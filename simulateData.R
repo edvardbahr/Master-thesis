@@ -62,7 +62,7 @@ get_stochvol_prior_constants <- function(prior = c("finance", "default")) {
 
 rprior_stochvol <- function(n,
                             prior = c("finance", "default"),
-                            return_sigma2 = TRUE) {
+                            return_sigma2 = FALSE) {
   stopifnot(n >= 1)
 
   prior <- match.arg(prior)
@@ -86,6 +86,9 @@ rprior_stochvol <- function(n,
 
   out
 }
+
+
+
 
 
 simulate_data_parallel <- function(m, n,
@@ -170,15 +173,31 @@ simulate_data_parallel <- function(m, n,
 
 
 # ============================================================
-# Optional helpers
+# Parameter moments
 # ============================================================
 
-phi_prior_mean <- function(a0, b0) {
-  2 * a0 / (a0 + b0) - 1
-}
 
-phi_prior_sd <- function(a0, b0) {
-  sqrt(4 * a0 * b0 / (((a0 + b0)^2) * (a0 + b0 + 1)))
+get_phi_prior_moments <- function(prior = c("default", "finance"),
+                                  transform = c("none", "shifted_logit", "fisher")) {
+  prior <- match.arg(prior)
+  transform <- match.arg(transform)
+
+  pc <- get_stochvol_prior_constants(prior)
+  a_0 <- pc$phi_a0
+  b_0 <- pc$phi_b0
+
+  if (transform == "none") {
+    mean <- (a_0 - b_0) / (a_0 + b_0)
+    variance <- 4 * a_0 * b_0 / ((a_0 + b_0)^2 * (a_0 + b_0 + 1))
+  } else if (transform == "shifted_logit") {
+    mean <- digamma(a_0) - digamma(b_0)
+    variance <- trigamma(a_0) + trigamma(b_0)
+  } else if (transform == "fisher") {
+    mean <- 0.5 * (digamma(a_0) - digamma(b_0))
+    variance <- 0.25 * (trigamma(a_0) + trigamma(b_0))
+  }
+
+  list(mean = mean, variance = variance, sd = sqrt(variance))
 }
 
 
