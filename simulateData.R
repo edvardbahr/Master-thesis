@@ -208,7 +208,7 @@ get_phi_prior_moments <- function(prior = c("default", "finance"),
 
 
 res <- simulate_data_parallel(
-  m = 400000,
+  m = 1000000,
   n = 253,
   prior = "default",
   chunk_size = 500,
