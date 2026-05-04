@@ -185,3 +185,4 @@ plt.xlabel("Epoch")
 plt.ylabel("Gaussian NLL")
 plt.legend()
 plt.show()
+
