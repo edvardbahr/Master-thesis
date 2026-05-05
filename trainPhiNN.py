@@ -6,6 +6,9 @@ import torch.nn.functional as F
 
 
 class GaussianMLP(nn.Module):
+
+    #the class structure of the GaussianMLP is as follows:
+    # - It inherits from nn.Module, which is the base class for all neural network modules
     def __init__(self, input_dim, hidden_dims=(64, 64), activation=nn.ReLU):
         super().__init__()
 
@@ -14,19 +17,28 @@ class GaussianMLP(nn.Module):
 
         for d_in, d_out in zip(dims[:-1], dims[1:]):
             layers.append(nn.Linear(d_in, d_out))
+
+            # nn.Linear applies a linear transformation to the incoming data: y = xA^T + b.
+            # Given the parameters d_in and d_out, it returns a "function" that takes
+            # an input of shape (batch_size, d_in) and produces an output of shape (batch_size, d_out). 
+
             layers.append(activation())
 
         self.net = nn.Sequential(*layers)
+        # nn.Sequential is a container module that sequences the layers in the order they are added.
         self.mu_head = nn.Linear(dims[-1], 1)
         self.var_head = nn.Linear(dims[-1], 1)
 
     def forward(self, z):
         h = self.net(z)
 
+        #the structure of h 
+
         mean = self.mu_head(h)
 
         # GaussianNLLLoss wants variance, not standard deviation.
         var = F.softplus(self.var_head(h)) + 1e-6
+        # Softplus is a smooth approximation to the ReLU function, defined as softplus(x) = log(1 + exp(x)).
 
         return mean, var
 
@@ -95,8 +107,8 @@ model = GaussianMLP(
 )
 
 loss_fn = nn.GaussianNLLLoss(full=True)
+# full=True means that the loss is averaged over all elements in the batch, rather than summed.
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
 
 # ------------------------------------------------------------
 # Training loop with early stopping
