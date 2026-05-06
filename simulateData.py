@@ -473,3 +473,16 @@ def sample_stochvol_prior(
 
 
 
+rng = np.random.default_rng(seed=1)
+m = 10_001
+
+mu, phi, sigma = sample_stochvol_prior(m, rng)
+
+y = simulate_sv_chunk(mu, phi, sigma, 253, rng)
+
+for i in range(m):
+    if i%20 == 0:
+        print(f"{i}:")
+        print(summary_stats_sv(y[i], compute_arima_coeff=False))
+    else:
+        summary_stats_sv(y[i], compute_arima_coeff=False)
