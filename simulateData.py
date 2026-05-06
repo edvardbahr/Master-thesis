@@ -1,9 +1,11 @@
 import warnings
 
 import numpy as np
+import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import acovf
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
+from dataclasses import dataclass
 
 
 def summary_stats_sv(
@@ -259,6 +261,215 @@ def summary_stats_sv(
 
     return out
 
+
+
+
+def simulate_sv_chunk(
+    mu,
+    phi,
+    sigma,
+    n,
+    rng,
+    random_init=True,
+    dtype=np.float64,
+    exp_clip=350.0,
+):
+    """
+    Simulate a chunk of standard log-normal SV series.
+
+    Model:
+        h_t = mu + phi * (h_{t-1} - mu) + sigma * eta_t
+        y_t = exp(h_t / 2) * eps_t
+
+    Parameters
+    ----------
+    mu, phi, sigma:
+        Arrays of shape (m,), where m is the chunk size.
+
+    n:
+        Length of each time series.
+
+    rng:
+        np.random.Generator.
+
+    random_init:
+        If True, initialize h_0 from the stationary distribution.
+        If False, initialize h_0 = mu.
+
+    dtype:
+        Floating point type for the returned y array.
+
+    exp_clip:
+        Clips h_t / 2 before exponentiating to avoid overflow.
+
+    Returns
+    -------
+    y:
+        Array of shape (m, n).
+    """
+
+    mu = np.asarray(mu, dtype=np.float64)
+    phi = np.asarray(phi, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+
+    if not (mu.shape == phi.shape == sigma.shape):
+        raise ValueError("mu, phi, and sigma must have the same shape.")
+
+    if mu.ndim != 1:
+        raise ValueError("mu, phi, and sigma must be one-dimensional arrays.")
+
+    if n < 1:
+        raise ValueError("n must be at least 1.")
+
+    if np.any(np.abs(phi) >= 1.0):
+        raise ValueError("All phi values must satisfy abs(phi) < 1.")
+
+    if np.any(sigma <= 0.0):
+        raise ValueError("All sigma values must be positive.")
+
+    m = len(mu)
+
+    y = np.empty((m, n), dtype=dtype)
+
+    if random_init:
+        stationary_sd = sigma / np.sqrt(1.0 - phi**2)
+        h_prev = mu + stationary_sd * rng.standard_normal(m)
+    else:
+        h_prev = mu.copy()
+
+    y[:, 0] = (
+        np.exp(np.clip(0.5 * h_prev, -exp_clip, exp_clip))
+        * rng.standard_normal(m)
+    )
+
+    for t in range(1, n):
+        h_prev = (
+            mu
+            + phi * (h_prev - mu)
+            + sigma * rng.standard_normal(m)
+        )
+
+        y[:, t] = (
+            np.exp(np.clip(0.5 * h_prev, -exp_clip, exp_clip))
+            * rng.standard_normal(m)
+        )
+
+    return y
+
+
+
+
+@dataclass(frozen=True)
+class StochvolPriorConstants:
+    mu_mean: float
+    mu_sd: float
+    phi_a0: float
+    phi_b0: float
+    Bsigma: float
+
+
+_STOCHVOL_PRIORS = {
+    "finance": StochvolPriorConstants(
+        mu_mean=-9.0,
+        mu_sd=1.0,
+        phi_a0=20.0,
+        phi_b0=1.5,
+        Bsigma=1.0,
+    ),
+    "default": StochvolPriorConstants(
+        mu_mean=0.0,
+        mu_sd=10.0,
+        phi_a0=5.0,
+        phi_b0=1.5,
+        Bsigma=1.0,
+    ),
+}
+
+
+def get_stochvol_prior_constants(prior="default"):
+    """
+    Return prior constants matching the R function get_stochvol_prior_constants().
+    """
+
+    if prior not in _STOCHVOL_PRIORS:
+        valid = ", ".join(_STOCHVOL_PRIORS)
+        raise ValueError(f"Unknown prior '{prior}'. Valid choices are: {valid}.")
+
+    return _STOCHVOL_PRIORS[prior]
+
+
+def sample_stochvol_prior(
+    n,
+    rng,
+    prior="default",
+    return_sigma2=False,
+    dtype=np.float64,
+):
+    """
+    Sample from the stochvol-style prior for (mu, phi, sigma).
+
+    Matches the R code:
+
+        mu     ~ N(mu_mean, mu_sd^2)
+        (phi + 1) / 2 ~ Beta(phi_a0, phi_b0)
+        sigma^2 ~ Bsigma * ChiSq(df = 1)
+
+    Parameters
+    ----------
+    n:
+        Number of parameter draws.
+
+    rng:
+        np.random.Generator object.
+
+    prior:
+        Either "finance" or "default".
+
+    return_sigma2:
+        If True, also return sigma2.
+
+    dtype:
+        Floating point dtype for output arrays.
+
+    Returns
+    -------
+    If return_sigma2=False:
+        mu, phi, sigma
+
+    If return_sigma2=True:
+        mu, phi, sigma, sigma2
+    """
+
+    if n < 1:
+        raise ValueError("n must be at least 1.")
+
+    hyper = get_stochvol_prior_constants(prior)
+
+    mu = rng.normal(
+        loc=hyper.mu_mean,
+        scale=hyper.mu_sd,
+        size=n,
+    ).astype(dtype, copy=False)
+
+    phi = (
+        2.0 * rng.beta(
+            a=hyper.phi_a0,
+            b=hyper.phi_b0,
+            size=n,
+        )
+        - 1.0
+    ).astype(dtype, copy=False)
+
+    sigma2 = (
+        hyper.Bsigma * rng.chisquare(df=1.0, size=n)
+    ).astype(dtype, copy=False)
+
+    sigma = np.sqrt(sigma2).astype(dtype, copy=False)
+
+    if return_sigma2:
+        return mu, phi, sigma, sigma2
+
+    return mu, phi, sigma
 
 
 
