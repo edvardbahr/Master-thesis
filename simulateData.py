@@ -9,39 +9,52 @@ from statsmodels.tools.sm_exceptions import ConvergenceWarning
 def summary_stats_sv(
     y,
     k=1e-8,
-    ratio_lags=(1, 2, 3, 4),
+    n_acvf_ratios=4,
     eps=1e-8,
     compute_arima_coeff=True,
     arima_method=None,
-    arima_fallback="acf_proxy",
     center_y=True,
     clean_output=True,
 ):
     """
     Summary statistic for one observed SV series y_{1:n}.
 
-    Feature order:
+    If compute_arima_coeff=True, feature order is:
         1. mean(log(y^2 + k))
         2. q05
         3. q25
         4. q50
         5. q75
         6. q95
-        7. transformed ACVF ratios for given ratio_lags
-        8. transformed ARMA/auxiliary AR coefficient
-        9. transformed ARMA/auxiliary MA coefficient
-        10. log auxiliary innovation SD
+        7. transformed ACVF ratios:
+
+              gamma(1) / gamma(0),
+              gamma(2) / gamma(1),
+              ...,
+              gamma(n_acvf_ratios) / gamma(n_acvf_ratios - 1)
+
+        8. transformed ARMA(1,1) AR coefficient
+        9. transformed ARMA(1,1) MA coefficient
+        10. log ARMA innovation SD
         11. 0.5 * log(var(log(y^2 + k)))
         12. log MAD(log(y^2 + k))
         13. plug-in log sigma estimate
 
-    If compute_arima_coeff=False, the output dimension is unchanged.
-    The ARMA features are replaced by cheap fallback features.
+    If compute_arima_coeff=False, the ARMA-related features are omitted.
+    The feature order is then:
+        1. mean(log(y^2 + k))
+        2. q05
+        3. q25
+        4. q50
+        5. q75
+        6. q95
+        7. transformed ACVF ratios
+        8. 0.5 * log(var(log(y^2 + k)))
+        9. log MAD(log(y^2 + k))
+        10. plug-in log sigma estimate
     """
 
     def clip_unit(z):
-        # Clip to (-1 + eps, 1 - eps)
-        # e.g. -1 + eps/2 is clipped to -1 + eps, and 1 - eps/2 is clipped to 1 - eps.
         return np.clip(z, -1.0 + eps, 1.0 - eps)
 
     def safe_log(z):
@@ -59,18 +72,14 @@ def summary_stats_sv(
     if not np.all(np.isfinite(y)):
         raise ValueError("y contains NaN or infinite values.")
 
-    ratio_lags = np.asarray(ratio_lags, dtype=int)
+    if not isinstance(n_acvf_ratios, int):
+        raise TypeError("n_acvf_ratios must be an integer.")
 
-    if ratio_lags.ndim != 1:
-        raise ValueError("ratio_lags must be one-dimensional.")
+    if n_acvf_ratios < 1:
+        raise ValueError("n_acvf_ratios must be at least 1.")
 
-    if np.any(ratio_lags < 0):
-        raise ValueError("ratio_lags must contain nonnegative integers.")
-
-    max_lag = int(np.max(ratio_lags)) + 1 if len(ratio_lags) > 0 else 1
-
-    if len(y) <= max_lag:
-        raise ValueError("y is too short for the requested ratio_lags.")
+    if len(y) <= n_acvf_ratios:
+        raise ValueError("y is too short for the requested number of ACVF ratios.")
 
     # Transform data
     if center_y:
@@ -82,47 +91,42 @@ def summary_stats_sv(
     mean_x = np.mean(x)
     q_x = np.quantile(x, [0.05, 0.25, 0.50, 0.75, 0.95])
 
-    # ACVF features
-    # adjusted=False gives the biased denominator n.
-    # demean=True matches your previous x_centered logic.
+    # ACVF ratio features
     gamma = acovf(
         x,
         adjusted=False,
         demean=True,
         fft=False,
-        nlag=max_lag,
+        nlag=n_acvf_ratios,
         missing="raise",
     )
 
-    if len(ratio_lags) > 0:
-        num = gamma[ratio_lags + 1]
-        den = gamma[ratio_lags]
+    num = gamma[1:n_acvf_ratios + 1]
+    den = gamma[0:n_acvf_ratios]
 
-        raw_ratios = np.divide(
-            num,
-            den,
-            out=np.zeros_like(num, dtype=float),
-            where=np.abs(den) > eps,
-        )
+    raw_ratios = np.divide(
+        num,
+        den,
+        out=np.zeros(n_acvf_ratios, dtype=float),
+        where=np.abs(den) > eps,
+    )
 
-        acvf_ratio_features = psi_phi(raw_ratios)
-    else:
-        raw_ratios = np.empty(0)
-        acvf_ratio_features = np.empty(0)
+    # Apply transformation to raw ACVF ratios to map them from (-1, 1) to the real line
+    acvf_ratio_features = psi_phi(raw_ratios)
 
-    # Cheap defaults used if ARMA is skipped or fails
-    if arima_fallback == "acf_proxy":
-        alpha_arma = raw_ratios[0] if len(raw_ratios) > 0 else 0.0
-        beta_arma = 0.0
-        arma_innov_sd = np.std(x, ddof=1)
-    elif arima_fallback == "zero":
-        alpha_arma = 0.0
-        beta_arma = 0.0
-        arma_innov_sd = np.std(x, ddof=1)
-    else:
-        raise ValueError("arima_fallback must be either 'acf_proxy' or 'zero'.")
+    # Spread features
+    var_x = np.var(x, ddof=1)
+    mad_x = np.median(np.abs(x - np.median(x)))
 
-    # ARMA(1,1) auxiliary fit
+    # Apply tranformation to variance and MAD to map them from (0, inf) to the real line
+    log_sd_x = 0.5 * safe_log(var_x)
+    log_mad_x = safe_log(mad_x)
+
+    
+    # Default persistence proxy used for log_sigma_plugin.
+    # This is always available because n_acvf_ratios >= 1.
+    phi_proxy = clip_unit(raw_ratios[0])
+
     if compute_arima_coeff:
         try:
             model = ARIMA(
@@ -143,53 +147,91 @@ def summary_stats_sv(
 
             params = dict(zip(fit.param_names, fit.params))
 
-            alpha_arma = params.get("ar.L1", alpha_arma)
-            beta_arma = params.get("ma.L1", beta_arma)
-            arma_sigma2 = params.get("sigma2", arma_innov_sd**2)
+            alpha_arma = params.get("ar.L1", 0.0)
+            beta_arma = params.get("ma.L1", 0.0)
+            arma_sigma2 = params.get("sigma2", np.var(fit.resid, ddof=1))
 
+            alpha_arma = clip_unit(alpha_arma)
+            beta_arma = clip_unit(beta_arma)
             arma_innov_sd = np.sqrt(max(arma_sigma2, eps))
 
+            psi_alpha_arma = psi_phi(alpha_arma)
+            psi_beta_arma = psi_phi(beta_arma)
+            log_arma_innov_sd = safe_log(arma_innov_sd)
+
+            arma_features = np.array(
+                [
+                    psi_alpha_arma,
+                    psi_beta_arma,
+                    log_arma_innov_sd,
+                ],
+                dtype=float,
+            )
+
+            # If the ARMA fit succeeds, use the AR coefficient
+            # as the persistence proxy in the plug-in sigma estimate.
+            phi_proxy = alpha_arma
+
         except Exception:
-            # Keep fallback values.
-            pass
+            # If ARMA fitting fails, include explicit fallback values,
+            # since compute_arima_coeff=True requested ARMA features.
+            print("ARMA(1,1) fitting failed. Using fallback values for ARMA features.")
+            alpha_arma = clip_unit(raw_ratios[0])
+            beta_arma = 0.0
+            arma_innov_sd = np.std(x, ddof=1)
 
-    alpha_arma = clip_unit(alpha_arma)
-    beta_arma = clip_unit(beta_arma)
+            psi_alpha_arma = psi_phi(alpha_arma)
+            psi_beta_arma = psi_phi(beta_arma)
+            log_arma_innov_sd = safe_log(arma_innov_sd)
 
-    psi_alpha_arma = psi_phi(alpha_arma)
-    psi_beta_arma = psi_phi(beta_arma)
-    log_arma_innov_sd = safe_log(arma_innov_sd)
+            arma_features = np.array(
+                [
+                    psi_alpha_arma,
+                    psi_beta_arma,
+                    log_arma_innov_sd,
+                ],
+                dtype=float,
+            )
 
-    # Spread features
-    var_x = np.var(x, ddof=1)
-    mad_x = np.median(np.abs(x - np.median(x)))
-
-    half_log_var_x = 0.5 * safe_log(var_x)
-    log_mad_x = safe_log(mad_x)
+            phi_proxy = alpha_arma
 
     # Plug-in log sigma estimate
     #
-    # var(log(y_t^2 + k)) approx var(h_t) + var(log(eps_t^2))
-    # var(log(eps_t^2)) = pi^2 / 2
+    # var(log(y_t^2 + k)) approx var(h_t) + var(log(epsilon_t^2))
+    # var(log(epsilon_t^2)) = pi^2 / 2
     # var(h_t) = sigma^2 / (1 - phi^2)
     #
     # log(sigma) approx 0.5 * [log(var(x) - pi^2/2) + log(1 - phi^2)]
     log_eps2_var = np.pi**2 / 2.0
 
     latent_var_est = max(var_x - log_eps2_var, eps)
-    one_minus_r2 = max(1.0 - alpha_arma**2, eps)
+    one_minus_r2 = max(1.0 - phi_proxy**2, eps)
 
     log_sigma_plugin = 0.5 * (
         np.log(latent_var_est)
         + np.log(one_minus_r2)
     )
 
-    # Preallocate output instead of repeatedly appending/concatenating
-    p = 6 + len(acvf_ratio_features) + 6
+    spread_features = np.array(
+        [
+            log_sd_x,
+            log_mad_x,
+            log_sigma_plugin,
+        ],
+        dtype=float,
+    )
+
+    # Preallocate output
+    if compute_arima_coeff:
+        p = 6 + n_acvf_ratios + 3 + 3
+    else:
+        p = 6 + n_acvf_ratios + 3
+
     out = np.empty(p, dtype=float)
 
     i = 0
 
+    # Location features
     out[i:i + 6] = [
         mean_x,
         q_x[0],
@@ -200,19 +242,23 @@ def summary_stats_sv(
     ]
     i += 6
 
-    out[i:i + len(acvf_ratio_features)] = acvf_ratio_features
-    i += len(acvf_ratio_features)
+    # Persistence features
+    out[i:i + n_acvf_ratios] = acvf_ratio_features
+    i += n_acvf_ratios
 
-    out[i:i + 6] = [
-        psi_alpha_arma,
-        psi_beta_arma,
-        log_arma_innov_sd,
-        half_log_var_x,
-        log_mad_x,
-        log_sigma_plugin,
-    ]
+    # Additional persistience features derived from ARMA(1,1) fit
+    if compute_arima_coeff:
+        out[i:i + 3] = arma_features
+        i += 3
+    
+    # Volatility of volatility features
+    out[i:i + 3] = spread_features
 
     if clean_output:
         out[~np.isfinite(out)] = 0.0
 
     return out
+
+
+
+
