@@ -127,9 +127,22 @@ def summary_stats_sv(
     
     # Default persistence proxy used for log_sigma_plugin.
     # This is always available because n_acvf_ratios >= 1.
-    phi_proxy = clip_unit(raw_ratios[0])
+    if n_acvf_ratios >= 2:
+        phi_proxy = clip_unit(np.median(raw_ratios[1:]))
+    else:
+        phi_proxy = clip_unit(raw_ratios[0])
 
     if compute_arima_coeff:
+        
+        sigma2_start = max(var_x * (1.0 - phi_proxy**2), eps)
+
+        start_params = np.array([
+            mean_x,           # const
+            phi_proxy,        # ar.L1
+            0.0,              # ma.L1
+            sigma2_start,     # sigma2
+        ])
+
         try:
             model = ARIMA(
                 x,
@@ -140,12 +153,32 @@ def summary_stats_sv(
             )
 
             with warnings.catch_warnings():
+                """
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Non-stationary starting autoregressive parameters found.*",
+                    category=UserWarning,
+                )   
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Non-invertible starting MA parameters found.*",
+                    category=UserWarning,
+                )
+                """
                 warnings.simplefilter("ignore", ConvergenceWarning)
 
                 if arima_method is None:
-                    fit = model.fit()
+                    fit = model.fit(
+                        start_params=start_params,
+                        method="statespace",
+                        method_kwargs={"maxiter": 50, "disp": 0},
+                    )
                 else:
-                    fit = model.fit(method=arima_method)
+                    fit = model.fit(
+                        start_params=start_params,
+                        method=arima_method,
+                        method_kwargs={"maxiter": 50, "disp": 0},
+                    )
 
             params = dict(zip(fit.param_names, fit.params))
 
@@ -473,16 +506,12 @@ def sample_stochvol_prior(
 
 
 
-rng = np.random.default_rng(seed=1)
-m = 10_001
+rng = np.random.default_rng(seed=2)
+m = 10
 
 mu, phi, sigma = sample_stochvol_prior(m, rng)
 
 y = simulate_sv_chunk(mu, phi, sigma, 253, rng)
 
 for i in range(m):
-    if i%20 == 0:
-        print(f"{i}:")
-        print(summary_stats_sv(y[i], compute_arima_coeff=False))
-    else:
-        summary_stats_sv(y[i], compute_arima_coeff=False)
+    print(summary_stats_sv(y[i]))
