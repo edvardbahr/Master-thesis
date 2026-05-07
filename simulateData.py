@@ -1,3 +1,15 @@
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import math
+import json
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import warnings
 
 import numpy as np
@@ -6,6 +18,81 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import acovf
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 from dataclasses import dataclass
+
+
+
+def _simulate_and_summarize_chunk(job):
+    """
+    Worker function.
+
+    It samples parameters, simulates a chunk of SV series, computes summaries,
+    and returns compact arrays.
+    """
+    (
+        chunk_id,
+        start_idx,
+        m_chunk,
+        n,
+        seed_seq,
+        prior,
+        random_init,
+        n_acvf_ratios,
+        compute_arima_coeff,
+        k,
+        eps,
+        arima_method,
+        center_y,
+        clean_output,
+        out_dtype,
+        exp_clip,
+    ) = job
+
+    rng = np.random.default_rng(seed_seq)
+
+    # 1. Sample parameters
+    mu, phi, sigma = sample_stochvol_prior(
+        m_chunk,
+        rng=rng,
+        prior=prior,
+        return_sigma2=False,
+        dtype=np.float64,
+    )
+
+    # 2. Simulate data
+    Y = simulate_sv_chunk(
+        mu=mu,
+        phi=phi,
+        sigma=sigma,
+        n=n,
+        rng=rng,
+        random_init=random_init,
+        dtype=np.float64,
+        exp_clip=exp_clip,
+    )
+
+    # 3. Compute summaries row by row
+    p = summary_stats_sv_dim(
+        n_acvf_ratios=n_acvf_ratios,
+        compute_arima_coeff=compute_arima_coeff,
+    )
+
+    Z_chunk = np.empty((m_chunk, p), dtype=out_dtype)
+
+    for i in range(m_chunk):
+        Z_chunk[i, :] = summary_stats_sv(
+            Y[i, :],
+            k=k,
+            n_acvf_ratios=n_acvf_ratios,
+            eps=eps,
+            compute_arima_coeff=compute_arima_coeff,
+            arima_method=arima_method,
+            center_y=center_y,
+            clean_output=clean_output,
+        ).astype(out_dtype, copy=False)
+
+    theta_chunk = np.column_stack([mu, phi, sigma]).astype(out_dtype, copy=False)
+
+    return start_idx, m_chunk, Z_chunk, theta_chunk
 
 
 def summary_stats_sv(
@@ -125,8 +212,7 @@ def summary_stats_sv(
     log_mad_x = safe_log(mad_x)
 
     
-    # Default persistence proxy used for log_sigma_plugin.
-    # This is always available because n_acvf_ratios >= 1.
+    # Default persistence proxy used for log_sigma_plugin and ARMA.
     if n_acvf_ratios >= 2:
         phi_proxy = clip_unit(np.median(raw_ratios[1:]))
     else:
@@ -153,18 +239,6 @@ def summary_stats_sv(
             )
 
             with warnings.catch_warnings():
-                """
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Non-stationary starting autoregressive parameters found.*",
-                    category=UserWarning,
-                )   
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Non-invertible starting MA parameters found.*",
-                    category=UserWarning,
-                )
-                """
                 warnings.simplefilter("ignore", ConvergenceWarning)
 
                 if arima_method is None:
@@ -211,7 +285,7 @@ def summary_stats_sv(
             # If ARMA fitting fails, include explicit fallback values,
             # since compute_arima_coeff=True requested ARMA features.
             print("ARMA(1,1) fitting failed. Using fallback values for ARMA features.")
-            alpha_arma = clip_unit(raw_ratios[0])
+            alpha_arma = phi_proxy
             beta_arma = 0.0
             arma_innov_sd = np.std(x, ddof=1)
 
@@ -295,6 +369,42 @@ def summary_stats_sv(
     return out
 
 
+def summary_stats_sv_dim(n_acvf_ratios=4, compute_arima_coeff=True):
+    """
+    Number of features returned by summary_stats_sv.
+    """
+    if compute_arima_coeff:
+        return 6 + n_acvf_ratios + 3 + 3
+    return 6 + n_acvf_ratios + 3
+
+
+def summary_stats_sv_feature_names(n_acvf_ratios=4, compute_arima_coeff=True):
+    names = [
+        "mean_x",
+        "q05_x",
+        "q25_x",
+        "q50_x",
+        "q75_x",
+        "q95_x",
+    ]
+
+    for j in range(1, n_acvf_ratios + 1):
+        names.append(f"psi_gamma{j}_over_gamma{j-1}")
+
+    if compute_arima_coeff:
+        names.extend([
+            "psi_alpha_arma",
+            "psi_beta_arma",
+            "log_arma_innov_sd",
+        ])
+
+    names.extend([
+        "log_sd_x",
+        "log_mad_x",
+        "log_sigma_plugin",
+    ])
+
+    return names
 
 
 def simulate_sv_chunk(
@@ -388,8 +498,6 @@ def simulate_sv_chunk(
         )
 
     return y
-
-
 
 
 @dataclass(frozen=True)
@@ -505,13 +613,161 @@ def sample_stochvol_prior(
     return mu, phi, sigma
 
 
+def generate_sv_dataset_parallel(
+    N,
+    n,
+    chunk_size=500,
+    n_workers=None,
+    seed=12345,
+    prior="default",
+    random_init=True,
+    n_acvf_ratios=4,
+    compute_arima_coeff=True,
+    k=1e-8,
+    eps=1e-8,
+    arima_method=None,
+    center_y=True,
+    clean_output=True,
+    out_dtype=np.float32,
+    exp_clip=350.0,
+    show_progress=True,
+):
+    """
+    Generate a dataset of summaries and true SV parameters in parallel.
 
-rng = np.random.default_rng(seed=2)
-m = 10
+    Returns
+    -------
+    Z:
+        Summary matrix of shape (N, p)
 
-mu, phi, sigma = sample_stochvol_prior(m, rng)
+    theta:
+        Parameter matrix of shape (N, 3), columns are mu, phi, sigma
 
-y = simulate_sv_chunk(mu, phi, sigma, 253, rng)
+    feature_names:
+        Names of summary-statistic features
+    """
 
-for i in range(m):
-    print(summary_stats_sv(y[i]))
+    if N < 1:
+        raise ValueError("N must be at least 1.")
+
+    if n < 1:
+        raise ValueError("n must be at least 1.")
+
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
+
+    if n_workers is None:
+        # Leave one core free.
+        n_workers = max(1, (os.cpu_count() or 2) - 1)
+
+    p = summary_stats_sv_dim(
+        n_acvf_ratios=n_acvf_ratios,
+        compute_arima_coeff=compute_arima_coeff,
+    )
+
+    feature_names = summary_stats_sv_feature_names(
+        n_acvf_ratios=n_acvf_ratios,
+        compute_arima_coeff=compute_arima_coeff,
+    )
+
+    Z = np.empty((N, p), dtype=out_dtype)
+    theta = np.empty((N, 3), dtype=out_dtype)
+
+    n_chunks = math.ceil(N / chunk_size)
+
+    # Independent, reproducible RNG streams for each chunk.
+    master_ss = np.random.SeedSequence(seed)
+    child_seeds = master_ss.spawn(n_chunks)
+
+    jobs = []
+
+    for chunk_id in range(n_chunks):
+        start_idx = chunk_id * chunk_size
+        stop_idx = min(start_idx + chunk_size, N)
+        m_chunk = stop_idx - start_idx
+
+        jobs.append(
+            (
+                chunk_id,
+                start_idx,
+                m_chunk,
+                n,
+                child_seeds[chunk_id],
+                prior,
+                random_init,
+                n_acvf_ratios,
+                compute_arima_coeff,
+                k,
+                eps,
+                arima_method,
+                center_y,
+                clean_output,
+                out_dtype,
+                exp_clip,
+            )
+        )
+
+    # "spawn" is safer and reproducible, but requires the usual
+    # if __name__ == "__main__" guard in scripts.
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        futures = [executor.submit(_simulate_and_summarize_chunk, job) for job in jobs]
+
+        completed_iter = as_completed(futures)
+
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                completed_iter = tqdm(completed_iter, total=n_chunks)
+            except ImportError:
+                pass
+
+        for future in completed_iter:
+            start_idx, m_chunk, Z_chunk, theta_chunk = future.result()
+
+            Z[start_idx:start_idx + m_chunk, :] = Z_chunk
+            theta[start_idx:start_idx + m_chunk, :] = theta_chunk
+
+    return Z, theta, feature_names
+
+
+
+if __name__ == "__main__":
+    N = 250_000
+    n = 253
+
+    Z, theta, feature_names = generate_sv_dataset_parallel(
+        N=N,
+        n=n,
+        chunk_size=500,
+        seed=1,
+        prior="default",
+        random_init=True,
+        n_acvf_ratios=4,
+        compute_arima_coeff=True,
+        out_dtype=np.float32,
+        show_progress=True,
+    )
+
+    np.savez(
+        "sv_dataset_250k.npz",
+        summaries=Z,
+        params=theta,
+        feature_names=np.array(feature_names),
+        param_names=np.array(["mu", "phi", "sigma"]),
+        config=json.dumps({
+            "N": N,
+            "n": n,
+            "chunk_size": 500,
+            "prior": "default",
+            "random_init": True,
+            "n_acvf_ratios": 4,
+            "compute_arima_coeff": True,
+            "seed": 1,
+        }),
+    )
+
+    print("Done.")
+    print("Z shape:", Z.shape)
+    print("theta shape:", theta.shape)
