@@ -5,7 +5,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import math
 import json
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -13,7 +12,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
 
 import numpy as np
-import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import acovf
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
@@ -618,7 +616,7 @@ def generate_sv_dataset_parallel(
     n,
     chunk_size=500,
     n_workers=None,
-    seed=12345,
+    seed=1,
     prior="default",
     random_init=True,
     n_acvf_ratios=4,
@@ -673,7 +671,7 @@ def generate_sv_dataset_parallel(
     Z = np.empty((N, p), dtype=out_dtype)
     theta = np.empty((N, 3), dtype=out_dtype)
 
-    n_chunks = math.ceil(N / chunk_size)
+    n_chunks = np.ceil(N / chunk_size).astype(int)
 
     # Independent, reproducible RNG streams for each chunk.
     master_ss = np.random.SeedSequence(seed)
@@ -734,37 +732,47 @@ def generate_sv_dataset_parallel(
 
 
 if __name__ == "__main__":
+
+
     N = 250_000
     n = 253
+
+    prior = "default"
+    chunk_size = 2_000
+    compute_arima_coeff = True
+    seed = 1
+
+    file_name = "sv_dataset_1Mill.npz"
+
 
     Z, theta, feature_names = generate_sv_dataset_parallel(
         N=N,
         n=n,
-        chunk_size=500,
-        seed=1,
-        prior="default",
+        chunk_size=chunk_size,
+        seed=seed,
+        prior=prior,
         random_init=True,
         n_acvf_ratios=4,
-        compute_arima_coeff=True,
+        compute_arima_coeff=compute_arima_coeff,
         out_dtype=np.float32,
         show_progress=True,
     )
 
     np.savez(
-        "sv_dataset_250k.npz",
+        file_name,
         summaries=Z,
         params=theta,
         feature_names=np.array(feature_names),
         param_names=np.array(["mu", "phi", "sigma"]),
-        config=json.dumps({
+        config=json.dumps({  #Store metadata
             "N": N,
             "n": n,
-            "chunk_size": 500,
-            "prior": "default",
+            "chunk_size": chunk_size,
+            "prior": prior,
             "random_init": True,
             "n_acvf_ratios": 4,
-            "compute_arima_coeff": True,
-            "seed": 1,
+            "compute_arima_coeff": compute_arima_coeff,
+            "seed": seed,
         }),
     )
 

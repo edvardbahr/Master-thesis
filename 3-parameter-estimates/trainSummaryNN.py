@@ -190,13 +190,11 @@ def diagonal_gaussian_nll(mean, var, target):
 
 
 
-
-
 # ============================================================
 # Load data
 # ============================================================
 
-data = np.load("sv_dataset_250k.npz", allow_pickle=True)
+data = np.load("sv_dataset_1Mill.npz", allow_pickle=True)
 
 Z = data["summaries"].astype(np.float32)
 theta = data["params"].astype(np.float32)
@@ -213,7 +211,7 @@ print("target shape:", target.shape)
 # Train-validation split
 # ============================================================
 
-rng = np.random.default_rng(seed=123)
+rng = np.random.default_rng(seed=1)
 
 n = Z.shape[0]
 indices = rng.permutation(n)
@@ -288,12 +286,12 @@ input_dim = Z.shape[1]
 model = SVPosteriorNN(
     input_dim=input_dim,
     hidden_dims_shared_trunk=(128, 128),
-    hidden_dims_head=(64,),
+    hidden_dims_head=(64,64,),
     activation=nn.ReLU,
     min_var=1e-6,
 ).to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.5e-3)
 
 
 # ============================================================
@@ -437,9 +435,9 @@ checkpoint = {
     "val_loss_history": val_loss_history,
 }
 
-torch.save(checkpoint, "sv_posterior_nn.pt")
+torch.save(checkpoint, "sv_posterior_nn6464.pt")
 
-print("Model saved to sv_posterior_nn.pt")
+print("Model saved to sv_posterior_nn6464.pt")
 
 
 
