@@ -43,6 +43,7 @@ def _simulate_and_summarize_chunk(job):
         clean_output,
         out_dtype,
         exp_clip,
+        p,
     ) = job
 
     rng = np.random.default_rng(seed_seq)
@@ -69,14 +70,9 @@ def _simulate_and_summarize_chunk(job):
     )
 
     # 3. Compute summaries row by row
-    p = summary_stats_sv_dim(
-        n_acvf_ratios=n_acvf_ratios,
-        compute_arima_coeff=compute_arima_coeff,
-    )
-
     Z_chunk = np.empty((m_chunk, p), dtype=out_dtype)
-
-    for i in range(m_chunk):
+    
+    for i in range(m_chunk):  # We use a Python for loop as summary_stats_sv() is not vectorized
         Z_chunk[i, :] = summary_stats_sv(
             Y[i, :],
             k=k,
@@ -367,16 +363,12 @@ def summary_stats_sv(
     return out
 
 
-def summary_stats_sv_dim(n_acvf_ratios=4, compute_arima_coeff=True):
-    """
-    Number of features returned by summary_stats_sv.
-    """
-    if compute_arima_coeff:
-        return 6 + n_acvf_ratios + 3 + 3
-    return 6 + n_acvf_ratios + 3
-
 
 def summary_stats_sv_feature_names(n_acvf_ratios=4, compute_arima_coeff=True):
+    """
+    Creates a list of the feature names generated in summary_stats_sv.
+    The number of feature names is equal to the dimension of the output of summary_stats_sv.
+    """
     names = [
         "mean_x",
         "q05_x",
@@ -658,15 +650,12 @@ def generate_sv_dataset_parallel(
         # Leave one core free.
         n_workers = max(1, (os.cpu_count() or 2) - 1)
 
-    p = summary_stats_sv_dim(
-        n_acvf_ratios=n_acvf_ratios,
-        compute_arima_coeff=compute_arima_coeff,
-    )
 
     feature_names = summary_stats_sv_feature_names(
         n_acvf_ratios=n_acvf_ratios,
         compute_arima_coeff=compute_arima_coeff,
     )
+    p = len(feature_names)
 
     Z = np.empty((N, p), dtype=out_dtype)
     theta = np.empty((N, 3), dtype=out_dtype)
@@ -702,6 +691,7 @@ def generate_sv_dataset_parallel(
                 clean_output,
                 out_dtype,
                 exp_clip,
+                p,
             )
         )
 
@@ -734,15 +724,15 @@ def generate_sv_dataset_parallel(
 if __name__ == "__main__":
 
 
-    N = 250_000
+    N = 1_000
     n = 253
 
     prior = "default"
-    chunk_size = 2_000
+    chunk_size = 500
     compute_arima_coeff = True
     seed = 1
 
-    file_name = "sv_dataset_1Mill.npz"
+    file_name = "weee.npz"#"sv_dataset_1Mill.npz"
 
 
     Z, theta, feature_names = generate_sv_dataset_parallel(
