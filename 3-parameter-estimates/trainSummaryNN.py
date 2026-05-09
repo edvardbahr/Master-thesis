@@ -45,7 +45,6 @@ def make_mlp(
 
     return nn.Sequential(*layers), d_prev
 
-
 class SVPosteriorNN(nn.Module):
     """
     Neural network for amortized inference in the standard SV model.

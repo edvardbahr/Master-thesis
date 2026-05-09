@@ -745,11 +745,11 @@ if __name__ == "__main__":
         prior="default",
         random_init=True,
         n_acvf_ratios=4,
-        compute_arima_coeff=True,
+        compute_arima_coeff=False,
         out_dtype=np.float32,
         show_progress=True,
     )
-
+    
     np.savez(
         "sv_dataset_250k.npz",
         summaries=Z,
@@ -763,7 +763,7 @@ if __name__ == "__main__":
             "prior": "default",
             "random_init": True,
             "n_acvf_ratios": 4,
-            "compute_arima_coeff": True,
+            "compute_arima_coeff": False,
             "seed": 1,
         }),
     )
