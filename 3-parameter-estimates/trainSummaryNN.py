@@ -36,6 +36,7 @@ def make_mlp(
 
         d_prev = d_hidden
 
+
     if output_dim is not None:
         layers.append(nn.Linear(d_prev, output_dim))
         d_prev = output_dim
@@ -114,8 +115,8 @@ class SVPosteriorNN(nn.Module):
         for name in self.param_names:
             out = self.heads[name](h)
 
-            mean = out[:, 0:1]
-            raw_var = out[:, 1:2]
+            mean = out[:, 0:1]    # Preserves shape (batch_size, 1) which is
+            raw_var = out[:, 1:2] # important for torch.cat later.
 
             var = F.softplus(raw_var) + self.min_var
 
@@ -125,7 +126,8 @@ class SVPosteriorNN(nn.Module):
         mean = torch.cat(means, dim=1)
         var = torch.cat(variances, dim=1)
 
-        return mean, var
+        # The mean and var posterior parameters for each main parameter is returned as we assume a diagonal Gaussian posterior.
+        return mean, var  
     
 
 def theta_to_target_numpy(theta, eps=1e-6):
@@ -149,7 +151,7 @@ def theta_to_target_numpy(theta, eps=1e-6):
     phi = np.clip(phi, -1.0 + eps, 1.0 - eps)
     sigma = np.clip(sigma, eps, None)
 
-    psi = np.log1p(phi) - np.log1p(-phi)
+    psi = 2 * np.arctanh(phi)
     log_sigma = np.log(sigma)
 
     target = np.column_stack([mu, psi, log_sigma])
@@ -201,7 +203,8 @@ theta = data["params"].astype(np.float32)
 print("Z shape:", Z.shape)
 print("theta shape:", theta.shape)
 
-target = theta_to_target_numpy(theta)
+# Transform to unconstrained space for NN training.
+target = theta_to_target_numpy(theta) 
 
 print("target shape:", target.shape)
 
@@ -212,11 +215,11 @@ print("target shape:", target.shape)
 
 rng = np.random.default_rng(seed=1)
 
-n = Z.shape[0]
-indices = rng.permutation(n)
+N = len(Z)
+indices = rng.permutation(N)
 
 val_fraction = 0.2
-n_val = int(val_fraction * n)
+n_val = int(val_fraction * N)
 
 val_idx = indices[:n_val]
 train_idx = indices[n_val:]
@@ -248,12 +251,12 @@ Z_val_scaled = (Z_val - z_mean) / z_std
 
 train_dataset = TensorDataset(
     torch.from_numpy(Z_train_scaled),
-    torch.from_numpy(target_train),
+    torch.from_numpy(target_train)
 )
 
 val_dataset = TensorDataset(
     torch.from_numpy(Z_val_scaled),
-    torch.from_numpy(target_val),
+    torch.from_numpy(target_val)
 )
 
 batch_size = 1024
@@ -262,14 +265,14 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=batch_size,
     shuffle=True,
-    drop_last=False,
+    drop_last=False
 )
 
 val_loader = DataLoader(
     val_dataset,
     batch_size=batch_size,
     shuffle=False,
-    drop_last=False,
+    drop_last=False
 )
 
 
