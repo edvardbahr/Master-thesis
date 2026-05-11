@@ -724,15 +724,16 @@ def generate_sv_dataset_parallel(
 if __name__ == "__main__":
 
 
-    N = 1_000
+    N = 1_000_000
     n = 253
 
     prior = "default"
-    chunk_size = 500
+    chunk_size = 2000
     compute_arima_coeff = True
+    n_cores = None # None means "use all available cores minus one"
     seed = 1
 
-    file_name = "weee.npz"#"sv_dataset_1Mill.npz"
+    file_name = f"sv_dataset_{prior}_1M.npz"
 
 
     Z, theta, feature_names = generate_sv_dataset_parallel(
@@ -746,6 +747,7 @@ if __name__ == "__main__":
         compute_arima_coeff=compute_arima_coeff,
         out_dtype=np.float32,
         show_progress=True,
+        n_workers=n_cores,
     )
     
     np.savez(
