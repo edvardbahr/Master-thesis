@@ -603,11 +603,49 @@ def sample_stochvol_prior(
     return mu, phi, sigma
 
 
+def resolve_n_workers(n_workers=None):
+    """
+    Resolve the number of worker processes.
+
+    If n_workers is None, leave one CPU core free.
+    """
+
+    if n_workers is None:
+        return max(1, (os.cpu_count() or 2) - 1)
+
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1.")
+
+    return n_workers
+
+
+def resolve_chunk_size(N, n_workers, chunk_size=None, chunks_per_worker=4):
+    """
+    Resolve chunk_size.
+
+    If chunk_size is None, use a small number of chunks per worker. This keeps
+    scheduling overhead low while still giving the executor some flexibility to
+    balance uneven chunk runtimes.
+    """
+
+    if chunks_per_worker < 1:
+        raise ValueError("chunks_per_worker must be at least 1.")
+
+    if chunk_size is None:
+        return max(1, int(np.ceil(N / (n_workers * chunks_per_worker))))
+
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
+
+    return chunk_size
+
+
 def generate_sv_dataset_parallel(
     N,
     n,
-    chunk_size=500,
+    chunk_size=None,
     n_workers=None,
+    chunks_per_worker=4,
     seed=1,
     prior="default",
     random_init=True,
@@ -643,13 +681,8 @@ def generate_sv_dataset_parallel(
     if n < 1:
         raise ValueError("n must be at least 1.")
 
-    if chunk_size < 1:
-        raise ValueError("chunk_size must be at least 1.")
-
-    if n_workers is None:
-        # Leave one core free.
-        n_workers = max(1, (os.cpu_count() or 2) - 1)
-
+    n_workers = resolve_n_workers(n_workers)
+    chunk_size = resolve_chunk_size(N, n_workers, chunk_size, chunks_per_worker)
 
     feature_names = summary_stats_sv_feature_names(
         n_acvf_ratios=n_acvf_ratios,
@@ -728,10 +761,14 @@ if __name__ == "__main__":
     n = 253
 
     prior = "default"
-    chunk_size = 2000
-    compute_arima_coeff = True
+    chunk_size = None
+    chunks_per_worker = 4
+    compute_arima_coeff = False
     n_cores = None # None means "use all available cores minus one"
     seed = 1
+
+    n_workers = resolve_n_workers(n_cores)
+    chunk_size = resolve_chunk_size(N, n_workers, chunk_size, chunks_per_worker)
 
     file_name = f"sv_dataset_{prior}_1M.npz"
 
@@ -740,6 +777,7 @@ if __name__ == "__main__":
         N=N,
         n=n,
         chunk_size=chunk_size,
+        chunks_per_worker=chunks_per_worker,
         seed=seed,
         prior=prior,
         random_init=True,
@@ -747,7 +785,7 @@ if __name__ == "__main__":
         compute_arima_coeff=compute_arima_coeff,
         out_dtype=np.float32,
         show_progress=True,
-        n_workers=n_cores,
+        n_workers=n_workers,
     )
     
     np.savez(
@@ -760,6 +798,7 @@ if __name__ == "__main__":
             "N": N,
             "n": n,
             "chunk_size": chunk_size,
+            "chunks_per_worker": chunks_per_worker,
             "prior": prior,
             "random_init": True,
             "n_acvf_ratios": 4,

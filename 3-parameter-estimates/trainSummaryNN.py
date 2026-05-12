@@ -203,7 +203,6 @@ def train_summary_nn(
     seed=1,
     val_fraction=0.2,
     batch_size=1024,
-    val_batch_size=None,
     lr=0.5e-3,
     n_epochs=1000,
     patience=50,
@@ -240,12 +239,8 @@ def train_summary_nn(
         Fraction of data used for validation.
 
     batch_size:
-        Mini-batch size for training.
+        Mini-batch size for training and validation.
         If batch_size=None, full-batch training is used.
-
-    val_batch_size:
-        Batch size for validation.
-        If None, it uses the same logic as batch_size.
 
     lr:
         Learning rate for Adam.
@@ -407,7 +402,7 @@ def train_summary_nn(
     # ============================================================
 
     if batch_size is None:
-        train_batch_size = len(train_dataset)
+        effective_batch_size = len(train_dataset)
         train_shuffle = False
 
         if verbose:
@@ -416,52 +411,12 @@ def train_summary_nn(
         if batch_size <= 0:
             raise ValueError("batch_size must be a positive integer or None.")
 
-        train_batch_size = batch_size
+        effective_batch_size = batch_size
         train_shuffle = True
 
         if verbose:
             print(f"Training mode: mini-batch, batch_size={batch_size}")
 
-    if val_batch_size is None:
-        if batch_size is None:
-            val_batch_size_effective = len(val_dataset)
-        else:
-            val_batch_size_effective = batch_size
-    else:
-        if val_batch_size <= 0:
-            raise ValueError("val_batch_size must be a positive integer or None.")
-
-        val_batch_size_effective = val_batch_size
-
-    # ============================================================
-    # Create DataLoaders
-    # ============================================================
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=train_batch_size,
-        shuffle=train_shuffle,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=val_batch_size_effective,
-        shuffle=False,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-
-    if verbose:
-        print("Train size:", len(train_dataset))
-        print("Validation size:", len(val_dataset))
-        print("Train batch size:", train_batch_size)
-        print("Validation batch size:", val_batch_size_effective)
-        print("Number of train batches per epoch:", len(train_loader))
-        print("Number of validation batches:", len(val_loader))
 
     # ============================================================
     # Initialize model
@@ -478,6 +433,38 @@ def train_summary_nn(
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+
+
+    # ============================================================
+    # Create DataLoaders
+    # ============================================================
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=effective_batch_size,
+        shuffle=train_shuffle,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    if verbose:
+        print("Train size:", len(train_dataset))
+        print("Validation size:", len(val_dataset))
+        print("Batch size:", effective_batch_size)
+        print("Number of train batches per epoch:", len(train_loader))
+        print("Number of validation batches:", len(val_loader))
+
 
     # ============================================================
     # Training loop with early stopping
@@ -524,8 +511,8 @@ def train_summary_nn(
         train_marginal_losses_value = total_train_losses / total_train_n
         val_marginal_losses_value = evaluate(model, val_loader, device)
 
-        train_marginal_losses_np = train_marginal_losses_value.detach().cpu().numpy()
-        val_marginal_losses_np = val_marginal_losses_value.detach().cpu().numpy()
+        train_marginal_losses_np = train_marginal_losses_value.cpu().numpy()
+        val_marginal_losses_np = val_marginal_losses_value.cpu().numpy()
 
         train_loss_value = float(train_marginal_losses_np.sum())
         val_loss_value = float(val_marginal_losses_np.sum())
@@ -646,8 +633,7 @@ def train_summary_nn(
         "data_path": data_path,
         "val_fraction": val_fraction,
         "batch_size": batch_size,
-        "train_batch_size_effective": train_batch_size,
-        "val_batch_size_effective": val_batch_size_effective,
+        "effective_batch_size": effective_batch_size,
         "lr": lr,
         "n_epochs": n_epochs,
         "patience": patience,
@@ -686,6 +672,7 @@ def train_summary_nn(
     return model, checkpoint
 
 def main():
+    """
     Z, theta, feature_names = simulateData.generate_sv_dataset_parallel(
         N=800,
         n=253,
@@ -701,6 +688,27 @@ def main():
     )
 
     print(Z)
+    """
+
+
+    train_summary_nn(
+    data_path = "sv_dataset_default_1M.npz",
+    hidden_dims_shared_trunk=(128, 128),
+    hidden_dims_head=(64, 64),
+    activation=nn.ReLU,
+    checkpoint_path="sv_posterior_nn.pt",
+    seed=1,
+    val_fraction=0.2,
+    batch_size=1024*16,
+    lr=0.5e-3,
+    n_epochs=2000,
+    patience=50,
+    min_delta=1e-5,
+    min_var=1e-12,
+    verbose=True,
+    plot=True,
+    num_workers=0,
+)
 
 
 if __name__ == "__main__":
