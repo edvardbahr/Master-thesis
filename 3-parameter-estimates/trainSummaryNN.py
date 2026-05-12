@@ -164,7 +164,7 @@ def theta_to_target_numpy(theta, eps=1e-6):
 
 def diagonal_gaussian_nll(mean, var, target):
     """
-    Computes the mean negative joint log score under a diagonal Gaussian.
+    Computes marginal negative log scores under a diagonal Gaussian.
 
     mean:
         shape (batch_size, param_dim)
@@ -176,7 +176,8 @@ def diagonal_gaussian_nll(mean, var, target):
         shape (batch_size, param_dim)
 
     Returns:
-        scalar loss averaged over the batch.
+        losses:
+            shape (param_dim,), one mean NLL per transformed parameter.
     """
     elementwise_nll = F.gaussian_nll_loss(
         input=mean,
@@ -186,11 +187,10 @@ def diagonal_gaussian_nll(mean, var, target):
         reduction="none",
     )
 
-    # Sum over the three transformed parameters.
-    # Then average over the batch.
-    loss = elementwise_nll.sum(dim=1).mean()
+    # Average over the batch, keeping one marginal NLL per transformed parameter.
+    losses = elementwise_nll.mean(dim=0)
 
-    return loss
+    return losses
 
 
 
@@ -299,9 +299,12 @@ def train_summary_nn(
 
     @torch.no_grad()
     def evaluate(model, loader, device):
+        """
+        Return one mean validation NLL per transformed parameter.
+        """
         model.eval()
 
-        total_loss = 0.0
+        total_losses = None
         total_n = 0
 
         for z_batch, target_batch in loader:
@@ -309,14 +312,17 @@ def train_summary_nn(
             target_batch = target_batch.to(device, non_blocking=True)
 
             mean, var = model(z_batch)
-            loss = diagonal_gaussian_nll(mean, var, target_batch)
+            losses = diagonal_gaussian_nll(mean, var, target_batch)
 
             batch_n = z_batch.shape[0]
 
-            total_loss += loss.item() * batch_n
+            if total_losses is None:
+                total_losses = torch.zeros_like(losses)
+
+            total_losses += losses * batch_n
             total_n += batch_n
 
-        return total_loss / total_n
+        return total_losses / total_n
 
     # ============================================================
     # Load data
@@ -477,6 +483,10 @@ def train_summary_nn(
     # Training loop with early stopping
     # ============================================================
 
+    target_names = ["mu", "psi", "log_sigma"]
+
+    train_marginal_loss_history = []
+    val_marginal_loss_history = []
     train_loss_history = []
     val_loss_history = []
 
@@ -488,7 +498,7 @@ def train_summary_nn(
     for epoch in range(n_epochs):
         model.train()
 
-        total_train_loss = 0.0
+        total_train_losses = None
         total_train_n = 0
 
         for z_batch, target_batch in train_loader:
@@ -496,22 +506,34 @@ def train_summary_nn(
             target_batch = target_batch.to(device, non_blocking=True)
 
             mean, var = model(z_batch)
-            train_loss = diagonal_gaussian_nll(mean, var, target_batch)
+            train_marginal_losses = diagonal_gaussian_nll(mean, var, target_batch)
+            train_loss = train_marginal_losses.sum()
 
-            optimizer.zero_grad()
-            train_loss.backward()
-            optimizer.step()
+            optimizer.zero_grad() # Clears old gradients from the last step.
+            train_loss.backward() # Computes gradient of train_loss w.r.t. model parameters.
+            optimizer.step()      # Updates model parameters using the computed gradient.
 
             batch_n = z_batch.shape[0]
 
-            total_train_loss += train_loss.item() * batch_n
+            if total_train_losses is None:
+                total_train_losses = torch.zeros_like(train_marginal_losses)
+
+            total_train_losses += train_marginal_losses.detach() * batch_n
             total_train_n += batch_n
 
-        train_loss_value = total_train_loss / total_train_n
-        val_loss_value = evaluate(model, val_loader, device)
+        train_marginal_losses_value = total_train_losses / total_train_n
+        val_marginal_losses_value = evaluate(model, val_loader, device)
+
+        train_marginal_losses_np = train_marginal_losses_value.detach().cpu().numpy()
+        val_marginal_losses_np = val_marginal_losses_value.detach().cpu().numpy()
+
+        train_loss_value = float(train_marginal_losses_np.sum())
+        val_loss_value = float(val_marginal_losses_np.sum())
 
         train_loss_history.append(train_loss_value)
         val_loss_history.append(val_loss_value)
+        train_marginal_loss_history.append(train_marginal_losses_np.tolist())
+        val_marginal_loss_history.append(val_marginal_losses_np.tolist())
 
         if val_loss_value < best_val_loss - min_delta:
             best_val_loss = val_loss_value
@@ -522,10 +544,27 @@ def train_summary_nn(
             epochs_without_improvement += 1
 
         if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
+            train_parts = ", ".join(
+                f"{name}={loss:.4f}"
+                for name, loss in zip(target_names, train_marginal_losses_np)
+            )
+            val_parts = ", ".join(
+                f"{name}={loss:.4f}"
+                for name, loss in zip(target_names, val_marginal_losses_np)
+            )
+
             print(
                 f"Epoch {epoch + 1:4d}: "
                 f"train NLL = {train_loss_value:.4f}, "
                 f"val NLL = {val_loss_value:.4f}"
+            )
+            print(
+                f"             "
+                f"train marginal NLLs: {train_parts}"
+            )
+            print(
+                f"             "
+                f"val marginal NLLs:   {val_parts}"
             )
 
         if epochs_without_improvement >= patience:
@@ -544,13 +583,22 @@ def train_summary_nn(
 
     model.eval()
 
-    final_val_loss = evaluate(model, val_loader, device)
+    final_val_marginal_losses = evaluate(model, val_loader, device)
+    final_val_marginal_losses_np = final_val_marginal_losses.detach().cpu().numpy()
+    final_val_loss = float(final_val_marginal_losses_np.sum())
 
     if verbose:
         print()
         print(f"Best epoch: {best_epoch}")
         print(f"Best validation mean negative joint log score: {best_val_loss:.6f}")
         print(f"Final validation mean negative joint log score: {final_val_loss:.6f}")
+        print(
+            "Final validation marginal NLLs:",
+            {
+                name: float(loss)
+                for name, loss in zip(target_names, final_val_marginal_losses_np)
+            },
+        )
 
     # ============================================================
     # Save checkpoint
@@ -576,7 +624,7 @@ def train_summary_nn(
         "z_mean": z_mean.astype(np.float32),
         "z_std": z_std.astype(np.float32),
 
-        "target_names": ["mu", "psi", "log_sigma"],
+        "target_names": target_names,
         "target_transform": {
             "mu": "mu",
             "psi": "2 * atanh(phi)",
@@ -584,12 +632,16 @@ def train_summary_nn(
         },
 
         "loss": "mean negative joint Gaussian log score, diagonal covariance",
+        "loss_components": "mean marginal Gaussian negative log scores for mu, psi, and log_sigma",
         "best_val_loss": float(best_val_loss),
         "final_val_loss": float(final_val_loss),
+        "final_val_marginal_losses": final_val_marginal_losses_np.astype(np.float32),
         "best_epoch": best_epoch,
 
         "train_loss_history": train_loss_history,
         "val_loss_history": val_loss_history,
+        "train_marginal_loss_history": train_marginal_loss_history,
+        "val_marginal_loss_history": val_marginal_loss_history,
 
         "data_path": data_path,
         "val_fraction": val_fraction,
@@ -617,6 +669,17 @@ def train_summary_nn(
         plt.plot(val_loss_history, label="validation")
         plt.xlabel("Epoch")
         plt.ylabel("Mean negative joint log score")
+        plt.legend()
+        plt.show()
+
+        train_marginal_loss_array = np.array(train_marginal_loss_history)
+        val_marginal_loss_array = np.array(val_marginal_loss_history)
+
+        for i, name in enumerate(target_names):
+            plt.plot(train_marginal_loss_array[:, i], label=f"train {name}")
+            plt.plot(val_marginal_loss_array[:, i], label=f"validation {name}")
+        plt.xlabel("Epoch")
+        plt.ylabel("Mean marginal negative log score")
         plt.legend()
         plt.show()
 
