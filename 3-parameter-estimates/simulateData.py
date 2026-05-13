@@ -653,8 +653,8 @@ def generate_sv_dataset_parallel(
     random_init=True,
     n_acvf_ratios=4,
     compute_arima_coeff=True,
-    k=1e-8,
-    eps=1e-8,
+    k=1e-14,
+    eps=1e-14,
     arima_method=None,
     center_y=True,
     clean_output=True,
@@ -759,7 +759,9 @@ def generate_sv_dataset_parallel(
 if __name__ == "__main__":
 
 
-    N = 10_000_000
+    # Set parameters 
+
+    N = 1_000_000
     n = 253
 
     prior = "default"
@@ -772,8 +774,10 @@ if __name__ == "__main__":
     n_workers = resolve_n_workers(n_cores)
     chunk_size = resolve_chunk_size(N, n_workers, chunk_size, chunks_per_worker)
 
-    file_name = f"sv_dataset_{prior}_10M.npz"
+    file_name = f"sv_dataset_{prior}_1M.npz"
 
+
+    # Generate data
 
     Z, theta, feature_names = generate_sv_dataset_parallel(
         N=N,

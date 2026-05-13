@@ -1,5 +1,7 @@
 library(stochvol)
 
+
+
 # -----------------------------
 # Function: posterior summary for psi = 2 * atanh(phi)
 # -----------------------------

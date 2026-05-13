@@ -45,6 +45,17 @@ def estimate_sv_with_r(y, draws=2000, burnin=500, thinpara=1):
     -------
     result:
         Structured NumPy array with one row per input series.
+        The columns are structured as:
+        - index
+        - mean mu
+        - mean phi
+        - mean sigma
+        - sd mu
+        - sd phi
+        - sd sigma
+        - median mu
+        - median phi
+        - median sigma
     """
     y = np.asarray(y, dtype=float)
 
@@ -108,4 +119,4 @@ if __name__ == "__main__":
         burnin=500,
     )
 
-    print(mcmc_summary)
+    print(len(mcmc_summary[0]))
