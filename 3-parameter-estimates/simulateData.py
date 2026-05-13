@@ -91,9 +91,9 @@ def _simulate_and_summarize_chunk(job):
 
 def summary_stats_sv(
     y,
-    k=1e-8,
+    k=1e-14,
     n_acvf_ratios=4,
-    eps=1e-8,
+    eps=1e-14,
     compute_arima_coeff=True,
     arima_method=None,
     center_y=True,
@@ -135,6 +135,8 @@ def summary_stats_sv(
         8. 0.5 * log(var(log(y^2 + k)))
         9. log MAD(log(y^2 + k))
         10. plug-in log sigma estimate
+    
+    NOTE: Remember to update summary_stats_sv_feature_names() if you change the features generated here.
     """
 
     def clip_unit(z):
@@ -757,7 +759,7 @@ def generate_sv_dataset_parallel(
 if __name__ == "__main__":
 
 
-    N = 1_000_000
+    N = 10_000_000
     n = 253
 
     prior = "default"
@@ -770,7 +772,7 @@ if __name__ == "__main__":
     n_workers = resolve_n_workers(n_cores)
     chunk_size = resolve_chunk_size(N, n_workers, chunk_size, chunks_per_worker)
 
-    file_name = f"sv_dataset_{prior}_1M.npz"
+    file_name = f"sv_dataset_{prior}_10M.npz"
 
 
     Z, theta, feature_names = generate_sv_dataset_parallel(
@@ -810,3 +812,7 @@ if __name__ == "__main__":
     print("Done.")
     print("Z shape:", Z.shape)
     print("theta shape:", theta.shape)
+
+    import pandas as pd
+    df = pd.DataFrame(Z, columns=feature_names)
+    print(df.describe())

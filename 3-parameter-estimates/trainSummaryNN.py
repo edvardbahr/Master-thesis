@@ -374,14 +374,21 @@ def train_summary_nn(
     # Standardize summary statistics using training set only
     # ============================================================
 
-    z_mean = Z_train.mean(axis=0, keepdims=True)
-    z_std = Z_train.std(axis=0, keepdims=True)
+    if(False):
 
-    # Avoid division by zero if a summary statistic is constant.
-    z_std = np.where(z_std < 1e-8, 1.0, z_std)
+        z_mean = Z_train.mean(axis=0, keepdims=True)
+        z_std = Z_train.std(axis=0, keepdims=True)
 
-    Z_train_scaled = (Z_train - z_mean) / z_std
-    Z_val_scaled = (Z_val - z_mean) / z_std
+        # Avoid division by zero if a summary statistic is constant.
+        z_std = np.where(z_std < 1e-8, 1.0, z_std)
+
+        Z_train_scaled = (Z_train - z_mean) / z_std
+        Z_val_scaled = (Z_val - z_mean) / z_std
+    else:
+        Z_train_scaled = Z_train
+        Z_val_scaled = Z_val
+        z_mean = np.zeros((1, Z.shape[1]), dtype=np.float32)
+        z_std = np.ones((1, Z.shape[1]), dtype=np.float32)
 
     # ============================================================
     # Create PyTorch datasets
