@@ -63,7 +63,7 @@ summarize_series <- function(series_index, y) {
     as.numeric(y),
     draws = draws,
     burnin = burnin,
-    priormu = c(prior_constants$mu_mean, prior_constants$mu_sd^2),
+    priormu = c(prior_constants$mu_mean, prior_constants$mu_sd),
     priorphi = c(prior_constants$phi_a0, prior_constants$phi_b0),
     priorsigma = prior_constants$Bsigma,
     thinpara = thinpara,
@@ -82,7 +82,13 @@ summarize_series <- function(series_index, y) {
     sigma_sd = sd(draws_matrix[, "sigma"]),
     mu_median = median(draws_matrix[, "mu"]),
     phi_median = median(draws_matrix[, "phi"]),
-    sigma_median = median(draws_matrix[, "sigma"])
+    sigma_median = median(draws_matrix[, "sigma"]),
+    mu_ci_lower = unname(quantile(draws_matrix[, "mu"], 0.025)),
+    mu_ci_upper = unname(quantile(draws_matrix[, "mu"], 0.975)),
+    phi_ci_lower = unname(quantile(draws_matrix[, "phi"], 0.025)),
+    phi_ci_upper = unname(quantile(draws_matrix[, "phi"], 0.975)),
+    sigma_ci_lower = unname(quantile(draws_matrix[, "sigma"], 0.025)),
+    sigma_ci_upper = unname(quantile(draws_matrix[, "sigma"], 0.975))
   )
 }
 
