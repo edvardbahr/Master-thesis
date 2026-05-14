@@ -27,9 +27,9 @@ def _simulate_and_summarize_chunk(job):
     and returns compact arrays.
     """
     (
-        chunk_id,
-        start_idx,
-        m_chunk,
+        _chunk_id,
+        chunk_start,
+        n_chunk,
         n,
         seed_seq,
         prior,
@@ -50,7 +50,7 @@ def _simulate_and_summarize_chunk(job):
 
     # 1. Sample parameters
     mu, phi, sigma = sample_stochvol_prior(
-        m_chunk,
+        n_chunk,
         rng=rng,
         prior=prior,
         return_sigma2=False,
@@ -58,7 +58,7 @@ def _simulate_and_summarize_chunk(job):
     )
 
     # 2. Simulate data
-    Y = simulate_sv_chunk(
+    y_chunk = simulate_sv_chunk(
         mu=mu,
         phi=phi,
         sigma=sigma,
@@ -70,11 +70,11 @@ def _simulate_and_summarize_chunk(job):
     )
 
     # 3. Compute summaries row by row
-    Z_chunk = np.empty((m_chunk, p), dtype=out_dtype)
+    summary_chunk = np.empty((n_chunk, p), dtype=out_dtype)
     
-    for i in range(m_chunk):  # We use a Python for loop as summary_stats_sv() is not vectorized
-        Z_chunk[i, :] = summary_stats_sv(
-            Y[i, :],
+    for i in range(n_chunk):  # We use a Python for loop as summary_stats_sv() is not vectorized
+        summary_chunk[i, :] = summary_stats_sv(
+            y_chunk[i, :],
             k=k,
             n_acvf_ratios=n_acvf_ratios,
             eps=eps,
@@ -86,14 +86,70 @@ def _simulate_and_summarize_chunk(job):
 
     theta_chunk = np.column_stack([mu, phi, sigma]).astype(out_dtype, copy=False)
 
-    return start_idx, m_chunk, Z_chunk, theta_chunk
+    return chunk_start, n_chunk, summary_chunk, theta_chunk
+
+
+def _simulate_log_y_squared_chunk(job):
+    """
+    Worker function.
+
+    It samples parameters, simulates a chunk of SV series, computes log(y^2+k),
+    and returns compact arrays.
+    """
+    (
+        _chunk_id,
+        chunk_start,
+        n_chunk,
+        n,
+        seed_seq,
+        prior,
+        random_init,
+        k,
+        center_y,
+        out_dtype,
+        exp_clip,
+    ) = job
+
+    rng = np.random.default_rng(seed_seq)
+
+    # 1. Sample parameters
+    mu, phi, sigma = sample_stochvol_prior(
+        n_chunk,
+        rng=rng,
+        prior=prior,
+        return_sigma2=False,
+        dtype=np.float64,
+    )
+
+    # 2. Simulate data
+    y_chunk = simulate_sv_chunk(
+        mu=mu,
+        phi=phi,
+        sigma=sigma,
+        n=n,
+        rng=rng,
+        random_init=random_init,
+        dtype=np.float64,
+        exp_clip=exp_clip,
+    )
+
+    if center_y:
+        y_chunk = y_chunk - np.mean(y_chunk, axis=1, keepdims=True)
+
+    log_y_squared_chunk = np.log(y_chunk * y_chunk + k).astype(out_dtype, copy=False)
+
+    theta_chunk = np.column_stack([mu, phi, sigma]).astype(out_dtype, copy=False)
+
+    return chunk_start, n_chunk, log_y_squared_chunk, theta_chunk
+
+
 
 
 def summary_stats_sv(
     y,
-    k=1e-14,
+    k=1e-12,
     n_acvf_ratios=4,
-    eps=1e-14,
+    eps=1e-12,
     compute_arima_coeff=True,
     arima_method=None,
     center_y=True,
@@ -605,56 +661,179 @@ def sample_stochvol_prior(
     return mu, phi, sigma
 
 
-def resolve_n_workers(n_workers=None):
+def resolve_n_workers(n_workers):
     """
     Resolve the number of worker processes.
 
-    If n_workers is None, leave one CPU core free.
+    Negative values work like offsets from the total CPU count:
+        -1 uses all cores except one,
+        -2 uses all cores except two,
+        etc.
+
+    To use all available cores, pass the explicit positive worker count.
     """
 
-    if n_workers is None:
-        return max(1, (os.cpu_count() or 2) - 1)
+    n_cpus = os.cpu_count() or 1
 
-    if n_workers < 1:
-        raise ValueError("n_workers must be at least 1.")
+    if n_workers is None:
+        raise ValueError(
+            "n_workers cannot be None. Use a positive worker count or a negative CPU offset."
+        )
+
+    if n_workers < 0:
+        resolved = n_cpus + n_workers
+
+        if resolved < 1:
+            raise ValueError(
+                "n_workers leaves no worker processes available. "
+                f"With {n_cpus} CPU core(s), use n_workers >= {1 - n_cpus}."
+            )
+
+        return resolved
+
+    if n_workers == 0:
+        raise ValueError("n_workers must not be 0.")
+
+    if n_workers > n_cpus:
+        raise ValueError(
+            f"n_workers={n_workers} exceeds the available CPU count ({n_cpus})."
+        )
 
     return n_workers
 
 
-def resolve_chunk_size(N, n_workers, chunk_size=None, chunks_per_worker=4):
+def resolve_chunk_size(N, n_workers, chunks_per_worker):
     """
-    Resolve chunk_size.
+    Compute a chunk size from the number of simulations, workers, and chunks
+    per worker.
+    """
 
-    If chunk_size is None, use a small number of chunks per worker. This keeps
-    scheduling overhead low while still giving the executor some flexibility to
-    balance uneven chunk runtimes.
-    """
+    if N < 1:
+        raise ValueError("N must be at least 1.")
+
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1.")
 
     if chunks_per_worker < 1:
         raise ValueError("chunks_per_worker must be at least 1.")
 
+    return max(1, int(np.ceil(N / (n_workers * chunks_per_worker))))
+
+
+def simulate_sv_log_y_squared_parallel(
+    N,
+    n,
+    chunk_size,
+    n_workers=-1,
+    seed=1,
+    prior="default",
+    random_init=True,
+    k=1e-12,
+    center_y=True,
+    out_dtype=np.float32,
+    exp_clip=350.0,
+    show_progress=True,
+):
+    """
+    Generate log(y^2 + k) series and true SV parameters in parallel.
+
+    Returns
+    -------
+    log_y_squared:
+        Matrix of shape (N, n), where row i is log(y_i^2 + k).
+
+    theta:
+        Parameter matrix of shape (N, 3), columns are mu, phi, sigma
+    """
+
+    if N < 1:
+        raise ValueError("N must be at least 1.")
+
+    if n < 1:
+        raise ValueError("n must be at least 1.")
+
+    n_workers = resolve_n_workers(n_workers)
+
     if chunk_size is None:
-        return max(1, int(np.ceil(N / (n_workers * chunks_per_worker))))
+        raise ValueError("chunk_size must be explicitly specified.")
 
     if chunk_size < 1:
         raise ValueError("chunk_size must be at least 1.")
 
-    return chunk_size
+    if k <= 0:
+        raise ValueError("k must be positive.")
+
+    log_y_squared = np.empty((N, n), dtype=out_dtype)
+    theta = np.empty((N, 3), dtype=out_dtype)
+
+    n_chunks = np.ceil(N / chunk_size).astype(int)
+
+    # Independent, reproducible RNG streams for each chunk.
+    master_ss = np.random.SeedSequence(seed)
+    child_seeds = master_ss.spawn(n_chunks)
+
+    chunk_jobs = []
+
+    for chunk_id in range(n_chunks):
+        chunk_start = chunk_id * chunk_size
+        chunk_stop = min(chunk_start + chunk_size, N)
+        n_chunk = chunk_stop - chunk_start
+
+        chunk_jobs.append(
+            (
+                chunk_id,
+                chunk_start,
+                n_chunk,
+                n,
+                child_seeds[chunk_id],
+                prior,
+                random_init,
+                k,
+                center_y,
+                out_dtype,
+                exp_clip,
+            )
+        )
+
+    # "spawn" is safer and reproducible, but requires the usual
+    # if __name__ == "__main__" guard in scripts.
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        futures = [executor.submit(_simulate_log_y_squared_chunk, job) for job in chunk_jobs]
+
+        completed_iter = as_completed(futures)
+
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                completed_iter = tqdm(completed_iter, total=n_chunks)
+            except ImportError:
+                pass
+
+        for future in completed_iter:
+            chunk_start, n_chunk, log_y_squared_chunk, theta_chunk = future.result()
+
+            chunk_stop = chunk_start + n_chunk
+            log_y_squared[chunk_start:chunk_stop, :] = log_y_squared_chunk
+            theta[chunk_start:chunk_stop, :] = theta_chunk
+
+    return log_y_squared, theta
 
 
-def generate_sv_dataset_parallel(
+
+def simulate_sv_summaries_parallel(
     N,
     n,
-    chunk_size=None,
-    n_workers=None,
-    chunks_per_worker=4,
+    chunk_size,
+    n_workers=-1,
     seed=1,
     prior="default",
     random_init=True,
     n_acvf_ratios=4,
     compute_arima_coeff=True,
-    k=1e-14,
-    eps=1e-14,
+    k=1e-12,
+    eps=1e-12,
     arima_method=None,
     center_y=True,
     clean_output=True,
@@ -684,7 +863,12 @@ def generate_sv_dataset_parallel(
         raise ValueError("n must be at least 1.")
 
     n_workers = resolve_n_workers(n_workers)
-    chunk_size = resolve_chunk_size(N, n_workers, chunk_size, chunks_per_worker)
+
+    if chunk_size is None:
+        raise ValueError("chunk_size must be explicitly specified.")
+
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
 
     feature_names = summary_stats_sv_feature_names(
         n_acvf_ratios=n_acvf_ratios,
@@ -764,26 +948,24 @@ if __name__ == "__main__":
     N = 1_000_000
     n = 253
 
-    prior = "default"
-    chunk_size = None
-    chunks_per_worker = 4
-    compute_arima_coeff = False
-    n_cores = None # None means "use all available cores minus one"
+    prior = "finance"
+    chunks_per_worker = 8
+    compute_arima_coeff = True
+    n_workers = -2 # -2 means "use all available cores minus two"
     seed = 1
 
-    n_workers = resolve_n_workers(n_cores)
-    chunk_size = resolve_chunk_size(N, n_workers, chunk_size, chunks_per_worker)
+    resolved_n_workers = resolve_n_workers(n_workers)
+    chunk_size = resolve_chunk_size(N, resolved_n_workers, chunks_per_worker)
 
-    file_name = f"sv_dataset_{prior}_1M.npz"
+    file_name = f"sv_dataset_{prior}_1M_ARIMA.npz"
 
 
     # Generate data
 
-    Z, theta, feature_names = generate_sv_dataset_parallel(
+    Z, theta, feature_names = simulate_sv_summaries_parallel(
         N=N,
         n=n,
         chunk_size=chunk_size,
-        chunks_per_worker=chunks_per_worker,
         seed=seed,
         prior=prior,
         random_init=True,
@@ -791,7 +973,7 @@ if __name__ == "__main__":
         compute_arima_coeff=compute_arima_coeff,
         out_dtype=np.float32,
         show_progress=True,
-        n_workers=n_workers,
+        n_workers=resolved_n_workers,
     )
     
     np.savez(

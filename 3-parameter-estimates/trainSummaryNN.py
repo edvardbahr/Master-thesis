@@ -203,7 +203,7 @@ def train_summary_nn(
     seed=1,
     val_fraction=0.2,
     batch_size=1024,
-    lr= 1e-4,
+    lr= 0.2e-3,
     n_epochs=1000,
     patience=50,
     min_delta=1e-4,
@@ -699,15 +699,15 @@ def main():
 
 
     train_summary_nn(
-    data_path = "sv_dataset_default_1M.npz",
+    data_path = "sv_dataset_default_1M_ARIMA.npz",
     hidden_dims_shared_trunk=(128, 128),
     hidden_dims_head=(64, 64),
     activation=nn.ReLU,
-    checkpoint_path="sv_posterior_nn.pt",
+    checkpoint_path="sv_posterior_nn_1M_ARIMA.pt",
     seed=1,
     val_fraction=0.2,
     batch_size=1024*16,
-    lr=1e-4,
+    lr=0.5e-3,    #Best step size found so far (I forgot standardazing tho :/)
     n_epochs=2000,
     patience=50,
     min_delta=1e-5,
