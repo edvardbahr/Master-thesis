@@ -1074,7 +1074,7 @@ def main2():
     resolved_n_workers = resolve_n_workers(n_workers)
     chunk_size = resolve_chunk_size(N, resolved_n_workers, chunks_per_worker)
 
-    file_name = f"sv_log_y_squared_{prior}_1M_n{n}.npz"
+    file_name = f"sv_log_y_squared_{prior}_1M.npz"
 
     log_y_squared, theta = simulate_sv_log_y_squared_parallel(
         N=N,

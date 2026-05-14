@@ -32,7 +32,7 @@ def find_rscript():
     )
 
 
-def estimate_sv_with_r(y, draws=2000, burnin=500, thinpara=1):
+def estimate_sv_with_r(y, draws=2000, burnin=500, thinpara=1, prior="default"):
     """
     Run stochvol MCMC in R for one or more simulated SV series.
 
@@ -40,6 +40,10 @@ def estimate_sv_with_r(y, draws=2000, burnin=500, thinpara=1):
     ----------
     y:
         One series with shape (n,) or many series with shape (m, n).
+
+    prior:
+        Prior constants to use in stochvol. Must be either "default" or
+        "finance", matching simulateData.sample_stochvol_prior().
 
     Returns
     -------
@@ -67,6 +71,8 @@ def estimate_sv_with_r(y, draws=2000, burnin=500, thinpara=1):
     if not np.all(np.isfinite(y)):
         raise ValueError("y contains NaN or infinite values.")
 
+    sim.get_stochvol_prior_constants(prior)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         input_path = tmpdir / "y.csv"
@@ -83,6 +89,7 @@ def estimate_sv_with_r(y, draws=2000, burnin=500, thinpara=1):
                 str(draws),
                 str(burnin),
                 str(thinpara),
+                str(prior),
             ],
             check=True,
         )
@@ -117,6 +124,7 @@ if __name__ == "__main__":
         y,
         draws=2000,
         burnin=500,
+        prior="finance",
     )
 
     print(len(mcmc_summary[0]))

@@ -404,6 +404,7 @@ def train_cnn(
     seed=1,
     val_fraction=0.2,
     batch_size=1024,
+    val_batch_size=None,
     lr=1e-4,
     weight_decay=0.0,
     n_epochs=1000,
@@ -412,6 +413,7 @@ def train_cnn(
     min_var=1e-12,
     standardize_input=True,
     normalization_chunk_size=100_000,
+    use_amp=None,
     grad_clip_norm=None,
     verbose=True,
     plot=True,
@@ -461,8 +463,12 @@ def train_cnn(
         Fraction of data used for validation.
 
     batch_size:
-        Mini-batch size for training and validation.
+        Mini-batch size for training.
         If batch_size=None, full-batch training is used.
+
+    val_batch_size:
+        Mini-batch size for validation. If None, validation uses batch_size.
+        Use a smaller value if validation runs out of GPU memory.
 
     lr:
         Learning rate for Adam.
@@ -488,6 +494,10 @@ def train_cnn(
 
     normalization_chunk_size:
         Number of indexed rows used at a time when computing training mean/std.
+
+    use_amp:
+        Whether to use CUDA automatic mixed precision. If None, AMP is enabled
+        automatically on CUDA and disabled on CPU.
 
     grad_clip_norm:
         If not None, clip gradient norm to this value.
@@ -523,6 +533,15 @@ def train_cnn(
 
     pin_memory = device.type == "cuda"
 
+    if use_amp is None:
+        use_amp = device.type == "cuda"
+
+    amp_enabled = bool(use_amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+
+    if verbose and amp_enabled:
+        print("Using CUDA automatic mixed precision")
+
     # ============================================================
     # Evaluation helper
     # ============================================================
@@ -541,8 +560,14 @@ def train_cnn(
             x_batch = x_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
 
-            mean, var = model(x_batch)
-            losses = diagonal_gaussian_nll(mean, var, target_batch)
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                mean, var = model(x_batch)
+
+            losses = diagonal_gaussian_nll(
+                mean.float(),
+                var.float(),
+                target_batch.float(),
+            )
 
             batch_n = x_batch.shape[0]
 
@@ -652,6 +677,14 @@ def train_cnn(
         if verbose:
             print(f"Training mode: mini-batch, batch_size={batch_size}")
 
+    if val_batch_size is None:
+        effective_val_batch_size = effective_batch_size
+    else:
+        if val_batch_size <= 0:
+            raise ValueError("val_batch_size must be a positive integer or None.")
+
+        effective_val_batch_size = val_batch_size
+
     # ============================================================
     # Initialize model
     # ============================================================
@@ -691,7 +724,7 @@ def train_cnn(
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=effective_batch_size,
+        batch_size=effective_val_batch_size,
         shuffle=False,
         drop_last=False,
         num_workers=num_workers,
@@ -703,7 +736,8 @@ def train_cnn(
         print("Validation size:", len(val_dataset))
         print("Sequence length:", sequence_length)
         print("Temporal receptive field:", temporal_receptive_field(kernel_size, model.dilations))
-        print("Batch size:", effective_batch_size)
+        print("Train batch size:", effective_batch_size)
+        print("Validation batch size:", effective_val_batch_size)
         print("Number of train batches per epoch:", len(train_loader))
         print("Number of validation batches:", len(val_loader))
         print("Trainable parameters:", count_parameters(model))
@@ -734,17 +768,26 @@ def train_cnn(
             x_batch = x_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
 
-            mean, var = model(x_batch)
-            train_marginal_losses = diagonal_gaussian_nll(mean, var, target_batch)
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                mean, var = model(x_batch)
+
+            train_marginal_losses = diagonal_gaussian_nll(
+                mean.float(),
+                var.float(),
+                target_batch.float(),
+            )
             train_loss = train_marginal_losses.sum()
 
-            optimizer.zero_grad(set_to_none=True)
-            train_loss.backward()
+            scaler.scale(train_loss).backward()
 
             if grad_clip_norm is not None:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             batch_n = x_batch.shape[0]
 
@@ -886,6 +929,9 @@ def train_cnn(
         "val_fraction": val_fraction,
         "batch_size": batch_size,
         "effective_batch_size": effective_batch_size,
+        "val_batch_size": val_batch_size,
+        "effective_val_batch_size": effective_val_batch_size,
+        "use_amp": use_amp,
         "lr": lr,
         "weight_decay": weight_decay,
         "n_epochs": n_epochs,
@@ -929,7 +975,7 @@ def train_cnn(
 
 def main():
     train_cnn(
-        data_path="sv_log_y_squared_default_1M_n253.npz",
+        data_path="sv_log_y_squared_default_1M.npz",
         tcn_channels=(16, 32, 32, 64, 64, 64),
         kernel_size=5,
         dilations=None,
@@ -937,17 +983,19 @@ def main():
         activation=nn.ReLU,
         dropout=0.05,
         use_batch_norm=True,
-        checkpoint_path="sv_posterior_tcn.pt",
+        checkpoint_path="sv_posterior_tcn_1M.pt",
         seed=1,
         val_fraction=0.2,
-        batch_size=1024 * 8,
-        lr=1e-4,
+        batch_size=1024*4,
+        val_batch_size=1024*16,
+        lr=0.5e-3,
         weight_decay=0.0,
         n_epochs=2000,
         patience=50,
         min_delta=1e-5,
         min_var=1e-12,
         standardize_input=True,
+        use_amp=True,
         grad_clip_norm=5.0,
         verbose=True,
         plot=True,
