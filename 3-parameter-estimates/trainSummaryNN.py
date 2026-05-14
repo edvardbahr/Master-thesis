@@ -680,7 +680,7 @@ def train_summary_nn(
 
 def main():
     """
-    Z, theta, feature_names = simulateData.generate_sv_dataset_parallel(
+    Z, theta, feature_names = simulateData.simulate_sv_dataset_parallel(
         N=800,
         n=253,
         chunk_size=200,
@@ -699,12 +699,12 @@ def main():
 
 
     train_summary_nn(
-    data_path = "sv_dataset_default_1M_ARIMA.npz",
+    data_path = "sv_dataset_finance_1M_ARIMA.npz",
     hidden_dims_shared_trunk=(128, 128),
     hidden_dims_head=(64, 64),
     activation=nn.ReLU,
-    checkpoint_path="sv_posterior_nn_1M_ARIMA.pt",
-    seed=1,
+    checkpoint_path="sv_posterior_nn_1M_ARIMA_finance.pt",
+    seed=2,
     val_fraction=0.2,
     batch_size=1024*16,
     lr=0.5e-3,    #Best step size found so far (I forgot standardazing tho :/)

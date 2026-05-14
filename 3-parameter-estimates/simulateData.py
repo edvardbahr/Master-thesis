@@ -12,6 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
 
 import numpy as np
+import pandas as pd
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import acovf
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
@@ -40,7 +41,7 @@ def _simulate_and_summarize_chunk(job):
         eps,
         arima_method,
         center_y,
-        clean_output,
+        remove_NaNs,
         out_dtype,
         exp_clip,
         p,
@@ -81,7 +82,7 @@ def _simulate_and_summarize_chunk(job):
             compute_arima_coeff=compute_arima_coeff,
             arima_method=arima_method,
             center_y=center_y,
-            clean_output=clean_output,
+            remove_NaNs=remove_NaNs,
         ).astype(out_dtype, copy=False)
 
     theta_chunk = np.column_stack([mu, phi, sigma]).astype(out_dtype, copy=False)
@@ -153,7 +154,7 @@ def summary_stats_sv(
     compute_arima_coeff=True,
     arima_method=None,
     center_y=True,
-    clean_output=True,
+    remove_NaNs=True,
 ):
     """
     Summary statistic for one observed SV series y_{1:n}.
@@ -415,7 +416,7 @@ def summary_stats_sv(
     # Volatility of volatility features
     out[i:i + 3] = spread_features
 
-    if clean_output:
+    if remove_NaNs:
         out[~np.isfinite(out)] = 0.0
 
     return out
@@ -836,7 +837,7 @@ def simulate_sv_summaries_parallel(
     eps=1e-12,
     arima_method=None,
     center_y=True,
-    clean_output=True,
+    remove_NaNs=True,
     out_dtype=np.float32,
     exp_clip=350.0,
     show_progress=True,
@@ -907,7 +908,7 @@ def simulate_sv_summaries_parallel(
                 eps,
                 arima_method,
                 center_y,
-                clean_output,
+                remove_NaNs,
                 out_dtype,
                 exp_clip,
                 p,
@@ -939,28 +940,48 @@ def simulate_sv_summaries_parallel(
     return Z, theta, feature_names
 
 
+def main1():
+    """
+    Generate a large summary-statistic dataset for the MLP trainer.
 
-if __name__ == "__main__":
+    The saved .npz file is compatible with trainSummaryNN.py and contains:
+        summaries:
+            Array of shape (N, p), where each row contains summary statistics.
 
+        params:
+            Array of shape (N, 3), with columns [mu, phi, sigma].
 
-    # Set parameters 
+        feature_names:
+            Names of the summary-statistic columns.
+
+        param_names:
+            Names of the parameter columns.
+
+        config:
+            JSON metadata describing the simulation settings.
+    """
 
     N = 1_000_000
     n = 253
 
     prior = "finance"
     chunks_per_worker = 8
-    compute_arima_coeff = True
+    compute_arima_coeff = False
     n_workers = -2 # -2 means "use all available cores minus two"
     seed = 1
+    k = 1e-12
+    eps = 1e-12
+    center_y = True
+    random_init = True
+    n_acvf_ratios = 4
+    out_dtype = np.float32
+    exp_clip = 350.0
 
     resolved_n_workers = resolve_n_workers(n_workers)
     chunk_size = resolve_chunk_size(N, resolved_n_workers, chunks_per_worker)
 
-    file_name = f"sv_dataset_{prior}_1M_ARIMA.npz"
-
-
-    # Generate data
+    arima_label = "ARIMA" if compute_arima_coeff else "no_ARIMA"
+    file_name = f"sv_summaries_{prior}_1M_n{n}_{arima_label}.npz"
 
     Z, theta, feature_names = simulate_sv_summaries_parallel(
         N=N,
@@ -968,10 +989,14 @@ if __name__ == "__main__":
         chunk_size=chunk_size,
         seed=seed,
         prior=prior,
-        random_init=True,
-        n_acvf_ratios=4,
+        random_init=random_init,
+        n_acvf_ratios=n_acvf_ratios,
         compute_arima_coeff=compute_arima_coeff,
-        out_dtype=np.float32,
+        k=k,
+        eps=eps,
+        center_y=center_y,
+        out_dtype=out_dtype,
+        exp_clip=exp_clip,
         show_progress=True,
         n_workers=resolved_n_workers,
     )
@@ -983,22 +1008,122 @@ if __name__ == "__main__":
         feature_names=np.array(feature_names),
         param_names=np.array(["mu", "phi", "sigma"]),
         config=json.dumps({  #Store metadata
+            "dataset_type": "summary_statistics",
             "N": N,
             "n": n,
             "chunk_size": chunk_size,
             "chunks_per_worker": chunks_per_worker,
+            "requested_n_workers": n_workers,
+            "resolved_n_workers": resolved_n_workers,
             "prior": prior,
-            "random_init": True,
-            "n_acvf_ratios": 4,
+            "random_init": random_init,
+            "n_acvf_ratios": n_acvf_ratios,
             "compute_arima_coeff": compute_arima_coeff,
+            "k": k,
+            "eps": eps,
+            "center_y": center_y,
+            "out_dtype": str(np.dtype(out_dtype)),
+            "exp_clip": exp_clip,
             "seed": seed,
         }),
     )
 
     print("Done.")
+    print("Saved to:", file_name)
     print("Z shape:", Z.shape)
     print("theta shape:", theta.shape)
 
-    import pandas as pd
     df = pd.DataFrame(Z, columns=feature_names)
     print(df.describe())
+
+
+def main2():
+    """
+    Generate a large log(y_t^2 + k) dataset for the TCN/CNN trainer.
+
+    This is the dataset format expected by trainCNN.py. The saved .npz file
+    contains:
+        log_y_squared:
+            Array of shape (N, n), where row i is log(y_i,t^2 + k).
+
+        params:
+            Array of shape (N, 3), with columns [mu, phi, sigma].
+
+        param_names:
+            Names of the parameter columns.
+
+        config:
+            JSON metadata describing the simulation settings.
+
+    The primary intended dataset is N=1,000,000, n=253, default prior.
+    """
+
+    N = 1_000_000
+    n = 253
+
+    prior = "default"
+    chunks_per_worker = 8
+    n_workers = -2 # -2 means "use all available cores minus two"
+    seed = 1
+    k = 1e-12
+    center_y = True
+    random_init = True
+    out_dtype = np.float32
+    exp_clip = 350.0
+
+    resolved_n_workers = resolve_n_workers(n_workers)
+    chunk_size = resolve_chunk_size(N, resolved_n_workers, chunks_per_worker)
+
+    file_name = f"sv_log_y_squared_{prior}_1M_n{n}.npz"
+
+    log_y_squared, theta = simulate_sv_log_y_squared_parallel(
+        N=N,
+        n=n,
+        chunk_size=chunk_size,
+        n_workers=resolved_n_workers,
+        seed=seed,
+        prior=prior,
+        random_init=random_init,
+        k=k,
+        center_y=center_y,
+        out_dtype=out_dtype,
+        exp_clip=exp_clip,
+        show_progress=True,
+    )
+    
+    np.savez(
+        file_name,
+        log_y_squared=log_y_squared,
+        params=theta,
+        param_names=np.array(["mu", "phi", "sigma"]),
+        config=json.dumps({  #Store metadata
+            "dataset_type": "log_y_squared",
+            "N": N,
+            "n": n,
+            "chunk_size": chunk_size,
+            "chunks_per_worker": chunks_per_worker,
+            "requested_n_workers": n_workers,
+            "resolved_n_workers": resolved_n_workers,
+            "prior": prior,
+            "random_init": random_init,
+            "k": k,
+            "center_y": center_y,
+            "out_dtype": str(np.dtype(out_dtype)),
+            "exp_clip": exp_clip,
+            "seed": seed,
+        }),
+    )
+
+    print("Done.")
+    print("Saved to:", file_name)
+    print("log_y_squared shape:", log_y_squared.shape)
+    print("theta shape:", theta.shape)
+    print("log_y_squared mean:", float(np.mean(log_y_squared)))
+    print("log_y_squared std:", float(np.std(log_y_squared)))
+    print("log_y_squared min:", float(np.min(log_y_squared)))
+    print("log_y_squared max:", float(np.max(log_y_squared)))
+
+
+if __name__ == "__main__":
+
+    main2()
