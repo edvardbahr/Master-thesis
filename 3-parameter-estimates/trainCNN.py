@@ -274,10 +274,10 @@ class SVPosteriorTCN(nn.Module):
     def __init__(
         self,
         sequence_length,
-        tcn_channels=(16, 32, 32, 64, 64, 64),
+        tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
         dilations=None,
-        hidden_dims_head=(64, 64),
+        hidden_dims_head=(32, 32),
         activation=nn.ReLU,
         dropout=0.0,
         use_batch_norm=True,
@@ -364,6 +364,7 @@ class SVPosteriorTCN(nn.Module):
 
         h = self.encoder(x)
 
+        # Each channel is pooled to a single value using both average and max pooling
         h_avg = F.adaptive_avg_pool1d(h, output_size=1).squeeze(-1)
         h_max = F.adaptive_max_pool1d(h, output_size=1).squeeze(-1)
         h = torch.cat([h_avg, h_max], dim=1)
@@ -976,12 +977,12 @@ def train_cnn(
 def main():
     train_cnn(
         data_path="sv_log_y_squared_default_1M.npz",
-        tcn_channels=(16, 32, 32, 64, 64, 64),
+        tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
         dilations=None,
-        hidden_dims_head=(64, 64),
+        hidden_dims_head=(32, 32),
         activation=nn.ReLU,
-        dropout=0.05,
+        dropout=0.0,
         use_batch_norm=True,
         checkpoint_path="sv_posterior_tcn_1M.pt",
         seed=1,

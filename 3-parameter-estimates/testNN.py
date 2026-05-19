@@ -21,7 +21,7 @@ from trainSummaryNN import SVPosteriorNN
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvolMCMC.R"
 
-DEFAULT_CHECKPOINT_PATH = "sv_posterior_nn_1M_ARIMA.pt"
+DEFAULT_CHECKPOINT_PATH = "sv_posterior_nn_1M_ARIMA_finance.pt"
 DEFAULT_OUTPUT_DIR = "nn_vs_mcmc_comparison"
 NORMAL_95_Z = 1.959963984540054
 
@@ -418,7 +418,7 @@ def plot_parameter_ci(comparison, parameter, output_dir, model_label, show=False
     ax.legend()
     fig.tight_layout()
 
-    output_path = output_dir / f"{parameter}_ci_comparison.png"
+    output_path = output_dir / f"{parameter}_ci_comparison_finance.png"
     fig.savefig(output_path, dpi=200)
 
     if show:
