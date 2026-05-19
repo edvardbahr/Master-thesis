@@ -416,6 +416,7 @@ def train_cnn(
     normalization_chunk_size=100_000,
     use_amp=None,
     grad_clip_norm=None,
+    warn_nonfinite_grad=True,
     verbose=True,
     plot=True,
     num_workers=0,
@@ -503,6 +504,9 @@ def train_cnn(
     grad_clip_norm:
         If not None, clip gradient norm to this value.
 
+    warn_nonfinite_grad:
+        If True, print a warning when NaN/Inf gradients are detected.
+
     verbose:
         Whether to print progress.
 
@@ -542,6 +546,13 @@ def train_cnn(
 
     if verbose and amp_enabled:
         print("Using CUDA automatic mixed precision")
+
+    def has_nonfinite_gradient(model):
+        for parameter in model.parameters():
+            if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+                return True
+
+        return False
 
     # ============================================================
     # Evaluation helper
@@ -765,12 +776,17 @@ def train_cnn(
         total_train_losses = None
         total_train_n = 0
 
-        for x_batch, target_batch in train_loader:
+        for batch_idx, (x_batch, target_batch) in enumerate(train_loader):
             x_batch = x_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
+            # AMP context is used during both training and validation inference,
+            # so that the model's outputs are always in the same dtype
+            # and the loss is computed consistently.
+            # This also lets us use a larger batch size if the GPU memory would be
+            # a bottleneck in full precision.
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 mean, var = model(x_batch)
 
@@ -781,13 +797,38 @@ def train_cnn(
             )
             train_loss = train_marginal_losses.sum()
 
+            # Upscale the loss by the GradScaler to prevent underflow in the backward pass when using AMP.
             scaler.scale(train_loss).backward()
 
-            if grad_clip_norm is not None:
+            if grad_clip_norm is not None or warn_nonfinite_grad:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
-            scaler.step(optimizer)
+            nonfinite_grad = warn_nonfinite_grad and has_nonfinite_gradient(model)
+
+            if nonfinite_grad and verbose:
+                if amp_enabled:
+                    print(
+                        "Warning: NaN/Inf gradients detected "
+                        f"at epoch {epoch + 1}, batch {batch_idx + 1}; "
+                        "GradScaler will skip the optimizer step and lower the scale."
+                    )
+                else:
+                    print(
+                        "Warning: NaN/Inf gradients detected "
+                        f"at epoch {epoch + 1}, batch {batch_idx + 1}; "
+                        "skipping the optimizer step."
+                    )
+
+            # Large gradients can occur and can destabilize training, especially with AMP.
+            # Clipping by norm prevents this. Unscaling the gradients before
+            # clipping makes the clipping threshold consistent across
+            # different AMP scaling values.
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            
+            # Undo the scaling in the optimizer step so that the correct effective learning rate is applied.
+            if not (nonfinite_grad and not amp_enabled):
+                scaler.step(optimizer)
             scaler.update()
 
             batch_n = x_batch.shape[0]
@@ -939,6 +980,7 @@ def train_cnn(
         "patience": patience,
         "min_delta": min_delta,
         "grad_clip_norm": grad_clip_norm,
+        "warn_nonfinite_grad": warn_nonfinite_grad,
         "seed": seed,
         "trainable_parameters": count_parameters(model),
     }
