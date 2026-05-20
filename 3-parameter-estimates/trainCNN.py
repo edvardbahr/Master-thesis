@@ -826,9 +826,17 @@ def train_cnn(
             if grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             
-            # Undo the scaling in the optimizer step so that the correct effective learning rate is applied.
-            if not (nonfinite_grad and not amp_enabled):
+           # scaler.step() checks if the gradient is scaled or unscaled.
+           # It unscales it only if it is scaled and then does an optimizer step.
+           # When amp is enabled scaler.step() also checks for NaNs. If they are present,
+           # it skips the optimizer step and also informs the scaler to reduce its factor for the next iteration.
+           # These guardrails are not in place when amp is disabled, so we check for nonfinite gradients ourselves and skip the step if needed.
+            if amp_enabled or not nonfinite_grad:
                 scaler.step(optimizer)
+            
+            # Updates the scale factor used by scaler.step().
+            # If the gradients were finite, the scale is increased by scaler_growth_interval.
+            # If the gradients were nonfinite, the scale is reduced by scaler_backoff_factor.
             scaler.update()
 
             batch_n = x_batch.shape[0]

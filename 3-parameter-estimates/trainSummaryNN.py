@@ -211,6 +211,7 @@ def train_summary_nn(
     verbose=True,
     plot=True,
     num_workers=0,
+    layer_norm=False,
 ):
     """
     Train a neural network to predict transformed SV parameters from summary statistics.
@@ -437,6 +438,7 @@ def train_summary_nn(
         hidden_dims_head=hidden_dims_head,
         activation=activation,
         min_var=min_var,
+        layer_norm=layer_norm,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -699,11 +701,11 @@ def main():
 
 
     train_summary_nn(
-    data_path = "sv_dataset_finance_1M_ARIMA.npz",
-    hidden_dims_shared_trunk=(128, 128),
-    hidden_dims_head=(64, 64),
+    data_path = "sv_dataset_default_10M.npz",
+    hidden_dims_shared_trunk=(128, 64),
+    hidden_dims_head=(32, 32),
     activation=nn.ReLU,
-    checkpoint_path="sv_posterior_nn_1M_ARIMA_finance.pt",
+    checkpoint_path="sv_posterior_nn_1M_ARIMA_finance_layerNormed.pt",
     seed=2,
     val_fraction=0.2,
     batch_size=1024*16,
@@ -715,6 +717,7 @@ def main():
     verbose=True,
     plot=True,
     num_workers=0,
+    layer_norm=True,
 )
 
 
