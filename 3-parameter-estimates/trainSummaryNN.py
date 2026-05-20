@@ -701,7 +701,7 @@ def main():
 
 
     train_summary_nn(
-    data_path = "sv_dataset_default_10M.npz",
+    data_path = "sv_dataset_default_1M.npz",
     hidden_dims_shared_trunk=(128, 64),
     hidden_dims_head=(32, 32),
     activation=nn.ReLU,
