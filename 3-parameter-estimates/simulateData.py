@@ -1000,19 +1000,7 @@ def log_y_squared_moments(prior="default"):
         + var_log_eps2
     )
 
-    return {
-        "mean": mean_log_y2,
-        "var": var_log_y2,
-        "std": np.sqrt(var_log_y2),
-        "components": {
-            "mean_log_eps2": mean_log_eps2,
-            "var_log_eps2": var_log_eps2,
-            "var_mu": var_mu,
-            "mean_sigma2": mean_sigma2,
-            "mean_inv_one_minus_phi2": mean_inv_one_minus_phi2,
-            "mean_stationary_h_var": mean_stationary_h_var,
-        },
-    }
+    return {"mean": mean_log_y2, "var": var_log_y2, "std": np.sqrt(var_log_y2)}
 
 
 
@@ -1114,91 +1102,57 @@ def main1():
 
 
 def main2():
-    """
-    Generate a large log(y_t^2 + k) dataset for the TCN/CNN trainer.
 
-    This is the dataset format expected by trainCNN.py. The saved .npz file
-    contains:
-        log_y_squared:
-            Array of shape (N, n), where row i is log(y_i,t^2 + k).
-
-        params:
-            Array of shape (N, 3), with columns [mu, phi, sigma].
-
-        param_names:
-            Names of the parameter columns.
-
-        config:
-            JSON metadata describing the simulation settings.
-
-    The primary intended dataset is N=1,000,000, n=253, default prior.
-    """
-
-    N = 1_000_000
+    N = 5_000_000
     n = 253
+    n_workers = resolve_n_workers(-2)
+    chunk_size = resolve_chunk_size(N, n_workers, 8)
 
-    prior = "default"
-    chunks_per_worker = 8
-    n_workers = -2 # -2 means "use all available cores minus two"
-    seed = 1
-    k = 1e-12
-    center_y = True
-    random_init = True
-    out_dtype = np.float32
-    exp_clip = 350.0
-
-    resolved_n_workers = resolve_n_workers(n_workers)
-    chunk_size = resolve_chunk_size(N, resolved_n_workers, chunks_per_worker)
-
-    file_name = f"sv_log_y_squared_{prior}_1M.npz"
-
-    log_y_squared, theta = simulate_sv_log_y_squared_parallel(
+    print(f"Simulating {N} series of length {n} in parallel using {n_workers} worker processes with prior='default'")
+    log_y_squared, _ = simulate_sv_log_y_squared_parallel(
         N=N,
         n=n,
         chunk_size=chunk_size,
-        n_workers=resolved_n_workers,
-        seed=seed,
-        prior=prior,
-        random_init=random_init,
-        k=k,
-        center_y=center_y,
-        out_dtype=out_dtype,
-        exp_clip=exp_clip,
+        seed=1,
+        prior="default",
+        random_init=True,
+        k=1e-12,
+        center_y=True,
+        out_dtype=np.float64,
+        exp_clip=350.0,
         show_progress=True,
     )
-    
-    np.savez(
-        file_name,
-        log_y_squared=log_y_squared,
-        params=theta,
-        param_names=np.array(["mu", "phi", "sigma"]),
-        config=json.dumps({  #Store metadata
-            "dataset_type": "log_y_squared",
-            "N": N,
-            "n": n,
-            "chunk_size": chunk_size,
-            "chunks_per_worker": chunks_per_worker,
-            "requested_n_workers": n_workers,
-            "resolved_n_workers": resolved_n_workers,
-            "prior": prior,
-            "random_init": random_init,
-            "k": k,
-            "center_y": center_y,
-            "out_dtype": str(np.dtype(out_dtype)),
-            "exp_clip": exp_clip,
-            "seed": seed,
-        }),
+
+    log_y_squared_mean_hat = np.mean(log_y_squared)
+    log_y_squared_var_hat = np.var(log_y_squared, ddof=1)
+    print(f"Mean: {log_y_squared_mean_hat}, Variance: {log_y_squared_var_hat}")
+
+    default_moments = log_y_squared_moments(prior="default")
+    print("default-predictive mean:", default_moments["mean"], "Default-predictive variance:", default_moments["var"])
+
+    del log_y_squared  # Free memory before the next large simulation
+    del _  # Free any other large variables if needed
+    print(f"Simulating {N} series of length {n} in parallel using {n_workers} worker processes with prior='finance'")
+    log_y_squared, _ = simulate_sv_log_y_squared_parallel(
+        N=N,
+        n=n,
+        chunk_size=chunk_size,
+        seed=1,
+        prior="finance",
+        random_init=True,
+        k=1e-12,
+        center_y=True,
+        out_dtype=np.float64,
+        exp_clip=350.0,
+        show_progress=True,
     )
 
-    print("Done.")
-    print("Saved to:", file_name)
-    print("log_y_squared shape:", log_y_squared.shape)
-    print("theta shape:", theta.shape)
-    print("log_y_squared mean:", float(np.mean(log_y_squared)))
-    print("log_y_squared std:", float(np.std(log_y_squared)))
-    print("log_y_squared min:", float(np.min(log_y_squared)))
-    print("log_y_squared max:", float(np.max(log_y_squared)))
+    log_y_squared_mean_hat = np.mean(log_y_squared)
+    log_y_squared_var_hat = np.var(log_y_squared, ddof=1)
+    print(f"Mean: {log_y_squared_mean_hat}, Variance: {log_y_squared_var_hat}")
 
+    finance_moments = log_y_squared_moments(prior="finance")
+    print("finance-predictive mean:", finance_moments["mean"], "Finance-predictive variance:", finance_moments["var"])
 
 if __name__ == "__main__":
 

@@ -21,25 +21,6 @@ from trainCNN import (
 )
 
 
-# ============================================================
-# Input standardization constants
-# ============================================================
-
-# These are prior-predictive moments for log(y_t^2), not for log(y_t^2 + k).
-# Replace the placeholder values with the moments you computed externally.
-#
-# input_std should be sqrt(var(log(y_t^2))).
-LOG_Y_SQUARED_INPUT_MOMENTS = {
-    "default": {
-        "mean": 0.0,
-        "std": 1.0,
-    },
-    "finance": {
-        "mean": 0.0,
-        "std": 1.0,
-    },
-}
-
 K_MOMENT_WARNING_THRESHOLD = 1e-10
 
 TRAIN_SEED_STREAM = 101
@@ -110,14 +91,7 @@ def resolve_input_moments(prior, standardize_input):
     if not standardize_input:
         return np.float32(0.0), np.float32(1.0)
 
-    if prior not in LOG_Y_SQUARED_INPUT_MOMENTS:
-        valid = ", ".join(LOG_Y_SQUARED_INPUT_MOMENTS)
-        raise ValueError(
-            f"No input standardization moments are stored for prior '{prior}'. "
-            f"Valid choices are: {valid}."
-        )
-
-    moments = LOG_Y_SQUARED_INPUT_MOMENTS[prior]
+    moments = sim.log_y_squared_moments(prior=prior)
     input_mean = np.float32(moments["mean"])
     input_std = np.float32(moments["std"])
 
