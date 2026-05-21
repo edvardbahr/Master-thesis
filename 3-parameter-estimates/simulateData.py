@@ -144,8 +144,6 @@ def _simulate_log_y_squared_chunk(job):
     return chunk_start, n_chunk, log_y_squared_chunk, theta_chunk
 
 
-
-
 def summary_stats_sv(
     y,
     k=1e-12,
@@ -420,7 +418,6 @@ def summary_stats_sv(
         out[~np.isfinite(out)] = 0.0
 
     return out
-
 
 
 def summary_stats_sv_feature_names(n_acvf_ratios=4, compute_arima_coeff=True):
@@ -822,7 +819,6 @@ def simulate_sv_log_y_squared_parallel(
     return log_y_squared, theta
 
 
-
 def simulate_sv_summaries_parallel(
     N,
     n,
@@ -938,6 +934,86 @@ def simulate_sv_summaries_parallel(
             theta[start_idx:start_idx + m_chunk, :] = theta_chunk
 
     return Z, theta, feature_names
+
+
+def log_y_squared_moments(prior="default"):
+    """
+    Computes the prior-predictive mean and variance of
+
+        log(y_t^2) = h_t + log(epsilon_t^2)
+
+    where
+
+        h_t | mu, phi, sigma ~ N(mu, sigma^2 / (1 - phi^2))
+        epsilon_t ~ N(0, 1)
+
+    and the SV parameters are drawn from the stochvol-style prior.
+    """
+
+    EULER_GAMMA = 0.5772156649015329
+
+    hyper = get_stochvol_prior_constants(prior)
+
+    a = hyper.phi_a0
+    b = hyper.phi_b0
+    Bsigma = hyper.Bsigma
+
+    if a <= 1 or b <= 1:
+        raise ValueError(
+            "The analytic variance requires phi_a0 > 1 and phi_b0 > 1, "
+            "otherwise E[1 / (1 - phi^2)] is infinite."
+        )
+
+    # Moments of log(epsilon_t^2), where epsilon_t ~ N(0, 1)
+    mean_log_eps2 = -EULER_GAMMA - np.log(2.0)
+    var_log_eps2 = np.pi**2 / 2.0
+
+    # E[mu]
+    mean_mu = hyper.mu_mean
+
+    # Var(mu)
+    var_mu = hyper.mu_sd**2
+
+    # E[sigma^2], since sigma^2 = Bsigma * chi^2_1
+    mean_sigma2 = Bsigma
+
+    # If phi = 2U - 1, U ~ Beta(a, b), then
+    #
+    # E[1 / (1 - phi^2)]
+    # =
+    # (a + b - 1) / 4 * (1 / (a - 1) + 1 / (b - 1))
+    mean_inv_one_minus_phi2 = (
+        (a + b - 1.0) / 4.0
+        * (1.0 / (a - 1.0) + 1.0 / (b - 1.0))
+    )
+
+    # E[sigma^2 / (1 - phi^2)]
+    mean_stationary_h_var = mean_sigma2 * mean_inv_one_minus_phi2
+
+    # Law of total expectation
+    mean_log_y2 = mean_mu + mean_log_eps2
+
+    # Law of total variance
+    var_log_y2 = (
+        var_mu
+        + mean_stationary_h_var
+        + var_log_eps2
+    )
+
+    return {
+        "mean": mean_log_y2,
+        "var": var_log_y2,
+        "std": np.sqrt(var_log_y2),
+        "components": {
+            "mean_log_eps2": mean_log_eps2,
+            "var_log_eps2": var_log_eps2,
+            "var_mu": var_mu,
+            "mean_sigma2": mean_sigma2,
+            "mean_inv_one_minus_phi2": mean_inv_one_minus_phi2,
+            "mean_stationary_h_var": mean_stationary_h_var,
+        },
+    }
+
 
 
 def main1():
