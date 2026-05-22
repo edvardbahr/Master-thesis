@@ -575,7 +575,11 @@ _STOCHVOL_PRIORS = {
 
 def get_stochvol_prior_constants(prior="default"):
     """
-    Return prior constants matching the R function get_stochvol_prior_constants().
+    Return the stochvol prior constants used throughout the project.
+
+    These constants are the single source of truth. Code that calls the R
+    stochvol bridge should pass these numeric values to R rather than
+    redefining named priors there.
     """
 
     if prior not in _STOCHVOL_PRIORS:
@@ -595,7 +599,7 @@ def sample_stochvol_prior(
     """
     Sample from the stochvol-style prior for (mu, phi, sigma).
 
-    Matches the R code:
+    Parameterization:
 
         mu     ~ N(mu_mean, mu_sd^2)
         (phi + 1) / 2 ~ Beta(phi_a0, phi_b0)
