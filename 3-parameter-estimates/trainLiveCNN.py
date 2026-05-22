@@ -104,6 +104,38 @@ def resolve_input_moments(prior, standardize_input):
     return input_mean, input_std
 
 
+def default_checkpoint_paths(checkpoint_path):
+    base, ext = os.path.splitext(checkpoint_path)
+
+    if ext == "":
+        ext = ".pt"
+
+    return f"{base}.latest{ext}", f"{base}.best{ext}"
+
+
+def torch_load_checkpoint(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def save_checkpoint_atomic(checkpoint, path):
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_path = f"{path}.tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def state_dict_to_cpu(state_dict):
+    return {
+        key: value.detach().cpu()
+        for key, value in state_dict.items()
+    }
+
+
 def simulate_live_dataset(
     N,
     sequence_length,
@@ -153,6 +185,9 @@ def train_live_cnn(
     dropout=0.0,
     use_batch_norm=True,
     checkpoint_path="sv_posterior_tcn_live.pt",
+    latest_checkpoint_path=None,
+    best_checkpoint_path=None,
+    resume_from=None,
     seed=1,
     batch_size=1024,
     n_batches=100,
@@ -222,6 +257,14 @@ def train_live_cnn(
 
     # Validate the prior name through simulateData's public API.
     sim.get_stochvol_prior_constants(prior)
+
+    default_latest_path, default_best_path = default_checkpoint_paths(checkpoint_path)
+
+    if latest_checkpoint_path is None:
+        latest_checkpoint_path = default_latest_path
+
+    if best_checkpoint_path is None:
+        best_checkpoint_path = default_best_path
 
     if k > K_MOMENT_WARNING_THRESHOLD:
         warnings.warn(
@@ -435,8 +478,126 @@ def train_live_cnn(
     best_epoch = None
     best_validation_seed = None
     epochs_without_improvement = 0
+    start_epoch = 0
 
-    for epoch in range(n_epochs):
+    def make_training_checkpoint(epoch_completed, checkpoint_kind):
+        best_model_state_cpu = None
+
+        if best_state is not None:
+            best_model_state_cpu = state_dict_to_cpu(best_state)
+
+        return {
+            "checkpoint_kind": checkpoint_kind,
+            "epoch": epoch_completed,
+            "model_state_dict": state_dict_to_cpu(model.state_dict()),
+            "best_model_state_dict": best_model_state_cpu,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+
+            "model_class": "SVPosteriorTCN",
+            "sequence_length": sequence_length,
+            "tcn_channels": tuple(tcn_channels),
+            "kernel_size": kernel_size,
+            "dilations": tuple(model.dilations),
+            "temporal_receptive_field": temporal_receptive_field(kernel_size, model.dilations),
+            "hidden_dims_head": tuple(hidden_dims_head),
+            "activation": getattr(activation, "__name__", str(activation)),
+            "dropout": dropout,
+            "use_batch_norm": use_batch_norm,
+            "min_var": min_var,
+
+            "input_mean": np.float32(input_mean),
+            "input_std": np.float32(input_std),
+            "standardize_input": standardize_input,
+            "standardization_source": "LOG_Y_SQUARED_INPUT_MOMENTS",
+
+            "target_names": target_names,
+            "target_transform": {
+                "mu": "mu",
+                "psi": "2 * atanh(phi)",
+                "log_sigma": "log(sigma)",
+            },
+
+            "best_val_loss": float(best_val_loss),
+            "best_epoch": best_epoch,
+            "best_validation_seed": best_validation_seed,
+            "epochs_without_improvement": epochs_without_improvement,
+            "train_loss_history": train_loss_history,
+            "val_loss_history": val_loss_history,
+            "train_marginal_loss_history": train_marginal_loss_history,
+            "val_marginal_loss_history": val_marginal_loss_history,
+            "train_seed_history": train_seed_history,
+            "validation_seed_history": validation_seed_history,
+
+            "live_training": True,
+            "prior": prior,
+            "batch_size": batch_size,
+            "n_batches": n_batches,
+            "train_size_per_validation": train_size,
+            "val_size": val_size,
+            "fixed_validation": fixed_validation,
+            "effective_val_batch_size": effective_val_batch_size,
+            "requested_n_workers": n_workers,
+            "resolved_n_workers": resolved_n_workers,
+            "chunks_per_worker": chunks_per_worker,
+            "train_chunk_size": train_chunk_size,
+            "val_chunk_size": val_chunk_size,
+            "random_init": random_init,
+            "k": k,
+            "center_y": center_y,
+            "out_dtype": str(np.dtype(out_dtype)),
+            "exp_clip": exp_clip,
+            "simulation_progress": simulation_progress,
+
+            "use_amp": use_amp,
+            "deterministic_torch": deterministic_torch,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "n_epochs": n_epochs,
+            "patience": patience,
+            "min_delta": min_delta,
+            "grad_clip_norm": grad_clip_norm,
+            "warn_nonfinite_grad": warn_nonfinite_grad,
+            "seed": seed,
+            "trainable_parameters": count_parameters(model),
+        }
+
+    if resume_from is not None:
+        resume_checkpoint = torch_load_checkpoint(resume_from, map_location=device)
+
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+
+        if "optimizer_state_dict" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+
+        if "scaler_state_dict" in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+
+        train_marginal_loss_history = resume_checkpoint.get("train_marginal_loss_history", [])
+        val_marginal_loss_history = resume_checkpoint.get("val_marginal_loss_history", [])
+        train_loss_history = resume_checkpoint.get("train_loss_history", [])
+        val_loss_history = resume_checkpoint.get("val_loss_history", [])
+        train_seed_history = resume_checkpoint.get("train_seed_history", [])
+        validation_seed_history = resume_checkpoint.get("validation_seed_history", [])
+
+        best_val_loss = float(resume_checkpoint.get("best_val_loss", float("inf")))
+        best_epoch = resume_checkpoint.get("best_epoch")
+        best_validation_seed = resume_checkpoint.get("best_validation_seed")
+        epochs_without_improvement = int(
+            resume_checkpoint.get("epochs_without_improvement", 0)
+        )
+        start_epoch = int(resume_checkpoint.get("epoch", len(train_loss_history)))
+
+        if "best_model_state_dict" in resume_checkpoint:
+            best_state = resume_checkpoint["best_model_state_dict"]
+        elif np.isfinite(best_val_loss):
+            best_state = copy.deepcopy(model.state_dict())
+
+        if verbose:
+            print(f"Resumed training from {resume_from}")
+            print(f"Starting at epoch {start_epoch + 1}")
+
+    for epoch in range(start_epoch, n_epochs):
         train_seed = make_child_seed(
             seed,
             TRAIN_SEED_STREAM,
@@ -573,7 +734,9 @@ def train_live_cnn(
         train_marginal_loss_history.append(train_marginal_losses_np.tolist())
         val_marginal_loss_history.append(val_marginal_losses_np.tolist())
 
-        if val_loss_value < best_val_loss - min_delta:
+        improved = val_loss_value < best_val_loss - min_delta
+
+        if improved:
             best_val_loss = val_loss_value
             best_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch + 1
@@ -605,6 +768,25 @@ def train_live_cnn(
                 f"             "
                 f"val marginal NLLs:   {val_parts}"
             )
+
+        latest_checkpoint = make_training_checkpoint(
+            epoch_completed=epoch + 1,
+            checkpoint_kind="latest",
+        )
+        save_checkpoint_atomic(latest_checkpoint, latest_checkpoint_path)
+
+        if improved:
+            best_checkpoint = make_training_checkpoint(
+                epoch_completed=epoch + 1,
+                checkpoint_kind="best",
+            )
+            save_checkpoint_atomic(best_checkpoint, best_checkpoint_path)
+
+        if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
+            print(f"Latest checkpoint saved to {latest_checkpoint_path}")
+
+            if improved:
+                print(f"Best checkpoint saved to {best_checkpoint_path}")
 
         if epochs_without_improvement >= patience:
             if verbose:
@@ -679,13 +861,15 @@ def train_live_cnn(
 
     activation_name = getattr(activation, "__name__", str(activation))
 
-    model_state_cpu = {
-        key: value.detach().cpu()
-        for key, value in model.state_dict().items()
-    }
+    model_state_cpu = state_dict_to_cpu(model.state_dict())
 
     checkpoint = {
+        "checkpoint_kind": "final",
+        "epoch": len(train_loss_history),
         "model_state_dict": model_state_cpu,
+        "best_model_state_dict": state_dict_to_cpu(best_state) if best_state is not None else None,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
 
         "model_class": "SVPosteriorTCN",
         "sequence_length": sequence_length,
@@ -758,9 +942,12 @@ def train_live_cnn(
         "warn_nonfinite_grad": warn_nonfinite_grad,
         "seed": seed,
         "trainable_parameters": count_parameters(model),
+        "latest_checkpoint_path": latest_checkpoint_path,
+        "best_checkpoint_path": best_checkpoint_path,
+        "resume_from": resume_from,
     }
 
-    torch.save(checkpoint, checkpoint_path)
+    save_checkpoint_atomic(checkpoint, checkpoint_path)
 
     if verbose:
         print(f"Model saved to {checkpoint_path}")
@@ -803,23 +990,26 @@ def main():
         dropout=0.0,
         use_batch_norm=True,
         checkpoint_path="sv_posterior_tcn_live.pt",
+        latest_checkpoint_path="sv_posterior_tcn_live.latest.pt",
+        best_checkpoint_path="sv_posterior_tcn_live.best.pt",
+        resume_from=None,  # Set to "sv_posterior_tcn_live.latest.pt" to continue.
         seed=1,
-        batch_size=1024 * 4,
-        n_batches=100,
-        val_size=500_000,
+        batch_size=1024 * 8,
+        n_batches=100,    # Number of batches done before each validation
+        val_size=500_000, # Larger validation to reduce noise between each epoch's validation scores 
         fixed_validation=False,
         lr=0.5e-3,
         weight_decay=0.0,
         n_epochs=2000,
-        patience=50,
+        patience=75, # A bit higher patience since live training is noisier than fixed datasets
         min_delta=1e-5,
-        min_var=1e-12,
+        min_var=1e-12, # Minimum variance to ensure numerical stability in the loss and gradients
         standardize_input=True,
-        use_amp=True,
+        use_amp=True,  # Use automatic mixed precision to save on memory
         grad_clip_norm=5.0,
         warn_nonfinite_grad=True,
         deterministic_torch=True,
-        n_workers=-2,
+        n_workers=-2, # Uses all but 2 cpu cores for data simulation
         chunks_per_worker=4,
         random_init=True,
         k=1e-12,

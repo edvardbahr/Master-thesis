@@ -27,11 +27,18 @@ NORMAL_95_Z = 1.959963984540054
 
 
 def find_rscript():
+    """
+    Find the path to the Rscript executable which is 
+    needed to run the stochvol MCMC estimation in R. 
+    """
+
+    # Search through folders on PATH to find the runnable program "Rscript". 
     rscript = shutil.which("Rscript")
 
     if rscript is not None:
         return rscript
-
+    
+    # If not found on PATH, look in the default installation location for R on Windows.
     program_files = Path("C:/Program Files")
     candidates = sorted(
         program_files.glob("R/R-*/bin/Rscript.exe"),
