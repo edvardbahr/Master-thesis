@@ -47,6 +47,10 @@ class LoadedSVModel:
 # ============================================================
 
 def find_rscript():
+    """
+    Try to find Rscript in the system. First check PATH,
+    then look in common installation directories on Windows.
+    """
     rscript = shutil.which("Rscript")
 
     if rscript is not None:
@@ -67,6 +71,10 @@ def find_rscript():
 
 
 def resolve_existing_path(path):
+    """
+    Resolve a path that may be absolute or relative. If relative, search in cwd,
+    script directory, and parent directories. Return the first existing path found.
+    """
     path = Path(path).expanduser()
 
     if path.is_absolute():
@@ -94,6 +102,10 @@ def resolve_existing_path(path):
 
 
 def resolve_output_dir(path):
+    """
+    Resolve an output directory path.
+    If it doesn't exist, create it. Return the resolved path.
+    """
     path = Path(path).expanduser()
 
     if not path.is_absolute():
@@ -112,7 +124,13 @@ def torch_load_checkpoint(path, map_location):
 
 
 def activation_from_checkpoint(checkpoint):
-    activation_name = checkpoint.get("activation", "ReLU")
+    """
+    Get the activation function class from the checkpoint. Default to ReLU if not specified.
+    """
+    activation_name = checkpoint.get("activation", -1)
+    if activation_name == -1:
+        print("Warning: checkpoint does not specify activation. Defaulting to ReLU.")
+        activation_name = "ReLU"
     activation = getattr(nn, activation_name, None)
 
     if activation is None:
