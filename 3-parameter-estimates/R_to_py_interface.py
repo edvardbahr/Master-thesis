@@ -56,7 +56,7 @@ def validate_series_matrix(y):
 
 def run_stochvol_mcmc(
     y,
-    prior="finance",
+    prior="default",
     draws=2000,
     burnin=500,
     thinpara=1,
@@ -160,7 +160,7 @@ def main():
         simulated_data,
         draws=10000,
         burnin=2000,
-        thinpara=5,
+        thinpara=1,
         return_draws=True,
     )
 
@@ -168,7 +168,7 @@ def main():
 
     traceplot_path = plot_parameter_trace(
         draws,
-        output_path=HERE / "stochvol_traceplot.png",
+        output_path=HERE / "recovered_plots" / "stochvol_traceplot.png",
         true_values={"mu": mu[0], "phi": phi[0], "sigma": sigma[0]},
     )
     print(f"Saved traceplot to {traceplot_path}")
