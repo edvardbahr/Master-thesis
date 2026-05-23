@@ -1,9 +1,10 @@
-import argparse
+import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 import numpy as np
 import pandas as pd
@@ -14,12 +15,6 @@ import simulateData as sim
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvolMCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
-
-
-@dataclass
-class StochvolMCMCResult:
-    summary: pd.DataFrame
-    draws: pd.DataFrame | None = None
 
 
 def find_rscript():
@@ -113,154 +108,70 @@ def run_stochvol_mcmc(
         )
 
     if return_draws:
-        return StochvolMCMCResult(summary=summary, draws=parameter_draws)
+        return summary, parameter_draws
 
     return summary
 
 
-def simulate_sanity_check_data(n_series=6, n_obs=253, seed=12345):
-    rng = np.random.default_rng(seed)
+def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
+    import matplotlib.pyplot as plt
 
-    truth = pd.DataFrame({
-        "mu_true": np.linspace(-10.0, -8.0, n_series),
-        "phi_true": np.linspace(0.94, 0.985, n_series),
-        "sigma_true": np.linspace(0.15, 0.35, n_series),
-    })
+    draws = draws[draws["index"] == series_index]
 
-    y = sim.simulate_sv_chunk(
-        mu=truth["mu_true"].to_numpy(),
-        phi=truth["phi_true"].to_numpy(),
-        sigma=truth["sigma_true"].to_numpy(),
-        n=n_obs,
-        rng=rng,
+    fig, axes = plt.subplots(
+        len(PARAMETER_NAMES),
+        1,
+        figsize=(10, 7),
+        sharex=True,
     )
 
-    return y, truth
+    for ax, parameter in zip(axes, PARAMETER_NAMES):
+        ax.plot(draws["draw_index"], draws[parameter], linewidth=0.7)
+        if true_values is not None:
+            ax.axhline(
+                true_values[parameter],
+                color="black",
+                linestyle="--",
+                linewidth=1.0,
+            )
+        ax.set_ylabel(parameter)
 
+    axes[-1].set_xlabel("MCMC draw")
+    fig.suptitle(f"stochvol parameter traceplot, series {series_index}")
+    fig.tight_layout()
 
-def summarize_sanity_check(summary, truth):
-    summary = summary.sort_values("index").reset_index(drop=True)
-    truth = truth.reset_index(drop=True)
+    output_path = Path(output_path)
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
 
-    rows = []
-    for parameter in PARAMETER_NAMES:
-        true_value = truth[f"{parameter}_true"]
-        median = summary[f"{parameter}_median"]
-        lower = summary[f"{parameter}_ci_lower"]
-        upper = summary[f"{parameter}_ci_upper"]
-
-        rows.append({
-            "parameter": parameter,
-            "coverage": np.mean((lower <= true_value) & (true_value <= upper)),
-            "mean_error": np.mean(median - true_value),
-            "mean_abs_error": np.mean(np.abs(median - true_value)),
-            "mean_ci_width": np.mean(upper - lower),
-        })
-
-    return pd.DataFrame(rows)
-
-
-def check_draw_summary_consistency(result):
-    if result.draws is None:
-        raise ValueError("Raw draws are needed for this check.")
-
-    rows = []
-    grouped = result.draws.groupby("index", sort=True)
-    summary = result.summary.set_index("index")
-
-    for index, draws_for_series in grouped:
-        for parameter in PARAMETER_NAMES:
-            rows.append({
-                "index": index,
-                "parameter": parameter,
-                "mean_diff": (
-                    draws_for_series[parameter].mean()
-                    - summary.loc[index, f"{parameter}_mean"]
-                ),
-                "median_diff": (
-                    draws_for_series[parameter].median()
-                    - summary.loc[index, f"{parameter}_median"]
-                ),
-            })
-
-    return pd.DataFrame(rows)
-
-
-def run_sanity_check(
-    n_series=6,
-    n_obs=253,
-    prior="finance",
-    draws=2000,
-    burnin=500,
-    thinpara=1,
-    alpha=0.05,
-    seed=12345,
-):
-    y, truth = simulate_sanity_check_data(
-        n_series=n_series,
-        n_obs=n_obs,
-        seed=seed,
-    )
-
-    result = run_stochvol_mcmc(
-        y,
-        prior=prior,
-        draws=draws,
-        burnin=burnin,
-        thinpara=thinpara,
-        alpha=alpha,
-        return_draws=True,
-    )
-
-    sanity = summarize_sanity_check(result.summary, truth)
-    consistency = check_draw_summary_consistency(result)
-
-    return result, truth, sanity, consistency
+    return output_path
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run small sanity checks for the Python-to-stochvol bridge."
-    )
-    parser.add_argument("--n-series", type=int, default=6)
-    parser.add_argument("--n-obs", type=int, default=253)
-    parser.add_argument("--prior", default="finance")
-    parser.add_argument("--draws", type=int, default=2000)
-    parser.add_argument("--burnin", type=int, default=500)
-    parser.add_argument("--thinpara", type=int, default=1)
-    parser.add_argument("--alpha", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=12345)
-    args = parser.parse_args()
+    mu = [-9.0]
+    phi = [0.98]
+    sigma = [0.20]
 
-    result, truth, sanity, consistency = run_sanity_check(
-        n_series=args.n_series,
-        n_obs=args.n_obs,
-        prior=args.prior,
-        draws=args.draws,
-        burnin=args.burnin,
-        thinpara=args.thinpara,
-        alpha=args.alpha,
-        seed=args.seed,
+    rng = np.random.default_rng(seed=1)
+
+    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=253*4, rng=rng)[0]
+
+    summary, draws = run_stochvol_mcmc(
+        simulated_data,
+        draws=10000,
+        burnin=2000,
+        thinpara=5,
+        return_draws=True,
     )
 
-    print("\nTrue parameters:")
-    print(truth.to_string(index=False))
+    print(summary[["mu_mean", "phi_mean", "sigma_mean"]])
 
-    print("\nMCMC posterior summaries:")
-    print(result.summary.to_string(index=False))
-
-    print("\nSanity-check metrics:")
-    print(sanity.to_string(index=False))
-
-    print("\nMax absolute summary-vs-raw-draw discrepancy:")
-    print(
-        consistency[["mean_diff", "median_diff"]]
-        .abs()
-        .max()
-        .to_string()
+    traceplot_path = plot_parameter_trace(
+        draws,
+        output_path=HERE / "stochvol_traceplot.png",
+        true_values={"mu": mu[0], "phi": phi[0], "sigma": sigma[0]},
     )
-
-    print(f"\nRaw parameter draws returned: {len(result.draws)} rows")
+    print(f"Saved traceplot to {traceplot_path}")
 
 
 if __name__ == "__main__":
