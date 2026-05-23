@@ -1,4 +1,5 @@
 import copy
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import simulateData
@@ -85,6 +86,8 @@ class SVPosteriorNN(nn.Module):
         self.hidden_dims_shared_trunk = hidden_dims_shared_trunk
         self.hidden_dims_head = hidden_dims_head
         self.min_var = min_var
+        self.dropout = dropout
+        self.layer_norm = layer_norm
 
         self.shared_trunk, trunk_output_dim = make_mlp(
             input_dim=input_dim,
@@ -328,10 +331,17 @@ def train_summary_nn(
 
     Z = data["summaries"].astype(np.float32)
     theta = data["params"].astype(np.float32)
+    feature_names = data["feature_names"].astype(str).tolist()
+    dataset_config = json.loads(str(data["config"]))
+
+    center_y = bool(dataset_config.get("center_y", True))
+    if not center_y:
+        raise ValueError("Summary NN training requires datasets generated with center_y=True.")
 
     if verbose:
         print("Z shape:", Z.shape)
         print("theta shape:", theta.shape)
+        print("feature count:", len(feature_names))
 
     # Transform constrained parameters to unconstrained training targets.
     target = theta_to_target_numpy(theta).astype(np.float32)
@@ -431,6 +441,11 @@ def train_summary_nn(
     # ============================================================
 
     input_dim = Z.shape[1]
+
+    if len(feature_names) != input_dim:
+        raise ValueError(
+            f"feature_names has length {len(feature_names)}, but input_dim is {input_dim}."
+        )
 
     model = SVPosteriorNN(
         input_dim=input_dim,
@@ -609,6 +624,7 @@ def train_summary_nn(
     }
 
     checkpoint = {
+        "model_class": model.__class__.__name__,
         "model_state_dict": model_state_cpu,
 
         "input_dim": input_dim,
@@ -616,9 +632,20 @@ def train_summary_nn(
         "hidden_dims_head": hidden_dims_head,
         "activation": activation_name,
         "min_var": min_var,
+        "dropout": float(dropout),
+        "layer_norm": bool(layer_norm),
 
         "z_mean": z_mean.astype(np.float32),
         "z_std": z_std.astype(np.float32),
+
+        "feature_names": feature_names,
+        "n_acvf_ratios": int(dataset_config.get("n_acvf_ratios", 4)),
+        "compute_arima_coeff": bool(dataset_config.get("compute_arima_coeff", True)),
+        "k": float(dataset_config.get("k", 1e-12)),
+        "eps": float(dataset_config.get("eps", 1e-12)),
+        "center_y": True,
+        "remove_NaNs": bool(dataset_config.get("remove_NaNs", True)),
+        "dataset_config": dataset_config,
 
         "target_names": target_names,
         "target_transform": {
