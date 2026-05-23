@@ -1,4 +1,3 @@
-import argparse
 import os
 import tempfile
 from dataclasses import dataclass
@@ -20,9 +19,6 @@ from trainSummaryNN import SVPosteriorNN
 
 HERE = Path(__file__).resolve().parent
 
-DEFAULT_SUMMARY_CHECKPOINT_PATH = "sv_posterior_nn_1M_ARIMA_finance.pt"
-DEFAULT_TCN_CHECKPOINT_PATH = "sv_posterior_tcn_live.latest.pt"
-DEFAULT_OUTPUT_DIR = "nn_parameter_sweep_test"
 DEFAULT_ALPHA = 0.05
 
 PARAMETER_NAMES = ("mu", "phi", "sigma")
@@ -410,6 +406,9 @@ def add_ci_rows(rows, swept_parameter, true_values, method, ci_frame):
 def run_parameter_sweep_test(
     summary_model,
     tcn_model,
+    baseline=None,
+    sweep_deltas=None,
+    sweeps=None,
     n=253,
     sweep_size=9,
     seed=12345,
@@ -422,6 +421,9 @@ def run_parameter_sweep_test(
 ):
     rng = np.random.default_rng(seed)
     datasets, sweeps, baseline = make_single_parameter_sweep_datasets(
+        baseline=baseline,
+        sweeps=sweeps,
+        sweep_deltas=sweep_deltas,
         n=n,
         sweep_size=sweep_size,
         rng=rng,
@@ -542,59 +544,68 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
     return output_path
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Compare MCMC, summary NN, and live TCN CIs on one-parameter SV sweeps."
-    )
-    parser.add_argument("--summary-checkpoint", default=DEFAULT_SUMMARY_CHECKPOINT_PATH)
-    parser.add_argument("--tcn-checkpoint", default=DEFAULT_TCN_CHECKPOINT_PATH)
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--n", type=int, default=253)
-    parser.add_argument("--sweep-size", type=int, default=9)
-    parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
-    parser.add_argument("--mcmc-prior", default="finance")
-    parser.add_argument("--mcmc-draws", type=int, default=2000)
-    parser.add_argument("--mcmc-burnin", type=int, default=500)
-    parser.add_argument("--mcmc-thinpara", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=4096)
-    parser.add_argument("--device", default=None)
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    summary_checkpoint_path = "sv_posterior_nn_1M_ARIMA_finance.pt"
+    tcn_checkpoint_path = "sv_posterior_tcn_live.best.pt"
+    output_dir = Path("nn_parameter_sweep_test")
+
+    baseline = {
+        "mu": -9.0,
+        "phi": 0.98,
+        "sigma": 0.20,
+    }
+    sweep_deltas = {
+        "mu": 2.0,
+        "phi": 0.015,
+        "sigma": 0.10,
+    }
+    sweeps = None
+
+    n = 253
+    sweep_size = 10
+    seed = 2
+    alpha = 0.05
+
+    mcmc_prior = "finance"
+    mcmc_draws = 2000
+    mcmc_burnin = 500
+    mcmc_thinpara = 1
+
+    batch_size = 4096
+    device_name = None
 
     device = torch.device(
-        args.device if args.device is not None
+        device_name if device_name is not None
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
 
-    summary_model = load_summary_model(args.summary_checkpoint, device)
-    tcn_model = load_tcn_model(args.tcn_checkpoint, device)
+    summary_model = load_summary_model(summary_checkpoint_path, device)
+    tcn_model = load_tcn_model(tcn_checkpoint_path, device)
 
     comparison, sweeps, baseline = run_parameter_sweep_test(
         summary_model=summary_model,
         tcn_model=tcn_model,
-        n=args.n,
-        sweep_size=args.sweep_size,
-        seed=args.seed,
-        alpha=args.alpha,
-        mcmc_prior=args.mcmc_prior,
-        mcmc_draws=args.mcmc_draws,
-        mcmc_burnin=args.mcmc_burnin,
-        mcmc_thinpara=args.mcmc_thinpara,
-        batch_size=args.batch_size,
+        baseline=baseline,
+        sweep_deltas=sweep_deltas,
+        sweeps=sweeps,
+        n=n,
+        sweep_size=sweep_size,
+        seed=seed,
+        alpha=alpha,
+        mcmc_prior=mcmc_prior,
+        mcmc_draws=mcmc_draws,
+        mcmc_burnin=mcmc_burnin,
+        mcmc_thinpara=mcmc_thinpara,
+        batch_size=batch_size,
     )
 
-    output_dir = resolve_path(args.output_dir) if Path(args.output_dir).exists() else Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = output_dir / "parameter_sweep_ci_comparison.csv"
     plot_path = output_dir / "parameter_sweep_ci_comparison.png"
 
     comparison.to_csv(csv_path, index=False)
-    plot_parameter_sweep_ci(comparison, plot_path, args.alpha)
+    plot_parameter_sweep_ci(comparison, plot_path, alpha)
 
     print("Baseline:", baseline)
     print("Sweeps:", {key: values.tolist() for key, values in sweeps.items()})
