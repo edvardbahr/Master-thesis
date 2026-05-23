@@ -208,6 +208,7 @@ def train_summary_nn(
     batch_size=1024,
     lr= 0.2e-3,
     n_epochs=1000,
+    dropout=0.0,
     patience=50,
     min_delta=1e-4,
     min_var=1e-12,
