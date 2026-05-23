@@ -32,6 +32,16 @@ DEFAULT_K = 1e-12
 
 PARAMETER_NAMES = ("mu", "phi", "sigma")
 TRANSFORMED_TARGET_NAMES = ["mu", "psi", "log_sigma"]
+DEFAULT_BASELINE = {
+    "mu": -9.0,
+    "phi": 0.98,
+    "sigma": 0.20,
+}
+DEFAULT_SWEEP_DELTAS = {
+    "mu": 2.0,
+    "phi": 0.015,
+    "sigma": 0.10,
+}
 
 
 def find_rscript():
@@ -263,15 +273,67 @@ def run_stochvol_mcmc(
     return result
 
 
+def simulate_single_parameter_sweep_datasets(
+    baseline=None,
+    sweeps=None,
+    sweep_deltas=None,
+    sweep_size=9,
+    n=253,
+    rng=None,
+    random_init=True,
+):
+    """
+    Return one simulated dataset per parameter sweep.
+
+    datasets[parameter] contains simulations where only that parameter changes
+    across rows; the other SV parameters are held fixed at the baseline.
+    """
+    baseline = DEFAULT_BASELINE | (baseline or {})
+    sweep_deltas = DEFAULT_SWEEP_DELTAS | (sweep_deltas or {})
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if sweeps is None:
+        sweeps = {
+            parameter: np.linspace(
+                baseline[parameter] - sweep_deltas[parameter],
+                baseline[parameter] + sweep_deltas[parameter],
+                sweep_size,
+            )
+            for parameter in PARAMETER_NAMES
+        }
+
+    datasets = {}
+    for swept_parameter in PARAMETER_NAMES:
+        m = len(sweeps[swept_parameter])
+        params = {
+            parameter: np.full(m, baseline[parameter])
+            for parameter in PARAMETER_NAMES
+        }
+        params[swept_parameter] = np.asarray(sweeps[swept_parameter])
+
+        datasets[swept_parameter] = sim.simulate_sv_chunk(
+            mu=params["mu"],
+            phi=params["phi"],
+            sigma=params["sigma"],
+            n=n,
+            rng=rng,
+            random_init=random_init,
+        )
+
+    return datasets, sweeps, baseline
 
 
 def main():
-    
 
 
     
+    n = 253
+    rng = np.random.default_rng(12345)
+    datasets, sweeps, baseline = simulate_single_parameter_sweep_datasets(n=n, rng=rng)
 
-    data = sim.simulate_sv_chunk()
+
 
 
 
