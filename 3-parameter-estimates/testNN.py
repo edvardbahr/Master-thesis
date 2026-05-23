@@ -1,8 +1,6 @@
 import argparse
 import os
 import re
-import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +10,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplot
 
 import numpy as np
 import pandas as pd
+from R_to_py_interface import run_stochvol_mcmc, validate_series_matrix
 import simulateData as sim
 import torch
 import torch.nn as nn
@@ -20,7 +19,6 @@ from trainSummaryNN import SVPosteriorNN
 
 
 HERE = Path(__file__).resolve().parent
-R_SCRIPT = HERE / "stochvolMCMC.R"
 
 DEFAULT_SUMMARY_CHECKPOINT_PATH = "sv_posterior_nn_1M_ARIMA_finance.pt"
 DEFAULT_OUTPUT_DIR = "nn_vs_mcmc_comparison"
@@ -45,30 +43,6 @@ class LoadedSVModel:
 # ============================================================
 # Path and checkpoint helpers
 # ============================================================
-
-def find_rscript():
-    """
-    Try to find Rscript in the system. First check PATH,
-    then look in common installation directories on Windows.
-    """
-    rscript = shutil.which("Rscript")
-
-    if rscript is not None:
-        return rscript
-
-    program_files = Path("C:/Program Files")
-    candidates = sorted(
-        program_files.glob("R/R-*/bin/Rscript.exe"),
-        reverse=True,
-    )
-
-    if candidates:
-        return str(candidates[0])
-
-    raise FileNotFoundError(
-        "Could not find Rscript. Add R's bin folder to PATH, or install R."
-    )
-
 
 def resolve_existing_path(path):
     """
@@ -319,92 +293,6 @@ def load_sv_model(
         prefix=prefix,
         device=device,
     )
-
-
-# ============================================================
-# MCMC baseline
-# ============================================================
-
-def validate_series_matrix(y):
-    y = np.asarray(y, dtype=np.float64)
-
-    if y.ndim == 1:
-        y = y.reshape(1, -1)
-    elif y.ndim != 2:
-        raise ValueError("y must have shape (n,) or (m, n).")
-
-    if y.shape[0] < 1 or y.shape[1] < 1:
-        raise ValueError("y must contain at least one series and one observation.")
-
-    if not np.all(np.isfinite(y)):
-        raise ValueError("y contains NaN or infinite values.")
-
-    return y
-
-
-def run_stochvol_mcmc(
-    y,
-    prior="finance",
-    draws=2000,
-    burnin=500,
-    thinpara=1,
-    alpha=DEFAULT_ALPHA,
-):
-    y = validate_series_matrix(y)
-
-    if draws < 1:
-        raise ValueError("draws must be at least 1.")
-
-    if burnin < 0:
-        raise ValueError("burnin must be non-negative.")
-
-    if thinpara < 1:
-        raise ValueError("thinpara must be at least 1.")
-
-    if not (0.0 < alpha < 1.0):
-        raise ValueError("alpha must be between 0 and 1.")
-
-    if not R_SCRIPT.exists():
-        raise FileNotFoundError(f"Could not find MCMC R script: {R_SCRIPT}")
-
-    prior_constants = sim.get_stochvol_prior_constants(prior)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "y.csv"
-        output_path = tmpdir / "sv_result.csv"
-
-        np.savetxt(input_path, y, delimiter=",")
-
-        subprocess.run(
-            [
-                find_rscript(),
-                str(R_SCRIPT),
-                str(input_path),
-                str(output_path),
-                str(int(draws)),
-                str(int(burnin)),
-                str(int(thinpara)),
-                str(float(prior_constants.mu_mean)),
-                str(float(prior_constants.mu_sd)),
-                str(float(prior_constants.phi_a0)),
-                str(float(prior_constants.phi_b0)),
-                str(float(prior_constants.Bsigma)),
-                str(float(alpha)),
-            ],
-            check=True,
-        )
-
-        result = pd.read_csv(output_path)
-
-    expected_rows = y.shape[0]
-
-    if len(result) != expected_rows:
-        raise RuntimeError(
-            f"stochvol MCMC returned {len(result)} rows for {expected_rows} series."
-        )
-
-    return result
 
 
 # ============================================================
