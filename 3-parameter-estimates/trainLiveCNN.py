@@ -783,8 +783,8 @@ def train_live_cnn(
             save_checkpoint_atomic(best_checkpoint, best_checkpoint_path)
             if verbose:
                 print(f"New best model found at epoch {epoch + 1} with validation NLL {val_loss_value:.6f}")
-                print(f"val marginal NLLs: {val_parts}")
-                print(f"Saved best checkpoint to {best_checkpoint_path}")
+                print(f"val marginal NLLs: {', '.join(f'{name}={loss:.4f}' for name, loss in zip(target_names, val_marginal_losses_np))}")
+                print(f"Best checkpoint saved to {best_checkpoint_path}")
 
         if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
             print(f"Latest checkpoint saved to {latest_checkpoint_path}")
@@ -983,17 +983,17 @@ def train_live_cnn(
 def main():
     train_live_cnn(
         sequence_length=253,
-        prior="default",
+        prior="finance",
         tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
-        dilations=None,
+        dilations=None, # Use default exponentially increasing dilations
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
         dropout=0.0,
         use_batch_norm=True,
-        checkpoint_path="sv_posterior_tcn_live.pt",
-        latest_checkpoint_path="sv_posterior_tcn_live.latest.pt",
-        best_checkpoint_path="sv_posterior_tcn_live.best.pt",
+        checkpoint_path="sv_posterior_tcn_live_finance.pt",
+        latest_checkpoint_path="sv_posterior_tcn_live_finance.latest.pt",
+        best_checkpoint_path="sv_posterior_tcn_live_finance.best.pt",
         resume_from=None,  # Set to "sv_posterior_tcn_live.latest.pt" to continue. Leave as None to start fresh.
         seed=1,
         batch_size=1024 * 8,
