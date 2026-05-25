@@ -87,23 +87,6 @@ def make_child_seed(seed, stream, index):
     return int(seed_sequence.generate_state(1, dtype=np.uint32)[0])
 
 
-def resolve_input_moments(prior, standardize_input):
-    if not standardize_input:
-        return np.float32(0.0), np.float32(1.0)
-
-    moments = sim.log_y_squared_moments(prior=prior)
-    input_mean = np.float32(moments["mean"])
-    input_std = np.float32(moments["std"])
-
-    if not np.isfinite(input_mean):
-        raise ValueError(f"Input mean for prior '{prior}' is not finite.")
-
-    if not np.isfinite(input_std) or input_std <= 0:
-        raise ValueError(f"Input std for prior '{prior}' must be finite and positive.")
-
-    return input_mean, input_std
-
-
 def default_checkpoint_paths(checkpoint_path):
     base, ext = os.path.splitext(checkpoint_path)
 
@@ -291,10 +274,14 @@ def train_live_cnn(
     )
     effective_val_batch_size = min(val_size, batch_size)
 
-    input_mean, input_std = resolve_input_moments(
-        prior=prior,
-        standardize_input=standardize_input,
-    )
+    if standardize_input:
+        moments = sim.log_y_squared_moments(prior=prior)
+        input_mean = np.float32(moments["mean"])
+        input_std = np.float32(moments["std"])
+
+    else:
+        input_mean = np.float32(0.0)
+        input_std = np.float32(1.0)
 
     # ============================================================
     # Reproducibility
@@ -332,6 +319,13 @@ def train_live_cnn(
 
     if use_amp is None:
         use_amp = device.type == "cuda"
+    elif use_amp and device.type != "cuda":
+        warnings.warn(
+            "Automatic mixed precision (AMP) is only supported on CUDA devices. "
+            "Disabling AMP.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     amp_enabled = bool(use_amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -569,6 +563,8 @@ def train_live_cnn(
 
         if "optimizer_state_dict" in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
         if "scaler_state_dict" in resume_checkpoint:
             scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
@@ -596,6 +592,7 @@ def train_live_cnn(
         if verbose:
             print(f"Resumed training from {resume_from}")
             print(f"Starting at epoch {start_epoch + 1}")
+            print(f"Using learning rate: {lr:g}")
 
     for epoch in range(start_epoch, n_epochs):
         train_seed = make_child_seed(
@@ -671,6 +668,8 @@ def train_live_cnn(
             if grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
+            # GradScaler handles inf/NaN gradients itself when AMP is enabled,
+            # so only manually skip the step when AMP is disabled.
             if amp_enabled or not nonfinite_grad:
                 scaler.step(optimizer)
 
@@ -681,6 +680,7 @@ def train_live_cnn(
             if total_train_losses is None:
                 total_train_losses = torch.zeros_like(train_marginal_losses)
 
+            # Avoid extending the graph while accumulating training metrics.
             total_train_losses += train_marginal_losses.detach() * batch_n
             total_train_n += batch_n
 
@@ -781,12 +781,14 @@ def train_live_cnn(
                 checkpoint_kind="best",
             )
             save_checkpoint_atomic(best_checkpoint, best_checkpoint_path)
+            if verbose:
+                print(f"New best model found at epoch {epoch + 1} with validation NLL {val_loss_value:.6f}")
+                print(f"val marginal NLLs: {val_parts}")
+                print(f"Saved best checkpoint to {best_checkpoint_path}")
 
         if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
             print(f"Latest checkpoint saved to {latest_checkpoint_path}")
 
-            if improved:
-                print(f"Best checkpoint saved to {best_checkpoint_path}")
 
         if epochs_without_improvement >= patience:
             if verbose:
@@ -992,7 +994,7 @@ def main():
         checkpoint_path="sv_posterior_tcn_live.pt",
         latest_checkpoint_path="sv_posterior_tcn_live.latest.pt",
         best_checkpoint_path="sv_posterior_tcn_live.best.pt",
-        resume_from=None,  # Set to "sv_posterior_tcn_live.latest.pt" to continue.
+        resume_from=None,  # Set to "sv_posterior_tcn_live.latest.pt" to continue. Leave as None to start fresh.
         seed=1,
         batch_size=1024 * 8,
         n_batches=100,    # Number of batches done before each validation
@@ -1005,7 +1007,7 @@ def main():
         min_delta=1e-5,
         min_var=1e-12, # Minimum variance to ensure numerical stability in the loss and gradients
         standardize_input=True,
-        use_amp=True,  # Use automatic mixed precision to save on memory
+        use_amp=True,  # Use automatic mixed precision to save on vram
         grad_clip_norm=5.0,
         warn_nonfinite_grad=True,
         deterministic_torch=True,
