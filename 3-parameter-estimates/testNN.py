@@ -546,18 +546,18 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
 
 def main():
     summary_checkpoint_path = "sv_posterior_nn_1M_ARIMA_finance.pt"
-    tcn_checkpoint_path = "sv_posterior_tcn_live.best.pt"
+    tcn_checkpoint_path = "sv_posterior_tcn_live_finance.best.pt"
     output_dir = Path("nn_parameter_sweep_test")
 
     baseline = {
         "mu": -9.0,
-        "phi": 0.98,
-        "sigma": 0.20,
+        "phi": 0.95,
+        "sigma": 0.25,
     }
     sweep_deltas = {
-        "mu": 2.0,
-        "phi": 0.015,
-        "sigma": 0.10,
+        "mu": 3.0,
+        "phi": 0.045,
+        "sigma": 0.20,
     }
     sweeps = None
 
@@ -567,8 +567,8 @@ def main():
     alpha = 0.05
 
     mcmc_prior = "finance"
-    mcmc_draws = 2000
-    mcmc_burnin = 500
+    mcmc_draws = 2000*10
+    mcmc_burnin = 500*2
     mcmc_thinpara = 1
 
     batch_size = 4096
