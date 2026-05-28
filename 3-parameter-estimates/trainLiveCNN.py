@@ -983,7 +983,7 @@ def train_live_cnn(
 def main():
     train_live_cnn(
         sequence_length=253,
-        prior="default",
+        prior="finance",
         tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
         dilations=None, # Use default exponentially increasing dilations
@@ -991,10 +991,10 @@ def main():
         activation=nn.ReLU,
         dropout=0.0,
         use_batch_norm=True,
-        checkpoint_path="sv_posterior_tcn_live.pt",
-        latest_checkpoint_path="sv_posterior_tcn_live.latest.pt",
-        best_checkpoint_path="sv_posterior_tcn_live.best.pt",
-        resume_from="sv_posterior_tcn_live.latest.pt",  # Set to "sv_posterior_tcn_live.latest.pt" to continue. Leave as None to start fresh.
+        checkpoint_path="sv_posterior_tcn_live_finance.pt",
+        latest_checkpoint_path="sv_posterior_tcn_live_finance.latest.pt",
+        best_checkpoint_path="sv_posterior_tcn_live_finance.best.pt",
+        resume_from="sv_posterior_tcn_live_finance.latest.pt",  # Set to "sv_posterior_tcn_live_finance.latest.pt" to continue. Leave as None to start fresh.
         seed=1,
         batch_size=1024 * 8,
         n_batches=100,    # Number of batches done before each validation

@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
-
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -15,6 +15,83 @@ import simulateData as sim
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvolMCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
+
+
+def plot_parameter_histograms_with_normal(
+    draws,
+    output_path,
+    true_values=None,
+    parameters=("mu", "phi", "sigma"),
+    bins=50,
+):
+    """
+    Plot posterior draw histograms with fitted empirical normal overlays.
+
+    Parameters
+    ----------
+    draws:
+        Usually a pandas DataFrame with columns "mu", "phi", "sigma".
+    output_path:
+        Path where the figure is saved.
+    true_values:
+        Optional dict, e.g. {"mu": -9.0, "phi": 0.98, "sigma": 0.20}.
+    parameters:
+        Parameters to plot.
+    bins:
+        Number of histogram bins.
+    """
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, len(parameters), figsize=(5 * len(parameters), 4))
+
+    if len(parameters) == 1:
+        axes = [axes]
+
+    for ax, param in zip(axes, parameters):
+        values = np.asarray(draws[param], dtype=float)
+        values = values[np.isfinite(values)]
+
+        mean_hat = np.mean(values)
+        sd_hat = np.std(values, ddof=1)
+
+        ax.hist(values, bins=bins, density=True, alpha=0.6)
+
+        if sd_hat > 0:
+            x_grid = np.linspace(values.min(), values.max(), 500)
+            normal_density = (
+                1.0 / (sd_hat * np.sqrt(2.0 * np.pi))
+                * np.exp(-0.5 * ((x_grid - mean_hat) / sd_hat) ** 2)
+            )
+
+            ax.plot(
+                x_grid,
+                normal_density,
+                linewidth=2,
+                label=f"N({mean_hat:.3g}, {sd_hat:.3g}²)",
+            )
+
+        if true_values is not None and param in true_values:
+            ax.axvline(
+                true_values[param],
+                linestyle="--",
+                linewidth=2,
+                label=f"true {param} = {true_values[param]:.3g}",
+            )
+
+        ax.set_title(param)
+        ax.set_xlabel("Posterior draw")
+        ax.set_ylabel("Density")
+        ax.legend()
+
+    fig.suptitle("Posterior draws with empirical normal overlays")
+    fig.tight_layout()
+
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return output_path
 
 
 def find_rscript():
@@ -154,7 +231,7 @@ def main():
 
     rng = np.random.default_rng(seed=1)
 
-    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=253*4, rng=rng)[0]
+    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=253 * 4, rng=rng)[0]
 
     summary, draws = run_stochvol_mcmc(
         simulated_data,
@@ -166,12 +243,27 @@ def main():
 
     print(summary[["mu_mean", "phi_mean", "sigma_mean"]])
 
+    true_values = {
+        "mu": mu[0],
+        "phi": phi[0],
+        "sigma": sigma[0],
+    }
+
     traceplot_path = plot_parameter_trace(
         draws,
         output_path=HERE / "recovered_plots" / "stochvol_traceplot.png",
-        true_values={"mu": mu[0], "phi": phi[0], "sigma": sigma[0]},
+        true_values=true_values,
     )
     print(f"Saved traceplot to {traceplot_path}")
+
+    hist_path = plot_parameter_histograms_with_normal(
+        draws,
+        output_path=HERE / "recovered_plots" / "stochvol_hist_normal_overlay.png",
+        true_values=true_values,
+        parameters=("mu", "phi", "sigma"),
+        bins=50,
+    )
+    print(f"Saved histogram plot to {hist_path}")
 
 
 if __name__ == "__main__":

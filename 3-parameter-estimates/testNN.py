@@ -533,7 +533,7 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
         ax.grid(alpha=0.25)
 
     axes[0].legend(loc="best")
-    fig.suptitle(f"{100 * (1.0 - alpha):.0f}% credible intervals by swept parameter")
+    fig.suptitle(f"{100 * (1.0 - alpha):.0f}% credible intervals by swept parameter using default prior")
     fig.tight_layout()
 
     output_path = Path(output_path)
@@ -545,8 +545,8 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
 
 
 def main():
-    summary_checkpoint_path = "sv_posterior_nn_1M_ARIMA_finance.pt"
-    tcn_checkpoint_path = "sv_posterior_tcn_live_finance.best.pt"
+    summary_checkpoint_path = "sv_posterior_nn_1M_ARIMA.pt"
+    tcn_checkpoint_path = "sv_posterior_tcn_live.best.pt"
     output_dir = Path("nn_parameter_sweep_test")
 
     baseline = {
@@ -566,7 +566,7 @@ def main():
     seed = 2
     alpha = 0.05
 
-    mcmc_prior = "finance"
+    mcmc_prior = "default"
     mcmc_draws = 2000*10
     mcmc_burnin = 500*2
     mcmc_thinpara = 1
@@ -601,8 +601,8 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = output_dir / "parameter_sweep_ci_comparison.csv"
-    plot_path = output_dir / "parameter_sweep_ci_comparison.png"
+    csv_path = output_dir / "parameter_sweep_ci_default_comparison.csv"
+    plot_path = output_dir / "parameter_sweep_ci_default_comparison.png"
 
     comparison.to_csv(csv_path, index=False)
     plot_parameter_sweep_ci(comparison, plot_path, alpha)
