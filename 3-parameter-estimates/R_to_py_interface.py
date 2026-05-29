@@ -81,14 +81,21 @@ def plot_parameter_histograms_with_normal(
 
         if true_values is not None and param in true_values:
             transformed_true_value = transform(true_values[param])
+            if transform.__name__ == "identity":
+                label = f"true {param} = {transformed_true_value:.3g}"
+            else:
+                label = f"true {transform.__name__}({param}) = {transformed_true_value:.3g}"
             ax.axvline(
                 transformed_true_value,
                 linestyle="--",
                 linewidth=2,
-                label=f"true {transform.__name__}({param}) = {transformed_true_value:.3g}",
+                label=label,
             )
-
-        ax.set_title(f"{transform.__name__}({param})")
+        
+        if transform.__name__ == "identity":
+            ax.set_title(f"{param}")
+        else:
+            ax.set_title(f"{transform.__name__}({param})")
         ax.set_xlabel("Posterior draw")
         ax.set_ylabel("Density")
         ax.legend()
@@ -238,7 +245,7 @@ def main():
 
     rng = np.random.default_rng(seed=1)
 
-    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=253, rng=rng)[0]
+    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=int(np.floor(253*4)), rng=rng)[0]
 
     summary, draws = run_stochvol_mcmc(
         simulated_data,
@@ -267,15 +274,18 @@ def main():
 
     def logit(x):
         return np.arctanh(x) * 2
+    
+    from scipy.stats import norm
 
     transformations = {
+        #"phi": lambda x: norm.ppf((x + 1.0) / 2.0),
         "phi": logit,
         "sigma": np.log,
     }
 
     hist_path = plot_parameter_histograms_with_normal(
         draws,
-        output_path=HERE / "recovered_plots" / "stochvol_hist_normal_overlay.png",
+        output_path=HERE / "recovered_plots" / "stochvol_hist_normal_overlay_logit.png",
         true_values=true_values,
         parameters=("mu", "phi", "sigma"),
         bins=50,
