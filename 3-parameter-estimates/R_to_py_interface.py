@@ -23,6 +23,7 @@ def plot_parameter_histograms_with_normal(
     true_values=None,
     parameters=("mu", "phi", "sigma"),
     bins=50,
+    transformations={},
 ):
     """
     Plot posterior draw histograms with fitted empirical normal overlays.
@@ -39,7 +40,12 @@ def plot_parameter_histograms_with_normal(
         Parameters to plot.
     bins:
         Number of histogram bins.
+    transformations:
+        Optional dict of parameter transformations, e.g. {"phi": lambda x: np.arctanh(x) * 2}.
     """
+
+    def identity(x):
+        return x
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +56,8 @@ def plot_parameter_histograms_with_normal(
         axes = [axes]
 
     for ax, param in zip(axes, parameters):
-        values = np.asarray(draws[param], dtype=float)
+        transform = transformations.get(param, identity)
+        values = transform(np.asarray(draws[param], dtype=float))
         values = values[np.isfinite(values)]
 
         mean_hat = np.mean(values)
@@ -73,14 +80,15 @@ def plot_parameter_histograms_with_normal(
             )
 
         if true_values is not None and param in true_values:
+            transformed_true_value = transform(true_values[param])
             ax.axvline(
-                true_values[param],
+                transformed_true_value,
                 linestyle="--",
                 linewidth=2,
-                label=f"true {param} = {true_values[param]:.3g}",
+                label=f"true {transform.__name__}({param}) = {transformed_true_value:.3g}",
             )
 
-        ax.set_title(param)
+        ax.set_title(f"{transform.__name__}({param})")
         ax.set_xlabel("Posterior draw")
         ax.set_ylabel("Density")
         ax.legend()
@@ -191,9 +199,8 @@ def run_stochvol_mcmc(
 
 
 def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
-    import matplotlib.pyplot as plt
 
-    draws = draws[draws["index"] == series_index]
+    draws = draws[draws["series_index"] == series_index]
 
     fig, axes = plt.subplots(
         len(PARAMETER_NAMES),
@@ -231,7 +238,7 @@ def main():
 
     rng = np.random.default_rng(seed=1)
 
-    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=253 * 4, rng=rng)[0]
+    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=253, rng=rng)[0]
 
     summary, draws = run_stochvol_mcmc(
         simulated_data,
@@ -256,12 +263,23 @@ def main():
     )
     print(f"Saved traceplot to {traceplot_path}")
 
+
+
+    def logit(x):
+        return np.arctanh(x) * 2
+
+    transformations = {
+        "phi": logit,
+        "sigma": np.log,
+    }
+
     hist_path = plot_parameter_histograms_with_normal(
         draws,
         output_path=HERE / "recovered_plots" / "stochvol_hist_normal_overlay.png",
         true_values=true_values,
         parameters=("mu", "phi", "sigma"),
         bins=50,
+        transformations=transformations,
     )
     print(f"Saved histogram plot to {hist_path}")
 

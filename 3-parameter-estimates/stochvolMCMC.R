@@ -141,7 +141,7 @@ sample_series <- function(series_index, y) {
   parameter_draws <- NULL
   if (save_parameter_draws) {
     parameter_draws <- data.frame(
-      index = series_index,
+      series_index = series_index,
       draw_index = seq_len(nrow(draws_matrix)),
       mu = draws_matrix[, "mu"],
       phi = draws_matrix[, "phi"],
