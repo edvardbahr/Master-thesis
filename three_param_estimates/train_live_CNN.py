@@ -238,7 +238,7 @@ def train_live_cnn(
     if k <= 0:
         raise ValueError("k must be positive.")
 
-    # Validate the prior name through simulateData's public API.
+    # Validate the prior name through the 3-parameter simulator API.
     sim.get_stochvol_prior_constants(prior)
 
     default_latest_path, default_best_path = default_checkpoint_paths(checkpoint_path)

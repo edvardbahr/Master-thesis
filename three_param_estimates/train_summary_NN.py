@@ -709,7 +709,7 @@ def train_summary_nn(
 
 def main():
     """
-    Z, theta, feature_names = simulateData.simulate_sv_dataset_parallel(
+    Z, theta, feature_names = sim_3_param_data.simulate_sv_summaries_parallel(
         N=800,
         n=253,
         chunk_size=200,
@@ -736,7 +736,7 @@ def main():
     seed=2,
     val_fraction=0.2,
     batch_size=1024*16,
-    lr=0.5e-3,    #Best step size found so far (I forgot standardazing tho :/)
+    lr=0.5e-3,    # Best step size found so far (before standardizing).
     n_epochs=2000,
     patience=50,
     min_delta=1e-5,

@@ -279,7 +279,7 @@ def prepare_summary_input(y, checkpoint):
     )
 
     if list(checkpoint["feature_names"]) != expected_feature_names:
-        raise ValueError("Checkpoint feature_names do not match simulateData.py.")
+        raise ValueError("Checkpoint feature_names do not match sim_3_param_data.py.")
 
     summaries = np.empty((y.shape[0], int(checkpoint["input_dim"])), dtype=np.float32)
 

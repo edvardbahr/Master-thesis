@@ -1015,7 +1015,7 @@ def main1():
     """
     Generate a large summary-statistic dataset for the MLP trainer.
 
-    The saved .npz file is compatible with trainSummaryNN.py and contains:
+    The saved .npz file is compatible with train_summary_NN.py and contains:
         summaries:
             Array of shape (N, p), where each row contains summary statistics.
 
