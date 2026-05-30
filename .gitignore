@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rout
+
+# Generated data / outputs
+*.csv
+*.xlsx
+*.parquet
+*.npy
+*.npz
+*.pkl
+*.rds
+*.RData
+outputs/
+results/
+figures/generated/
+
+# LaTeX/build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
