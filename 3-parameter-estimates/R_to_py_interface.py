@@ -9,11 +9,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import simulateData as sim
+import simulate_data as sim
 
 
 HERE = Path(__file__).resolve().parent
-R_SCRIPT = HERE / "stochvolMCMC.R"
+R_SCRIPT = HERE / "stochvol_MCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
 
 

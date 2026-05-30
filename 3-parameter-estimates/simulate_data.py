@@ -636,12 +636,14 @@ def sample_stochvol_prior(
 
     hyper = get_stochvol_prior_constants(prior)
 
+    # mu follows a normal distribution
     mu = rng.normal(
         loc=hyper.mu_mean,
         scale=hyper.mu_sd,
         size=n,
     ).astype(dtype, copy=False)
 
+    # phi follows a transformed beta distribution on (-1, 1)
     phi = (
         2.0 * rng.beta(
             a=hyper.phi_a0,
@@ -651,6 +653,7 @@ def sample_stochvol_prior(
         - 1.0
     ).astype(dtype, copy=False)
 
+    # sigma2 follows a scaled chi-square distribution
     sigma2 = (
         hyper.Bsigma * rng.chisquare(df=1.0, size=n)
     ).astype(dtype, copy=False)

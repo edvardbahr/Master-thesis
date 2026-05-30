@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import simulateData as sim
-from trainCNN import (
+import simulate_data as sim
+from train_CNN import (
     SVPosteriorTCN,
     count_parameters,
     diagonal_gaussian_nll,

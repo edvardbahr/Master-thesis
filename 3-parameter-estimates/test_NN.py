@@ -10,11 +10,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from R_to_py_interface import run_stochvol_mcmc, validate_series_matrix
-import simulateData as sim
+import simulate_data as sim
 import torch
 import torch.nn as nn
-from trainLiveCNN import LiveSVPosteriorTCN
-from trainSummaryNN import SVPosteriorNN
+from train_live_CNN import LiveSVPosteriorTCN
+from train_summary_NN import SVPosteriorNN
 
 
 HERE = Path(__file__).resolve().parent
