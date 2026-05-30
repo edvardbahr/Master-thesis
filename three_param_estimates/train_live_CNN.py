@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import simulate_data as sim
+import sim_3_param_data as sim
 from train_CNN import (
     SVPosteriorTCN,
     count_parameters,

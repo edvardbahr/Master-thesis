@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import simulate_data as sim
+import sim_3_param_data as sim
 
 
 HERE = Path(__file__).resolve().parent
