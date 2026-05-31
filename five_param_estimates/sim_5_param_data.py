@@ -1,3 +1,12 @@
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import numpy as np
@@ -288,6 +297,212 @@ def simulate_sv_chunk(
         )
 
     return y
+
+
+def _simulate_log_y_squared_chunk(job):
+    """
+    Worker function for parallel log(y^2 + k) simulation.
+    """
+
+    (
+        _chunk_id,
+        chunk_start,
+        n_chunk,
+        n,
+        seed_seq,
+        prior,
+        random_init,
+        k,
+        center_y,
+        out_dtype,
+        exp_clip,
+    ) = job
+
+    rng = np.random.default_rng(seed_seq)
+
+    mu, phi, s, r, nu = sample_stochvol_prior(
+        n_chunk,
+        rng=rng,
+        prior=prior,
+        return_s2=False,
+        dtype=np.float64,
+    )
+
+    y_chunk = simulate_sv_chunk(
+        mu=mu,
+        phi=phi,
+        s=s,
+        r=r,
+        nu=nu,
+        n=n,
+        rng=rng,
+        random_init=random_init,
+        dtype=np.float64,
+        exp_clip=exp_clip,
+    )
+
+    if center_y:
+        y_chunk = y_chunk - np.mean(y_chunk, axis=1, keepdims=True)
+
+    log_y_squared_chunk = np.log(y_chunk * y_chunk + k).astype(out_dtype, copy=False)
+    theta_chunk = np.column_stack([mu, phi, s, r, nu]).astype(out_dtype, copy=False)
+
+    return chunk_start, n_chunk, log_y_squared_chunk, theta_chunk
+
+
+def resolve_n_workers(n_workers):
+    """
+    Resolve the number of worker processes.
+
+    Negative values work like offsets from the total CPU count:
+        -1 uses all cores except one,
+        -2 uses all cores except two,
+        etc.
+    """
+
+    n_cpus = os.cpu_count() or 1
+
+    if n_workers is None:
+        raise ValueError(
+            "n_workers cannot be None. Use a positive worker count or a negative CPU offset."
+        )
+
+    if n_workers < 0:
+        resolved = n_cpus + n_workers
+
+        if resolved < 1:
+            raise ValueError(
+                "n_workers leaves no worker processes available. "
+                f"With {n_cpus} CPU core(s), use n_workers >= {1 - n_cpus}."
+            )
+
+        return resolved
+
+    if n_workers == 0:
+        raise ValueError("n_workers must not be 0.")
+
+    if n_workers > n_cpus:
+        raise ValueError(
+            f"n_workers={n_workers} exceeds the available CPU count ({n_cpus})."
+        )
+
+    return n_workers
+
+
+def resolve_chunk_size(N, n_workers, chunks_per_worker):
+    """
+    Compute a chunk size from the number of simulations, workers, and chunks
+    per worker.
+    """
+
+    if N < 1:
+        raise ValueError("N must be at least 1.")
+
+    if n_workers < 1:
+        raise ValueError("n_workers must be at least 1.")
+
+    if chunks_per_worker < 1:
+        raise ValueError("chunks_per_worker must be at least 1.")
+
+    return max(1, int(np.ceil(N / (n_workers * chunks_per_worker))))
+
+
+def simulate_sv_log_y_squared_parallel(
+    N,
+    n,
+    chunk_size,
+    n_workers=-1,
+    seed=1,
+    prior="default",
+    random_init=True,
+    k=1e-12,
+    center_y=True,
+    out_dtype=np.float32,
+    exp_clip=350.0,
+    show_progress=True,
+):
+    """
+    Generate log(y^2 + k) series and true five-parameter SV values in parallel.
+
+    Returns
+    -------
+    log_y_squared:
+        Matrix of shape (N, n), where row i is log(y_i^2 + k).
+
+    theta:
+        Parameter matrix of shape (N, 5), columns are mu, phi, s, r, nu.
+    """
+
+    if N < 1:
+        raise ValueError("N must be at least 1.")
+
+    if n < 1:
+        raise ValueError("n must be at least 1.")
+
+    n_workers = resolve_n_workers(n_workers)
+
+    if chunk_size is None:
+        raise ValueError("chunk_size must be explicitly specified.")
+
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
+
+    if k <= 0:
+        raise ValueError("k must be positive.")
+
+    log_y_squared = np.empty((N, n), dtype=out_dtype)
+    theta = np.empty((N, 5), dtype=out_dtype)
+
+    n_chunks = np.ceil(N / chunk_size).astype(int)
+
+    master_ss = np.random.SeedSequence(seed)
+    child_seeds = master_ss.spawn(n_chunks)
+
+    chunk_jobs = []
+
+    for chunk_id in range(n_chunks):
+        chunk_start = chunk_id * chunk_size
+        chunk_stop = min(chunk_start + chunk_size, N)
+        n_chunk = chunk_stop - chunk_start
+
+        chunk_jobs.append(
+            (
+                chunk_id,
+                chunk_start,
+                n_chunk,
+                n,
+                child_seeds[chunk_id],
+                prior,
+                random_init,
+                k,
+                center_y,
+                out_dtype,
+                exp_clip,
+            )
+        )
+
+    ctx = mp.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        futures = [executor.submit(_simulate_log_y_squared_chunk, job) for job in chunk_jobs]
+
+        completed_iter = as_completed(futures)
+
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                completed_iter = tqdm(completed_iter, total=n_chunks)
+            except ImportError:
+                pass
+
+        for future in completed_iter:
+            chunk_start, n_chunk, log_y_squared_chunk, theta_chunk = future.result()
+
+            chunk_stop = chunk_start + n_chunk
+            log_y_squared[chunk_start:chunk_stop, :] = log_y_squared_chunk
+            theta[chunk_start:chunk_stop, :] = theta_chunk
+
+    return log_y_squared, theta
 
 
 
