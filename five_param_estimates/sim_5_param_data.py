@@ -83,7 +83,7 @@ def get_gh_skew_t_prior_constants(prior="default"):
 
 # Backwards-compatible alias with the same naming style as sim_3_param_data.py.
 get_stochvol_prior_constants = get_gh_skew_t_prior_constants
-
+# This should probably be removed as there is no backwards compatibility involed.
 
 def sample_stochvol_prior(
     n,
@@ -194,7 +194,9 @@ def sample_centered_gh_skew_t_innovations(s, r, nu, rng, dtype=np.float64):
     s, r, nu = np.broadcast_arrays(s, r, nu)
     mu_gh, delta, beta = gh_skew_t_params_from_s_r_nu(s, r, nu)
     gamma_draw = rng.gamma(shape=0.5 * nu, scale=1.0)
-    w = 0.5 * delta * delta / gamma_draw
+    # 1/gamma(shape = 0.5 * nu, rate = k) -> inv-gamma(shape = 0.5 * nu, scale = k)
+    # 0.5 * delta^2 * inv-gamma(shape = 0.5 * nu, scale = 1.0) -> inv-gamma(shape = 0.5 * nu, scale = 0.5 * delta^2)
+    w = 0.5 * delta * delta / gamma_draw    
     z = rng.standard_normal(size=np.shape(w))
     innovations = mu_gh + beta * w + np.sqrt(w) * z
 
@@ -508,7 +510,28 @@ def simulate_sv_log_y_squared_parallel(
 
 
 def main():
-    pass
+    N = 1000
+    n = 1000
+    n_workers = resolve_n_workers(-2)
+    chunk_size = resolve_chunk_size(N, n_workers, chunks_per_worker=4)
+    seed = 1
+
+    log_y_squared, theta = simulate_sv_log_y_squared_parallel(
+        N=N,
+        n=n,
+        chunk_size=chunk_size,
+        n_workers=n_workers,
+        seed=seed,
+        prior="default",
+        random_init=True,
+        k=1e-12,
+        center_y=True,
+        out_dtype=np.float32,
+        exp_clip=350.0,
+        show_progress=True,
+    )
+
+
 
 
 if __name__ == "__main__":
