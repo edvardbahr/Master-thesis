@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,41 @@ from scipy import optimize, special
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 GHST_SAMPLE_PATH = SCRIPT_DIR / "ghst_eta_hat_samples.csv"
+BOOTSTRAP_ESTIMATES_PATH = SCRIPT_DIR / "ghst_em_bootstrap_estimates.csv"
+BOOTSTRAP_CI_PATH = SCRIPT_DIR / "ghst_em_bootstrap_ci.csv"
+
+BOOTSTRAP_ESTIMATE_COLUMNS = (
+    "bootstrap_index",
+    "root_seed",
+    "bootstrap_seed",
+    "sample_size",
+    "base_mu",
+    "base_delta",
+    "base_beta",
+    "base_nu",
+    "converged",
+    "n_iter",
+    "loglikelihood",
+    "mu",
+    "delta",
+    "beta",
+    "nu",
+    "centered_mean",
+    "s",
+    "r",
+    "beta_sign",
+    "error",
+)
+
+BOOTSTRAP_CI_PARAMETERS = (
+    "mu",
+    "delta",
+    "beta",
+    "nu",
+    "centered_mean",
+    "s",
+    "r",
+)
 
 
 def load_ghst_samples(path: str | Path = GHST_SAMPLE_PATH) -> np.ndarray:
@@ -21,9 +57,6 @@ def load_ghst_samples(path: str | Path = GHST_SAMPLE_PATH) -> np.ndarray:
             "Run RV_AR_1_estm.R first to create ghst_eta_hat_samples.csv."
         )
     return np.genfromtxt(sample_path, delimiter=",", skip_header=1)
-
-
-ghst_samples = np.genfromtxt("ghst_eta_hat_samples.csv", delimiter=",", skip_header=1)
 
 
 @dataclass(frozen=True)
@@ -575,7 +608,252 @@ def create_ghst_diagnostic_plots(
     return hist_path, qq_path
 
 
+def _completed_bootstrap_indices(path: Path) -> set[int]:
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+
+    with path.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return {
+            int(row["bootstrap_index"])
+            for row in reader
+            if row.get("bootstrap_index", "").strip()
+        }
+
+
+def _bootstrap_success_row(
+    *,
+    bootstrap_index: int,
+    root_seed: int,
+    bootstrap_seed: int,
+    sample_size: int,
+    base_params: GHSTParameters,
+    result: GHSTEMResult,
+) -> dict[str, object]:
+    p = result.params
+    c = result.centered_params
+
+    return {
+        "bootstrap_index": bootstrap_index,
+        "root_seed": root_seed,
+        "bootstrap_seed": bootstrap_seed,
+        "sample_size": sample_size,
+        "base_mu": base_params.mu,
+        "base_delta": base_params.delta,
+        "base_beta": base_params.beta,
+        "base_nu": base_params.nu,
+        "converged": result.converged,
+        "n_iter": result.n_iter,
+        "loglikelihood": result.loglikelihood,
+        "mu": p.mu,
+        "delta": p.delta,
+        "beta": p.beta,
+        "nu": p.nu,
+        "centered_mean": c.mean,
+        "s": c.s,
+        "r": c.r,
+        "beta_sign": c.beta_sign,
+        "error": "",
+    }
+
+
+def _bootstrap_error_row(
+    *,
+    bootstrap_index: int,
+    root_seed: int,
+    bootstrap_seed: int,
+    sample_size: int,
+    base_params: GHSTParameters,
+    error: Exception,
+) -> dict[str, object]:
+    row = dict.fromkeys(BOOTSTRAP_ESTIMATE_COLUMNS, np.nan)
+    row.update(
+        {
+            "bootstrap_index": bootstrap_index,
+            "root_seed": root_seed,
+            "bootstrap_seed": bootstrap_seed,
+            "sample_size": sample_size,
+            "base_mu": base_params.mu,
+            "base_delta": base_params.delta,
+            "base_beta": base_params.beta,
+            "base_nu": base_params.nu,
+            "converged": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    )
+    return row
+
+
+def save_bootstrap_ci_summary(
+    estimates_path: str | Path,
+    base_result: GHSTEMResult,
+    *,
+    output_path: str | Path = BOOTSTRAP_CI_PATH,
+    alpha: float = 0.05,
+) -> Path:
+    """Save percentile bootstrap confidence intervals from fitted bootstrap rows."""
+
+    estimates_path = Path(estimates_path)
+    output_path = Path(output_path)
+    rows: list[dict[str, str]] = []
+
+    with estimates_path.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows.extend(reader)
+
+    valid_rows = [
+        row
+        for row in rows
+        if row.get("error", "") == "" and row.get("converged", "").lower() == "true"
+    ]
+
+    if len(valid_rows) < 10:
+        raise ValueError(
+            f"Only {len(valid_rows)} successful bootstrap fits are available; "
+            "need at least 10 to summarize confidence intervals."
+        )
+
+    base_estimates = {
+        "mu": base_result.params.mu,
+        "delta": base_result.params.delta,
+        "beta": base_result.params.beta,
+        "nu": base_result.params.nu,
+        "centered_mean": base_result.centered_params.mean,
+        "s": base_result.centered_params.s,
+        "r": base_result.centered_params.r,
+    }
+
+    ci_rows = []
+    lower_prob = alpha / 2.0
+    upper_prob = 1.0 - alpha / 2.0
+
+    for parameter in BOOTSTRAP_CI_PARAMETERS:
+        values = np.asarray([float(row[parameter]) for row in valid_rows], dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if values.size < 10:
+            continue
+
+        lower, upper = np.quantile(values, [lower_prob, upper_prob])
+        ci_rows.append(
+            {
+                "parameter": parameter,
+                "estimate": base_estimates[parameter],
+                "bootstrap_mean": float(np.mean(values)),
+                "bootstrap_sd": float(np.std(values, ddof=1)),
+                "ci_lower": float(lower),
+                "ci_upper": float(upper),
+                "alpha": alpha,
+                "n_bootstrap_used": int(values.size),
+                "n_bootstrap_rows": len(rows),
+                "n_bootstrap_converged": len(valid_rows),
+            }
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(ci_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(ci_rows)
+
+    return output_path
+
+
+def run_parametric_bootstrap_ci(
+    x: np.ndarray,
+    base_result: GHSTEMResult,
+    *,
+    n_bootstrap: int = 1000,
+    seed: int = 20260610,
+    estimates_path: str | Path = BOOTSTRAP_ESTIMATES_PATH,
+    ci_path: str | Path = BOOTSTRAP_CI_PATH,
+    max_iter: int = 1000,
+    tol: float = 1e-7,
+    resume: bool = True,
+    progress_every: int = 25,
+) -> tuple[Path, Path]:
+    """
+    Parametric bootstrap for GHST EM confidence intervals.
+
+    Each bootstrap sample has the same size as x and is drawn from the fitted
+    GHST model. Every refit is appended immediately to estimates_path.
+    """
+
+    x = _clean_sample(x)
+    n_bootstrap = int(n_bootstrap)
+    estimates_path = Path(estimates_path)
+    ci_path = Path(ci_path)
+    estimates_path.parent.mkdir(parents=True, exist_ok=True)
+
+    completed = _completed_bootstrap_indices(estimates_path) if resume else set()
+    mode = "a" if resume and estimates_path.exists() else "w"
+    needs_header = mode == "w" or estimates_path.stat().st_size == 0
+    sample_size = int(x.size)
+    base_params = base_result.params
+
+    print(
+        f"\nStarting parametric GHST bootstrap: "
+        f"{n_bootstrap} replications, sample size {sample_size}"
+    )
+    if completed:
+        print(f"Resuming from {len(completed)} completed bootstrap rows.")
+
+    with estimates_path.open(mode, newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BOOTSTRAP_ESTIMATE_COLUMNS)
+        if needs_header:
+            writer.writeheader()
+
+        for bootstrap_index in range(n_bootstrap):
+            if bootstrap_index in completed:
+                continue
+
+            bootstrap_seed = seed + bootstrap_index
+            rng = np.random.default_rng(bootstrap_seed)
+
+            try:
+                bootstrap_sample = sample_ghst(base_params, size=sample_size, rng=rng)
+                bootstrap_result = fit_ghst_em(
+                    bootstrap_sample,
+                    initial_params=base_params,
+                    max_iter=max_iter,
+                    tol=tol,
+                    verbose=False,
+                )
+                row = _bootstrap_success_row(
+                    bootstrap_index=bootstrap_index,
+                    root_seed=seed,
+                    bootstrap_seed=bootstrap_seed,
+                    sample_size=sample_size,
+                    base_params=base_params,
+                    result=bootstrap_result,
+                )
+            except Exception as exc:
+                row = _bootstrap_error_row(
+                    bootstrap_index=bootstrap_index,
+                    root_seed=seed,
+                    bootstrap_seed=bootstrap_seed,
+                    sample_size=sample_size,
+                    base_params=base_params,
+                    error=exc,
+                )
+
+            writer.writerow(row)
+            handle.flush()
+
+            done = bootstrap_index + 1
+            if done == n_bootstrap or done % progress_every == 0:
+                print(f"bootstrap {done}/{n_bootstrap} saved")
+
+    ci_output = save_bootstrap_ci_summary(estimates_path, base_result, output_path=ci_path)
+    print("\nSaved GHST bootstrap results")
+    print(f"bootstrap estimates: {estimates_path}")
+    print(f"CI summary:          {ci_output}")
+
+    return estimates_path, ci_output
+
+
 if __name__ == "__main__":
+    ghst_samples = load_ghst_samples(GHST_SAMPLE_PATH)
     result = fit_ghst_em(ghst_samples, max_iter=1000, tol=1e-7, verbose=True)
     print_fit_summary(result)
-    create_ghst_diagnostic_plots(ghst_samples, result)
+    create_ghst_diagnostic_plots(ghst_samples, result, show=False)
+    run_parametric_bootstrap_ci(ghst_samples, result, n_bootstrap=1000)
