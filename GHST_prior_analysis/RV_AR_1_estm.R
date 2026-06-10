@@ -24,9 +24,9 @@ rumidas_rv[, log_RV := log(RV)]
 # the conditional-mean restriction E[u_t | log_RV_{t-1}] = 0, so u_t can be
 # non-Gaussian, skewed, and heavy-tailed. The estimated residuals below are then
 # treated as empirical samples from the GHST innovation distribution.
-ar_data <- rumidas_rv[, .(date, RV, log_RV)]
+ar_data <- rumidas_rv[, .(date, log_RV)]
 ar_data[, log_RV_lag := shift(log_RV)]
-ar_data <- ar_data[is.finite(log_RV) & is.finite(log_RV_lag)]
+ar_data <- ar_data[!is.na(log_RV_lag)]  # Remove the first row which has NA in log_RV_lag
 
 ar1_fit <- lm(log_RV ~ log_RV_lag, data = ar_data)
 
@@ -40,9 +40,13 @@ if (abs(1 - phi_hat) < sqrt(.Machine$double.eps)) {
 mu_hat <- alpha_hat / (1 - phi_hat)
 
 ar_data[, fitted_log_RV := mu_hat + phi_hat * (log_RV_lag - mu_hat)]
-ar_data[, u_hat := log_RV - fitted_log_RV]
+ar_data[, eta_hat := log_RV - fitted_log_RV]
 
-ghst_samples <- ar_data$u_hat
+ghst_samples <- ar_data$eta_hat
+# Save the residual samples for later analysis. These are treated as empirical
+# samples from the GHST innovation distribution.
+fwrite(data.table(eta_hat = ghst_samples), "ghst_eta_hat_samples.csv")
+
 
 n_u <- length(ghst_samples)
 u_centered <- ghst_samples - mean(ghst_samples)
@@ -56,7 +60,7 @@ excess_kurtosis_hat <- mean(u_centered^4) / u_var_mle^2 - 3
 #   H0 excess kurtosis = 0 against H1 excess kurtosis > 0
 #
 # These are asymptotic checks. They are useful diagnostics, but the p-values
-# should not be treated as exact because u_hat is estimated from a time series.
+# should not be treated as exact because eta_hat is estimated from a time series.
 skewness_z <- skewness_hat / sqrt(6 / n_u)
 skewness_p_two_sided <- 2 * pnorm(abs(skewness_z), lower.tail = FALSE)
 
@@ -162,7 +166,7 @@ print(tail_quantile_balance)
 cat("\nTail sign tests conditional on large absolute residuals\n")
 print(tail_sign_tests)
 
-cat("\nQuantiles of u_hat residual samples\n")
+cat("\nQuantiles of eta_hat residual samples\n")
 print(quantile(
   ghst_samples,
   probs = c(0.001, 0.005, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 0.995, 0.999),
@@ -171,8 +175,8 @@ print(quantile(
 
 cat("\nLargest absolute residuals\n")
 print(head(ar_data[
-  order(-abs(u_hat)),
-  .(date, log_RV, fitted_log_RV, u_hat)
+  order(-abs(eta_hat)),
+  .(date, log_RV, fitted_log_RV, eta_hat)
 ], 10))
 
 old_par <- par(no.readonly = TRUE)
