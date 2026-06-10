@@ -3,31 +3,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 import numpy as np
 from scipy import optimize, special
 
-
-def _find_samples_csv() -> Path:
-    """Find the eta_hat sample file from common project working directories."""
-
-    here = Path(__file__).resolve()
-    candidates = (
-        Path.cwd() / "ghst_eta_hat_samples.csv",
-        here.parent / "ghst_eta_hat_samples.csv",
-        here.parents[2] / "ghst_eta_hat_samples.csv",
-    )
-
-    for path in candidates:
-        if path.exists():
-            return path
-
-    raise FileNotFoundError(
-        "Could not find ghst_eta_hat_samples.csv in the cwd, beside this file, "
-        "or at the workspace root."
-    )
+SCRIPT_DIR = Path(__file__).resolve().parent
+GHST_SAMPLE_PATH = SCRIPT_DIR / "ghst_eta_hat_samples.csv"
 
 
-ghst_samples = np.genfromtxt(_find_samples_csv(), delimiter=",", skip_header=1)
+def load_ghst_samples(path: str | Path = GHST_SAMPLE_PATH) -> np.ndarray:
+    sample_path = Path(path)
+    if not sample_path.exists():
+        raise FileNotFoundError(
+            f"Could not find residual samples at {sample_path}. "
+            "Run RV_AR_1_estm.R first to create ghst_eta_hat_samples.csv."
+        )
+    return np.genfromtxt(sample_path, delimiter=",", skip_header=1)
+
+
+ghst_samples = np.genfromtxt("ghst_eta_hat_samples.csv", delimiter=",", skip_header=1)
 
 
 @dataclass(frozen=True)
@@ -133,6 +129,29 @@ def ghst_loglikelihood(x: np.ndarray, params: GHSTParameters) -> float:
     if not np.all(np.isfinite(logpdf)):
         return -np.inf
     return float(np.sum(logpdf))
+
+
+def sample_ghst(
+    params: GHSTParameters,
+    size: int | tuple[int, ...],
+    rng: np.random.Generator,
+    dtype=np.float64,
+) -> np.ndarray:
+    """
+    Sample from the fitted Aas-Haff GH skew Student t distribution.
+
+    This uses the same normal-variance-mean mixture convention as
+    five_param_estimates/sim_5_param_data.py, but keeps the signed beta from
+    the EM fit instead of using only the positive-skew centered convention.
+    """
+
+    mu, delta, beta, nu = params.mu, params.delta, params.beta, params.nu
+    gamma_draw = rng.gamma(shape=0.5 * nu, scale=1.0, size=size)
+    w = 0.5 * delta * delta / gamma_draw
+    z = rng.standard_normal(size=size)
+    samples = mu + beta * w + np.sqrt(w) * z
+
+    return np.asarray(samples, dtype=dtype)
 
 
 def _initial_params(x: np.ndarray, r0: float = 0.08) -> GHSTParameters:
@@ -410,8 +429,153 @@ def print_fit_summary(result: GHSTEMResult) -> None:
         )
 
 
+def plot_histogram_vs_pdf(
+    x: np.ndarray,
+    result: GHSTEMResult,
+    *,
+    output_path: str | Path | None = None,
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes]:
+    """Plot the empirical residual histogram against the fitted GHST pdf."""
+
+    x = _clean_sample(x)
+    owns_figure = ax is None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    else:
+        fig = ax.figure
+
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+    span = max(x_max - x_min, float(np.std(x)), 1e-8)
+    grid = np.linspace(x_min - 0.06 * span, x_max + 0.06 * span, 1200)
+    pdf = np.exp(ghst_logpdf(grid, result.params))
+
+    ax.hist(
+        x,
+        bins="fd",
+        density=True,
+        color="#d8dee9",
+        edgecolor="white",
+        linewidth=0.8,
+        label="Residual samples",
+    )
+    ax.plot(grid, pdf, color="#b22234", linewidth=2.2, label="Fitted GHST pdf")
+    ax.axvline(float(np.mean(x)), color="#2f3b52", linestyle="--", linewidth=1.1, label="Sample mean")
+    ax.set_title("Residual Histogram vs Fitted GHST PDF")
+    ax.set_xlabel("Residual innovation")
+    ax.set_ylabel("Density")
+    ax.legend(frameon=False)
+    ax.grid(axis="y", color="#edf0f5", linewidth=0.8)
+
+    if owns_figure:
+        fig.tight_layout()
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=220, bbox_inches="tight")
+
+    return fig, ax
+
+
+def plot_ghst_qq(
+    x: np.ndarray,
+    result: GHSTEMResult,
+    *,
+    n_sim: int = 500_000,
+    seed: int = 20260610,
+    output_path: str | Path | None = None,
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes]:
+    """
+    Make a QQ plot using Monte Carlo quantiles from the fitted GHST model.
+
+    The theoretical quantiles are empirical quantiles from a large simulated
+    sample because this GHST parameterization does not have a simple inverse CDF.
+    """
+
+    x = _clean_sample(x)
+    n_sim = int(n_sim)
+    if n_sim < 10_000:
+        raise ValueError("n_sim should be at least 10,000 for a stable GHST QQ plot.")
+
+    owns_figure = ax is None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.4, 6.2))
+    else:
+        fig = ax.figure
+
+    observed_quantiles = np.sort(x)
+    probs = (np.arange(1, observed_quantiles.size + 1) - 0.5) / observed_quantiles.size
+    rng = np.random.default_rng(seed)
+    simulated = sample_ghst(result.params, size=n_sim, rng=rng)
+    theoretical_quantiles = np.quantile(simulated, probs)
+
+    ax.scatter(
+        theoretical_quantiles,
+        observed_quantiles,
+        s=20,
+        color="#234f7e",
+        alpha=0.68,
+        linewidths=0,
+    )
+
+    line_min = float(min(np.min(theoretical_quantiles), np.min(observed_quantiles)))
+    line_max = float(max(np.max(theoretical_quantiles), np.max(observed_quantiles)))
+    ax.plot([line_min, line_max], [line_min, line_max], color="#b22234", linewidth=1.8)
+    ax.set_xlim(line_min, line_max)
+    ax.set_ylim(line_min, line_max)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title("GHST QQ Plot")
+    ax.set_xlabel("Fitted GHST quantiles")
+    ax.set_ylabel("Observed residual quantiles")
+    ax.grid(color="#edf0f5", linewidth=0.8)
+
+    if owns_figure:
+        fig.tight_layout()
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=220, bbox_inches="tight")
+
+    return fig, ax
+
+
+def create_ghst_diagnostic_plots(
+    x: np.ndarray,
+    result: GHSTEMResult,
+    *,
+    output_dir: str | Path = SCRIPT_DIR / "plots",
+    qq_sim_size: int = 500_000,
+    seed: int = 20260610,
+    show: bool = True,
+) -> tuple[Path, Path]:
+    """Create and save the two main fitted-GHST diagnostics."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hist_path = output_dir / "ghst_histogram_vs_pdf.png"
+    qq_path = output_dir / "ghst_qq_plot.png"
+
+    hist_fig, _ = plot_histogram_vs_pdf(x, result, output_path=hist_path)
+    qq_fig, _ = plot_ghst_qq(x, result, n_sim=qq_sim_size, seed=seed, output_path=qq_path)
+
+    print("\nSaved GHST diagnostic plots")
+    print(f"histogram vs pdf: {hist_path}")
+    print(f"GHST QQ plot:     {qq_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(hist_fig)
+        plt.close(qq_fig)
+
+    return hist_path, qq_path
+
+
 if __name__ == "__main__":
     result = fit_ghst_em(ghst_samples, max_iter=1000, tol=1e-7, verbose=True)
     print_fit_summary(result)
-
-    
+    create_ghst_diagnostic_plots(ghst_samples, result)
