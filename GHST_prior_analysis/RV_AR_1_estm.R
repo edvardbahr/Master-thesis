@@ -45,7 +45,7 @@ ar_data[, eta_hat := log_RV - fitted_log_RV]
 ghst_samples <- ar_data$eta_hat
 # Save the residual samples for later analysis. These are treated as empirical
 # samples from the GHST innovation distribution.
-fwrite(data.table(eta_hat = ghst_samples), "ghst_eta_hat_samples.csv")
+# fwrite(data.table(eta_hat = ghst_samples), "ghst_eta_hat_samples.csv")
 
 
 n_u <- length(ghst_samples)

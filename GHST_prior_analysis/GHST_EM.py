@@ -365,7 +365,7 @@ def fit_ghst_em(
     x: np.ndarray,
     *,
     initial_params: GHSTParameters | None = None,
-    max_iter: int = 500,
+    max_iter: int = 2000,
     tol: float = 1e-7,
     verbose: bool = True,
 ) -> GHSTEMResult:
@@ -851,9 +851,13 @@ def run_parametric_bootstrap_ci(
     return estimates_path, ci_output
 
 
-if __name__ == "__main__":
+
+def main() -> None:
     ghst_samples = load_ghst_samples(GHST_SAMPLE_PATH)
     result = fit_ghst_em(ghst_samples, max_iter=1000, tol=1e-7, verbose=True)
     print_fit_summary(result)
     create_ghst_diagnostic_plots(ghst_samples, result, show=False)
-    run_parametric_bootstrap_ci(ghst_samples, result, n_bootstrap=1000)
+    #run_parametric_bootstrap_ci(ghst_samples, result, n_bootstrap=1000)
+
+if __name__ == "__main__":
+    main()
