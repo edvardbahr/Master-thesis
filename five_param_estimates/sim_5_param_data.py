@@ -19,35 +19,36 @@ class GHSkewTPriorConstants:
     phi_a0: float
     phi_b0: float
     Bs: float
-    r_a0: float
-    r_b0: float
+    r_a0: float | None
+    r_b0: float | None
     r_max: float
     nu_min: float
     nu_rate: float
 
 
 _GH_SKEW_T_PRIORS = {
-    "finance": GHSkewTPriorConstants(
-        mu_mean=-9.0,
-        mu_sd=1.0,
-        phi_a0=20.0,
-        phi_b0=1.5,
-        Bs=1.0,
-        r_a0=1.0,
-        r_b0=9.0,
-        r_max=0.8,
-        nu_min=8.0,
-        nu_rate=0.1,
-    ),
+    # TODO: Finalize finance prior before making it selectable.
+    # "finance": GHSkewTPriorConstants(
+    #     mu_mean=-9.0,
+    #     mu_sd=1.0,
+    #     phi_a0=20.0,
+    #     phi_b0=1.5,
+    #     Bs=1.0,
+    #     r_a0=1.0,
+    #     r_b0=9.0,
+    #     r_max=0.8,
+    #     nu_min=8.0,
+    #     nu_rate=0.1,
+    # ),
     "default": GHSkewTPriorConstants(
         mu_mean=0.0,
         mu_sd=10.0,
         phi_a0=5.0,
         phi_b0=1.5,
         Bs=1.0,
-        r_a0=1.0,
-        r_b0=9.0,
-        r_max=0.8,
+        r_a0=None,  # When r_a0, r_b0 is None, r is sampled
+        r_b0=None,  # from a uniform distribution on [0, r_max).
+        r_max=0.999999,
         nu_min=8.0,
         nu_rate=0.1,
     ),
@@ -67,7 +68,8 @@ def get_gh_skew_t_prior_constants(prior="default"):
     The GH skew-t innovation is parameterized by (s, nu, r), where r controls
     the positive-skew variance fraction and nu controls tail thickness:
 
-        r / r_max ~ Beta(r_a0, r_b0)
+        r / r_max ~ Beta(r_a0, r_b0), or
+        r ~ Uniform(0, r_max) if r_a0 and r_b0 are both None
 
     The tail parameter follows a shifted exponential distribution:
 
@@ -85,10 +87,41 @@ def get_gh_skew_t_prior_constants(prior="default"):
 get_stochvol_prior_constants = get_gh_skew_t_prior_constants
 # This should probably be removed as there is no backwards compatibility involed.
 
+
+def validate_gh_skew_t_prior_constants(hyper):
+    """
+    Validate prior constants whose constraints are needed by the sampler.
+    """
+
+    if not np.isfinite(hyper.r_max) or not (0.0 < hyper.r_max < 1.0):
+        raise ValueError("r_max must satisfy 0 < r_max < 1.")
+
+    has_r_a0 = hyper.r_a0 is not None
+    has_r_b0 = hyper.r_b0 is not None
+
+    if has_r_a0 != has_r_b0:
+        raise ValueError("r_a0 and r_b0 must either both be specified or both be None.")
+
+    if has_r_a0 and (
+        not np.isfinite(hyper.r_a0)
+        or not np.isfinite(hyper.r_b0)
+        or hyper.r_a0 <= 0.0
+        or hyper.r_b0 <= 0.0
+    ):
+        raise ValueError("r_a0 and r_b0 must be positive when specified.")
+
+    if not np.isfinite(hyper.nu_min) or hyper.nu_min <= 4.0:
+        raise ValueError("nu_min must be greater than 4.")
+
+    if not np.isfinite(hyper.nu_rate) or hyper.nu_rate <= 0.0:
+        raise ValueError("nu_rate must be positive.")
+
+
 def sample_stochvol_prior(
     n,
     rng,
     prior="default",
+    fixed_nu=None,
     return_s2=False,
     dtype=np.float64,
 ):
@@ -100,7 +133,9 @@ def sample_stochvol_prior(
         mu ~ N(mu_mean, mu_sd^2)
         (phi + 1) / 2 ~ Beta(phi_a0, phi_b0)
         s^2 ~ Bs * ChiSq(df = 1)
-        r / r_max ~ Beta(r_a0, r_b0)
+        r / r_max ~ Beta(r_a0, r_b0), or
+        r ~ Uniform(0, r_max) if r_a0 and r_b0 are both None
+        nu = fixed_nu if fixed_nu is not None, otherwise
         nu = nu_min + X, X ~ Exponential(rate = nu_rate)
 
     Returns
@@ -116,6 +151,10 @@ def sample_stochvol_prior(
         raise ValueError("n must be at least 1.")
 
     hyper = get_gh_skew_t_prior_constants(prior)
+    validate_gh_skew_t_prior_constants(hyper)
+
+    if fixed_nu is not None and (not np.isfinite(fixed_nu) or fixed_nu <= 4.0):
+        raise ValueError("fixed_nu must be greater than 4.")
 
     mu = rng.normal(
         loc=hyper.mu_mean,
@@ -137,17 +176,25 @@ def sample_stochvol_prior(
     ).astype(dtype, copy=False)
     s = np.sqrt(s2).astype(dtype, copy=False)
 
-    r = (
-        hyper.r_max * rng.beta(
-            a=hyper.r_a0,
-            b=hyper.r_b0,
-            size=n,
-        )
-    ).astype(dtype, copy=False)
+    if hyper.r_a0 is not None and hyper.r_b0 is not None:
+        r = (
+            hyper.r_max * rng.beta(
+                a=hyper.r_a0,
+                b=hyper.r_b0,
+                size=n,
+            )
+        ).astype(dtype, copy=False)
+    else:
+        r = (
+            hyper.r_max * rng.uniform(low=0.0, high=1.0, size=n)
+        ).astype(dtype, copy=False)
 
-    nu = (
-        hyper.nu_min + rng.exponential(scale=1.0 / hyper.nu_rate, size=n)
-    ).astype(dtype, copy=False)
+    if fixed_nu is None:
+        nu = (
+            hyper.nu_min + rng.exponential(scale=1.0 / hyper.nu_rate, size=n)
+        ).astype(dtype, copy=False)
+    else:
+        nu = np.full((n,), fixed_nu, dtype=dtype)
 
     if return_s2:
         return mu, phi, s, r, nu, s2
@@ -313,6 +360,7 @@ def _simulate_log_y_squared_chunk(job):
         n,
         seed_seq,
         prior,
+        fixed_nu,
         random_init,
         k,
         center_y,
@@ -326,6 +374,7 @@ def _simulate_log_y_squared_chunk(job):
         n_chunk,
         rng=rng,
         prior=prior,
+        fixed_nu=fixed_nu,
         return_s2=False,
         dtype=np.float64,
     )
@@ -413,6 +462,7 @@ def simulate_sv_log_y_squared_parallel(
     N,
     n,
     chunk_size,
+    fixed_nu=None,
     n_workers=-1,
     seed=1,
     prior="default",
@@ -443,9 +493,6 @@ def simulate_sv_log_y_squared_parallel(
 
     n_workers = resolve_n_workers(n_workers)
 
-    if chunk_size is None:
-        raise ValueError("chunk_size must be explicitly specified.")
-
     if chunk_size < 1:
         raise ValueError("chunk_size must be at least 1.")
 
@@ -475,6 +522,7 @@ def simulate_sv_log_y_squared_parallel(
                 n,
                 child_seeds[chunk_id],
                 prior,
+                fixed_nu,
                 random_init,
                 k,
                 center_y,
@@ -510,7 +558,7 @@ def simulate_sv_log_y_squared_parallel(
 
 
 def main():
-    N = 1000
+    N = 10000
     n = 1000
     n_workers = resolve_n_workers(-2)
     chunk_size = resolve_chunk_size(N, n_workers, chunks_per_worker=4)
@@ -519,6 +567,7 @@ def main():
     log_y_squared, theta = simulate_sv_log_y_squared_parallel(
         N=N,
         n=n,
+        fixed_nu=10,
         chunk_size=chunk_size,
         n_workers=n_workers,
         seed=seed,
@@ -530,6 +579,10 @@ def main():
         exp_clip=350.0,
         show_progress=True,
     )
+
+    import matplotlib.pyplot as plt
+    plt.hist(theta[:,-2], density=True)
+    plt.show()
 
 
 
