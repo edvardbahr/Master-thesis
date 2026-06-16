@@ -14,6 +14,103 @@ import torch.nn.functional as F
 import sim_5_param_data as sim
 
 
+def make_mlp(
+    input_dim,
+    hidden_dims,
+    output_dim=None,
+    activation=nn.ReLU,
+):
+    layers = []
+    d_prev = input_dim
+
+    for d_hidden in hidden_dims:
+        layers.append(nn.Linear(d_prev, d_hidden))
+        layers.append(activation())
+
+        d_prev = d_hidden
+
+    if output_dim is not None:
+        layers.append(nn.Linear(d_prev, output_dim))
+        d_prev = output_dim
+
+    if len(layers) == 0:
+        return nn.Identity(), input_dim
+
+    return nn.Sequential(*layers), d_prev
+
+
+
+class TemporalResidualBlock(nn.Module):
+    """
+    Non-causal TCN-style residual block.
+
+    Causality is unnecessary here because the posterior is conditioned on the
+    full observed series. Symmetric padding lets each location use neighboring
+    observations on both sides while preserving sequence length.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=5,
+        dilation=1,
+        activation=nn.ReLU,
+        use_batch_norm=True,
+    ):
+        super().__init__()
+
+        if kernel_size < 1:
+            raise ValueError("kernel_size must be at least 1.")
+
+        if kernel_size % 2 == 0:
+            raise ValueError("Use an odd kernel_size so symmetric padding preserves length.")
+
+        padding = dilation * (kernel_size - 1) // 2
+
+        layers = [
+            nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+            ),
+        ]
+
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(out_channels))
+
+        layers.append(activation())
+
+
+        layers.append(
+            nn.Conv1d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
+
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(out_channels))
+
+
+        self.net = nn.Sequential(*layers)
+
+        if in_channels == out_channels:
+            self.residual = nn.Identity()
+        else:
+            self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+
+        self.activation = activation()
+
+    def forward(self, x):
+        return self.activation(self.net(x) + self.residual(x))
+
+
 class SVPosteriorTCN(nn.Module):
     """
     Temporal convolutional network for amortized inference in the standard SV model.
@@ -44,7 +141,6 @@ class SVPosteriorTCN(nn.Module):
         dilations=None,
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
-        dropout=0.0,
         use_batch_norm=True,
         min_var=1e-12,
         input_mean=0.0,
@@ -69,7 +165,6 @@ class SVPosteriorTCN(nn.Module):
         self.kernel_size = kernel_size
         self.dilations = tuple(dilations)
         self.hidden_dims_head = tuple(hidden_dims_head)
-        self.dropout = dropout
         self.use_batch_norm = use_batch_norm
         self.min_var = min_var
 
@@ -93,7 +188,6 @@ class SVPosteriorTCN(nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     activation=activation,
-                    dropout=dropout,
                     use_batch_norm=use_batch_norm,
                 )
             )
@@ -111,8 +205,6 @@ class SVPosteriorTCN(nn.Module):
                 hidden_dims=hidden_dims_head,
                 output_dim=2,
                 activation=activation,
-                dropout=dropout,
-                layer_norm=False,
             )
             self.heads[name] = head
 
@@ -362,7 +454,6 @@ def train_live_cnn(
     dilations=None,
     hidden_dims_head=(64, 64),
     activation=nn.ReLU,
-    dropout=0.0,
     use_batch_norm=True,
     checkpoint_path="sv_posterior_tcn_live.pt",
     latest_checkpoint_path=None,
@@ -587,7 +678,6 @@ def train_live_cnn(
         dilations=dilations,
         hidden_dims_head=hidden_dims_head,
         activation=activation,
-        dropout=dropout,
         use_batch_norm=use_batch_norm,
         min_var=min_var,
         input_mean=input_mean,
@@ -693,7 +783,6 @@ def train_live_cnn(
             "temporal_receptive_field": temporal_receptive_field(kernel_size, model.dilations),
             "hidden_dims_head": tuple(hidden_dims_head),
             "activation": getattr(activation, "__name__", str(activation)),
-            "dropout": dropout,
             "use_batch_norm": use_batch_norm,
             "min_var": min_var,
 
@@ -1078,7 +1167,6 @@ def train_live_cnn(
         "temporal_receptive_field": temporal_receptive_field(kernel_size, model.dilations),
         "hidden_dims_head": tuple(hidden_dims_head),
         "activation": activation_name,
-        "dropout": dropout,
         "use_batch_norm": use_batch_norm,
         "min_var": min_var,
 
@@ -1186,7 +1274,6 @@ def main():
         dilations=None, # Use default exponentially increasing dilations
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
-        dropout=0.0,
         use_batch_norm=True,
         checkpoint_path="sv_posterior_tcn_live_finance.pt",
         latest_checkpoint_path="sv_posterior_tcn_live_finance.latest.pt",
