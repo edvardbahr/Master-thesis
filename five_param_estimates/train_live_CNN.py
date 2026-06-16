@@ -12,13 +12,210 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sim_5_param_data as sim
-from train_CNN import (
-    SVPosteriorTCN,
-    count_parameters,
-    diagonal_gaussian_nll,
-    temporal_receptive_field,
-    theta_to_target_numpy,
-)
+
+
+class SVPosteriorTCN(nn.Module):
+    """
+    Temporal convolutional network for amortized inference in the standard SV model.
+
+    Input:
+        x: log(y_t^2 + k), shape (batch_size, sequence_length)
+           or (batch_size, 1, sequence_length)
+
+    Output:
+        mean: shape (batch_size, 3)
+              columns: [mu_mean, psi_mean, log_sigma_mean]
+
+        var: shape (batch_size, 3)
+             columns: [mu_var, psi_var, log_sigma_var]
+
+    where:
+        psi = 2 * atanh(phi)
+        log_sigma = log(sigma)
+    """
+
+    param_names = ("mu", "psi", "log_sigma")
+
+    def __init__(
+        self,
+        sequence_length,
+        tcn_channels=(16, 32, 32, 64, 64),
+        kernel_size=5,
+        dilations=None,
+        hidden_dims_head=(32, 32),
+        activation=nn.ReLU,
+        dropout=0.0,
+        use_batch_norm=True,
+        min_var=1e-12,
+        input_mean=0.0,
+        input_std=1.0,
+    ):
+        super().__init__()
+
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be at least 1.")
+
+        if len(tcn_channels) == 0:
+            raise ValueError("tcn_channels must contain at least one channel size.")
+
+        if dilations is None:
+            dilations = tuple(2 ** i for i in range(len(tcn_channels)))
+
+        if len(dilations) != len(tcn_channels):
+            raise ValueError("dilations must have the same length as tcn_channels.")
+
+        self.sequence_length = sequence_length
+        self.tcn_channels = tuple(tcn_channels)
+        self.kernel_size = kernel_size
+        self.dilations = tuple(dilations)
+        self.hidden_dims_head = tuple(hidden_dims_head)
+        self.dropout = dropout
+        self.use_batch_norm = use_batch_norm
+        self.min_var = min_var
+
+        self.register_buffer(
+            "input_mean",
+            torch.tensor(float(input_mean), dtype=torch.float32).view(1, 1, 1),
+        )
+        self.register_buffer(
+            "input_std",
+            torch.tensor(float(input_std), dtype=torch.float32).view(1, 1, 1),
+        )
+
+        blocks = []
+        in_channels = 1
+
+        for out_channels, dilation in zip(tcn_channels, dilations):
+            blocks.append(
+                TemporalResidualBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    activation=activation,
+                    dropout=dropout,
+                    use_batch_norm=use_batch_norm,
+                )
+            )
+            in_channels = out_channels
+
+        self.encoder = nn.Sequential(*blocks)
+
+        representation_dim = 2 * tcn_channels[-1]
+
+        self.heads = nn.ModuleDict()
+
+        for name in self.param_names:
+            head, _ = make_mlp(
+                input_dim=representation_dim,
+                hidden_dims=hidden_dims_head,
+                output_dim=2,
+                activation=activation,
+                dropout=dropout,
+                layer_norm=False,
+            )
+            self.heads[name] = head
+
+    def forward(self, x):
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        elif x.ndim != 3:
+            raise ValueError("x must have shape (batch_size, n) or (batch_size, 1, n).")
+
+        if x.shape[1] != 1:
+            raise ValueError("x must have exactly one input channel.")
+
+        x = (x - self.input_mean) / self.input_std.clamp_min(1e-8)
+
+        h = self.encoder(x)
+
+        # Each channel is pooled to a single value using both average and max pooling
+        h_avg = F.adaptive_avg_pool1d(h, output_size=1).squeeze(-1)
+        h_max = F.adaptive_max_pool1d(h, output_size=1).squeeze(-1)
+        h = torch.cat([h_avg, h_max], dim=1)
+
+        means = []
+        variances = []
+
+        for name in self.param_names:
+            out = self.heads[name](h)
+
+            mean = out[:, 0:1]
+            raw_var = out[:, 1:2]
+            var = F.softplus(raw_var) + self.min_var
+
+            means.append(mean)
+            variances.append(var)
+
+        mean = torch.cat(means, dim=1)
+        var = torch.cat(variances, dim=1)
+
+        return mean, var
+
+
+def theta_to_target_numpy(theta, eps=1e-6):
+    """
+    Converts original SV parameters to transformed training targets.
+
+    theta has shape (n_samples, 3), with columns:
+        theta[:, 0] = mu
+        theta[:, 1] = phi
+        theta[:, 2] = sigma
+
+    Returns target with columns:
+        mu
+        psi = 2 * atanh(phi)
+        log_sigma = log(sigma)
+    """
+    mu = theta[:, 0]
+    phi = theta[:, 1]
+    sigma = theta[:, 2]
+
+    phi = np.clip(phi, -1.0 + eps, 1.0 - eps)
+    sigma = np.clip(sigma, eps, None)
+
+    psi = 2 * np.arctanh(phi)
+    log_sigma = np.log(sigma)
+
+    target = np.column_stack([mu, psi, log_sigma])
+
+    return target.astype(np.float32)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def temporal_receptive_field(kernel_size, dilations, convs_per_block=2):
+    return 1 + convs_per_block * (kernel_size - 1) * sum(dilations)
+
+def diagonal_gaussian_nll(mean, var, target):
+    """
+    Computes marginal negative log scores under a diagonal Gaussian.
+
+    mean:
+        shape (batch_size, param_dim)
+
+    var:
+        shape (batch_size, param_dim)
+
+    target:
+        shape (batch_size, param_dim)
+
+    Returns:
+        losses:
+            shape (param_dim,), one mean NLL per transformed parameter.
+    """
+    elementwise_nll = F.gaussian_nll_loss(
+        input=mean,
+        target=target,
+        var=var,
+        full=True,
+        reduction="none",
+    )
+
+    losses = elementwise_nll.mean(dim=0)
+
+    return losses
 
 
 K_MOMENT_WARNING_THRESHOLD = 1e-10
