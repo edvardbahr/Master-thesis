@@ -661,8 +661,8 @@ def main():
     )
 
     import matplotlib.pyplot as plt
-    #plt.hist(theta[:,3], density=True)
-    #plt.show()
+    plt.hist(theta[:,3], density=True)
+    plt.show()
 
     print(np.mean(log_y_squared[:,4]))
     print(np.var(log_y_squared[:,4]))

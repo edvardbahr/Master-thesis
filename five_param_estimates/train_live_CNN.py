@@ -131,7 +131,7 @@ class SVPosteriorTCN(nn.Module):
         log_sigma = log(sigma)
     """
 
-    param_names = ("mu", "psi", "log_sigma")
+    param_names = ("mu", "psi", "log_s", "r")
 
     def __init__(
         self,
@@ -195,6 +195,7 @@ class SVPosteriorTCN(nn.Module):
 
         self.encoder = nn.Sequential(*blocks)
 
+        # We multiply by 2 as we are collapsing every channel to two distinct values, being h_avg and h_max
         representation_dim = 2 * tcn_channels[-1]
 
         self.heads = nn.ModuleDict()
