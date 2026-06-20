@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 
-STATIONARY_INIT_BURN_IN_STEPS = 20
+_STATIONARY_INIT_BURN_IN_STEPS = 20
 
 
 @dataclass(frozen=True)
@@ -85,11 +85,6 @@ def get_gh_skew_t_prior_constants(prior="default"):
         raise ValueError(f"Unknown prior '{prior}'. Valid choices are: {valid}.")
 
     return _GH_SKEW_T_PRIORS[prior]
-
-
-# Backwards-compatible alias with the same naming style as sim_3_param_data.py.
-get_stochvol_prior_constants = get_gh_skew_t_prior_constants
-# This should probably be removed as there is no backwards compatibility involed.
 
 
 def validate_gh_skew_t_prior_constants(hyper):
@@ -330,7 +325,7 @@ def simulate_sv_chunk(
         stationary_sd = s / np.sqrt(1.0 - phi**2)
         h_prev = mu + stationary_sd * rng.standard_normal(m)
 
-        for _ in range(STATIONARY_INIT_BURN_IN_STEPS):
+        for _ in range(_STATIONARY_INIT_BURN_IN_STEPS):
             h_prev = (
                 mu
                 + phi * (h_prev - mu)
@@ -572,11 +567,79 @@ def simulate_sv_log_y_squared_parallel(
     return log_y_squared, theta
 
 
+def log_y_squared_moments(prior="default"):
+    """
+    Computes the prior-predictive mean and variance of
+
+        log(y_t^2) = h_t + log(epsilon_t^2)
+
+    where
+
+        E(h_t | mu, phi, s, r, nu) = mu;
+        var(h_t | mu, phi, s, r, nu) =  s^2 / (1 - phi^2);
+        epsilon_t ~ N(0, 1);
+
+    and mu, phi, s are drawn from the stochvol-style prior.
+    """
+
+    EULER_GAMMA = 0.5772156649015329
+
+    hyper = get_gh_skew_t_prior_constants(prior)
+
+    a = hyper.phi_a0
+    b = hyper.phi_b0
+    Bs = hyper.Bs
+
+    if a <= 1 or b <= 1:
+        raise ValueError(
+            "The analytic variance requires phi_a0 > 1 and phi_b0 > 1, "
+            "otherwise E[1 / (1 - phi^2)] is infinite."
+        )
+
+    # Moments of log(epsilon_t^2), where epsilon_t ~ N(0, 1)
+    mean_log_eps2 = -EULER_GAMMA - np.log(2.0)
+    var_log_eps2 = np.pi**2 / 2.0
+
+    # E[mu]
+    mean_mu = hyper.mu_mean
+
+    # Var(mu)
+    var_mu = hyper.mu_sd**2
+
+    # E[sigma^2], since sigma^2 = Bs * chi^2_1
+    mean_sigma2 = Bs
+
+    # If phi = 2U - 1, U ~ Beta(a, b), then
+    #
+    # E[1 / (1 - phi^2)]
+    # =
+    # (a + b - 1) / 4 * (1 / (a - 1) + 1 / (b - 1))
+    mean_inv_one_minus_phi2 = (
+        (a + b - 1.0) / 4.0
+        * (1.0 / (a - 1.0) + 1.0 / (b - 1.0))
+    )
+
+    # E[sigma^2 / (1 - phi^2)]
+    mean_stationary_h_var = mean_sigma2 * mean_inv_one_minus_phi2
+
+    # Law of total expectation
+    mean_log_y2 = mean_mu + mean_log_eps2
+
+    # Law of total variance
+    var_log_y2 = (
+        var_mu
+        + mean_stationary_h_var
+        + var_log_eps2
+    )
+
+    return {"mean": mean_log_y2, "var": var_log_y2, "std": np.sqrt(var_log_y2)}
+
+
 
 
 def main():
-    N = 10000
-    n = 1000
+    N = 100000
+    n = 5
     n_workers = resolve_n_workers(-2)
     chunk_size = resolve_chunk_size(N, n_workers, chunks_per_worker=4)
     seed = 1
@@ -598,9 +661,13 @@ def main():
     )
 
     import matplotlib.pyplot as plt
-    plt.hist(theta[:,-2], density=True)
-    plt.show()
+    #plt.hist(theta[:,3], density=True)
+    #plt.show()
 
+    print(np.mean(log_y_squared[:,4]))
+    print(np.var(log_y_squared[:,4]))
+
+    print(log_y_squared_moments())
 
 
 
