@@ -27,7 +27,8 @@ class GHSkewTPriorConstants:
 
 
 _GH_SKEW_T_PRIORS = {
-    # TODO: Finalize finance prior before making it selectable.
+    # TODO: Finalize finance prior before making it selectable. This can be done through "adaptive learning"
+    # by conditioning on the default prior first and then use the resulting posterior as a finance prior.
     # "finance": GHSkewTPriorConstants(
     #     mu_mean=-9.0,
     #     mu_sd=1.0,
@@ -49,8 +50,8 @@ _GH_SKEW_T_PRIORS = {
         r_a0=None,  # When r_a0, r_b0 is None, r is sampled
         r_b0=None,  # from a uniform distribution on [0, r_max).
         r_max=0.999999,
-        nu_min=8.0,
-        nu_rate=0.1,
+        nu_min=8.0,  # Under this condition the kurtosis exists
+        nu_rate=0.1, # Picked so that there should be at least 5% chance of observing dof > 30 (approx Gaussian)
     ),
 }
 
@@ -69,7 +70,7 @@ def get_gh_skew_t_prior_constants(prior="default"):
     the positive-skew variance fraction and nu controls tail thickness:
 
         r / r_max ~ Beta(r_a0, r_b0), or
-        r ~ Uniform(0, r_max) if r_a0 and r_b0 are both None
+        r ~ Uniform(0, r_max) if r_a0 or r_b0 are None
 
     The tail parameter follows a shifted exponential distribution:
 
@@ -322,6 +323,8 @@ def simulate_sv_chunk(
     m = len(mu)
     y = np.empty((m, n), dtype=dtype)
 
+    # The stationary law is assumed normal, which is only an approximation of the true law.
+    # The approximation is the best when phi is close to 1 (might be problematic when using default prior).
     if random_init:
         stationary_sd = s / np.sqrt(1.0 - phi**2)
         h_prev = mu + stationary_sd * rng.standard_normal(m)
