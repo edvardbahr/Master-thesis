@@ -15,8 +15,8 @@ NU_VALUES = np.array([8.1, 10.0, 15.0, 30.0, 100.0], dtype=np.float64)
 K_VALUES = (0, 5, 10, 20, 50)
 
 SV_MU = -9.0
-S = 1.0
-R = 0.0
+S = 0.65
+R = 0.7
 
 N_APPROX_DRAWS = 10_000
 N_REFERENCE_DRAWS = 50_000

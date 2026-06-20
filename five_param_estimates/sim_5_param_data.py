@@ -12,6 +12,9 @@ from dataclasses import dataclass
 import numpy as np
 
 
+STATIONARY_INIT_BURN_IN_STEPS = 20
+
+
 @dataclass(frozen=True)
 class GHSkewTPriorConstants:
     mu_mean: float
@@ -285,8 +288,8 @@ def simulate_sv_chunk(
         np.random.Generator.
 
     random_init:
-        If True, initialize h_0 using the stationary mean and variance. This
-        matches the 3-parameter simulator's initialization style.
+        If True, initialize from a Gaussian with the stationary mean and
+        variance, then apply 20 GHST transitions before generating y_0.
 
     dtype:
         Floating point type for the returned y array.
@@ -323,11 +326,22 @@ def simulate_sv_chunk(
     m = len(mu)
     y = np.empty((m, n), dtype=dtype)
 
-    # The stationary law is assumed normal, which is only an approximation of the true law.
-    # The approximation is the best when phi is close to 1 (might be problematic when using default prior).
     if random_init:
         stationary_sd = s / np.sqrt(1.0 - phi**2)
         h_prev = mu + stationary_sd * rng.standard_normal(m)
+
+        for _ in range(STATIONARY_INIT_BURN_IN_STEPS):
+            h_prev = (
+                mu
+                + phi * (h_prev - mu)
+                + sample_centered_gh_skew_t_innovations(
+                    s,
+                    r,
+                    nu,
+                    rng,
+                    dtype=np.float64,
+                )
+            )
     else:
         h_prev = mu.copy()
 
