@@ -1293,10 +1293,10 @@ def train_live_cnn(
 
 def main():
     train_live_cnn(
-        sequence_length=253,
+        sequence_length=253 * 2,
         prior="default",
         fixed_nu=12,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500
-        tcn_channels=(16, 32, 32, 64, 64),
+        tcn_channels=(16, 32, 32, 64, 64, 64),
         kernel_size=5,
         dilations=None, # Use default exponentially increasing dilations
         hidden_dims_head=(32, 32),
