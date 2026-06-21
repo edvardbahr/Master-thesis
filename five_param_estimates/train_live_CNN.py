@@ -1,4 +1,3 @@
-import copy
 import os
 import warnings
 
@@ -56,7 +55,7 @@ class TemporalResidualBlock(nn.Module):
         kernel_size=5,
         dilation=1,
         activation=nn.ReLU,
-        use_batch_norm=True,
+        use_batch_norm=False,
     ):
         super().__init__()
 
@@ -120,36 +119,27 @@ class SVPosteriorTCN(nn.Module):
            or (batch_size, 1, sequence_length)
 
     Output:
-        mean: shape (batch_size, 3)
-              columns: [mu_mean, psi_mean, log_sigma_mean]
+        mean: shape (batch_size, n_parameters)
+        var: shape (batch_size, n_parameters)
 
-        var: shape (batch_size, 3)
-             columns: [mu_var, psi_var, log_sigma_var]
-
-    where:
-        psi = 2 * atanh(phi)
-        log_sigma = log(sigma)
+    The output columns follow ``param_names``.
     """
 
-    param_names = ("mu", "psi", "log_s", "r")
+    param_names = ("mu", "psi", "log_s", "logit_r", "log_nu")
 
     def __init__(
         self,
-        sequence_length,
         tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
         dilations=None,
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
-        use_batch_norm=True,
+        use_batch_norm=False,
         min_var=1e-12,
         input_mean=0.0,
         input_std=1.0,
     ):
         super().__init__()
-
-        if sequence_length < 1:
-            raise ValueError("sequence_length must be at least 1.")
 
         if len(tcn_channels) == 0:
             raise ValueError("tcn_channels must contain at least one channel size.")
@@ -160,7 +150,6 @@ class SVPosteriorTCN(nn.Module):
         if len(dilations) != len(tcn_channels):
             raise ValueError("dilations must have the same length as tcn_channels.")
 
-        self.sequence_length = sequence_length
         self.tcn_channels = tuple(tcn_channels)
         self.kernel_size = kernel_size
         self.dilations = tuple(dilations)
@@ -195,7 +184,7 @@ class SVPosteriorTCN(nn.Module):
 
         self.encoder = nn.Sequential(*blocks)
 
-        # We multiply by 2 as we are collapsing every channel to two distinct values, being h_avg and h_max
+        # We multiply by 2 as we are collapsing every channel to h_avg and h_max.
         representation_dim = 2 * tcn_channels[-1]
 
         self.heads = nn.ModuleDict()
@@ -222,9 +211,10 @@ class SVPosteriorTCN(nn.Module):
 
         h = self.encoder(x)
 
-        # Each channel is pooled to a single value using both average and max pooling
-        h_avg = F.adaptive_avg_pool1d(h, output_size=1).squeeze(-1)
-        h_max = F.adaptive_max_pool1d(h, output_size=1).squeeze(-1)
+        # Direct reductions avoid nondeterministic adaptive-max-pool backward
+        # implementations while preserving the same representation shape.
+        h_avg = h.mean(dim=-1)
+        h_max = h.amax(dim=-1)
         h = torch.cat([h_avg, h_max], dim=1)
 
         means = []
@@ -250,27 +240,39 @@ def theta_to_target_numpy(theta, eps=1e-6):
     """
     Converts original SV parameters to transformed training targets.
 
-    theta has shape (n_samples, 3), with columns:
+    theta has shape (n_samples, 5), with columns:
         theta[:, 0] = mu
         theta[:, 1] = phi
-        theta[:, 2] = sigma
+        theta[:, 2] = s
+        theta[:, 3] = r
+        theta[:, 4] = nu
 
     Returns target with columns:
         mu
         psi = 2 * atanh(phi)
-        log_sigma = log(sigma)
+        log_s = log(s)
+        logit_r = logit(r)
+        log_nu = log(nu)
     """
     mu = theta[:, 0]
     phi = theta[:, 1]
-    sigma = theta[:, 2]
+    s = theta[:, 2]
+    r = theta[:, 3]
+    nu = theta[:, 4]
+
 
     phi = np.clip(phi, -1.0 + eps, 1.0 - eps)
-    sigma = np.clip(sigma, eps, None)
+    s= np.clip(s, eps, None)
+    r = np.clip(r, eps, 1.0 - eps)
+    nu = np.clip(nu, eps, None)
 
     psi = 2 * np.arctanh(phi)
-    log_sigma = np.log(sigma)
+    log_s = np.log(s)
+    logit_r = np.log(r / (1 - r))
+    log_nu = np.log(nu)
 
-    target = np.column_stack([mu, psi, log_sigma])
+
+    target = np.column_stack([mu, psi, log_s, logit_r, log_nu])
 
     return target.astype(np.float32)
 
@@ -281,7 +283,7 @@ def count_parameters(model):
 def temporal_receptive_field(kernel_size, dilations, convs_per_block=2):
     return 1 + convs_per_block * (kernel_size - 1) * sum(dilations)
 
-def diagonal_gaussian_nll(mean, var, target):
+def diagonal_gaussian_nll(mean, var, target, min_var):
     """
     Computes marginal negative log scores under a diagonal Gaussian.
 
@@ -303,6 +305,7 @@ def diagonal_gaussian_nll(mean, var, target):
         target=target,
         var=var,
         full=True,
+        eps=min_var,
         reduction="none",
     )
 
@@ -317,54 +320,6 @@ TRAIN_SEED_STREAM = 101
 VALIDATION_SEED_STREAM = 202
 FINAL_VALIDATION_SEED_STREAM = 303
 
-
-# ============================================================
-# Live simulation helpers
-# ============================================================
-
-class LiveSVPosteriorTCN(SVPosteriorTCN):
-    """
-    State-dict compatible TCN using deterministic pooling reductions.
-
-    The base SVPosteriorTCN uses adaptive max pooling. On CUDA, PyTorch can
-    mark its backward pass as nondeterministic. These reductions preserve the
-    same representation shape without introducing extra parameters.
-    """
-
-    def forward(self, x):
-        if x.ndim == 2:
-            x = x.unsqueeze(1)
-        elif x.ndim != 3:
-            raise ValueError("x must have shape (batch_size, n) or (batch_size, 1, n).")
-
-        if x.shape[1] != 1:
-            raise ValueError("x must have exactly one input channel.")
-
-        x = (x - self.input_mean) / self.input_std.clamp_min(1e-8)
-
-        h = self.encoder(x)
-
-        h_avg = h.mean(dim=-1)
-        h_max = h.amax(dim=-1)
-        h = torch.cat([h_avg, h_max], dim=1)
-
-        means = []
-        variances = []
-
-        for name in self.param_names:
-            out = self.heads[name](h)
-
-            mean = out[:, 0:1]
-            raw_var = out[:, 1:2]
-            var = F.softplus(raw_var) + self.min_var
-
-            means.append(mean)
-            variances.append(var)
-
-        mean = torch.cat(means, dim=1)
-        var = torch.cat(variances, dim=1)
-
-        return mean, var
 
 def make_child_seed(seed, stream, index):
     """
@@ -404,7 +359,7 @@ def save_checkpoint_atomic(checkpoint, path):
 
 def state_dict_to_cpu(state_dict):
     return {
-        key: value.detach().cpu()
+        key: value.detach().cpu().clone()
         for key, value in state_dict.items()
     }
 
@@ -455,7 +410,7 @@ def train_live_cnn(
     dilations=None,
     hidden_dims_head=(64, 64),
     activation=nn.ReLU,
-    use_batch_norm=True,
+    use_batch_norm=False,
     checkpoint_path="sv_posterior_tcn_live.pt",
     latest_checkpoint_path=None,
     best_checkpoint_path=None,
@@ -466,7 +421,6 @@ def train_live_cnn(
     val_size=500_000,
     fixed_validation=False,
     lr=1e-4,
-    weight_decay=0.0,
     n_epochs=1000,
     patience=50,
     min_delta=1e-4,
@@ -527,6 +481,9 @@ def train_live_cnn(
     if k <= 0:
         raise ValueError("k must be positive.")
 
+    if min_var <= 0:
+        raise ValueError("min_var must be positive.")
+
     # Validate the prior name through the 3-parameter simulator API.
     sim.get_stochvol_prior_constants(prior)
 
@@ -576,7 +533,6 @@ def train_live_cnn(
     # Reproducibility
     # ============================================================
 
-    np.random.seed(seed)
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -615,6 +571,7 @@ def train_live_cnn(
             RuntimeWarning,
             stacklevel=2,
         )
+        use_amp = False
 
     amp_enabled = bool(use_amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -656,6 +613,7 @@ def train_live_cnn(
                 mean.float(),
                 var.float(),
                 target_batch.float(),
+                min_var=min_var,
             )
 
             batch_n = x_batch.shape[0]
@@ -672,8 +630,7 @@ def train_live_cnn(
     # Initialize model
     # ============================================================
 
-    model = LiveSVPosteriorTCN(
-        sequence_length=sequence_length,
+    model = SVPosteriorTCN(
         tcn_channels=tcn_channels,
         kernel_size=kernel_size,
         dilations=dilations,
@@ -688,7 +645,6 @@ def train_live_cnn(
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=lr,
-        weight_decay=weight_decay,
     )
 
     if verbose:
@@ -752,8 +708,6 @@ def train_live_cnn(
     val_marginal_loss_history = []
     train_loss_history = []
     val_loss_history = []
-    train_seed_history = []
-    validation_seed_history = []
 
     best_val_loss = float("inf")
     best_state = None
@@ -761,12 +715,27 @@ def train_live_cnn(
     best_validation_seed = None
     epochs_without_improvement = 0
     start_epoch = 0
+    completed_epoch = 0
 
-    def make_training_checkpoint(epoch_completed, checkpoint_kind):
+    activation_name = getattr(activation, "__name__", str(activation))
+
+    def make_checkpoint(
+        epoch_completed,
+        checkpoint_kind,
+        final_val_loss=None,
+        final_val_marginal_losses=None,
+        final_validation_seed=None,
+    ):
         best_model_state_cpu = None
 
         if best_state is not None:
             best_model_state_cpu = state_dict_to_cpu(best_state)
+
+        if final_val_marginal_losses is not None:
+            final_val_marginal_losses = np.asarray(
+                final_val_marginal_losses,
+                dtype=np.float32,
+            )
 
         return {
             "checkpoint_kind": checkpoint_kind,
@@ -783,34 +752,40 @@ def train_live_cnn(
             "dilations": tuple(model.dilations),
             "temporal_receptive_field": temporal_receptive_field(kernel_size, model.dilations),
             "hidden_dims_head": tuple(hidden_dims_head),
-            "activation": getattr(activation, "__name__", str(activation)),
+            "activation": activation_name,
             "use_batch_norm": use_batch_norm,
             "min_var": min_var,
 
             "input_mean": np.float32(input_mean),
             "input_std": np.float32(input_std),
             "standardize_input": standardize_input,
-            "standardization_source": "LOG_Y_SQUARED_INPUT_MOMENTS",
+            "standardization_source": "sim_5_param_data.log_y_squared_moments",
 
             "target_names": target_names,
             "target_transform": {
                 "mu": "mu",
                 "psi": "2 * atanh(phi)",
-                "log_sigma": "log(sigma)",
+                "log_s": "log(s)",
+                "logit_r": "log(r/(1-r))",
+                "log_nu": "log(nu)"
             },
+            "loss": "mean negative joint Gaussian log score, diagonal covariance",
+            "loss_components": "mean marginal Gaussian negative log scores",
 
             "best_val_loss": float(best_val_loss),
+            "final_val_loss": (
+                None if final_val_loss is None else float(final_val_loss)
+            ),
+            "final_val_marginal_losses": final_val_marginal_losses,
             "best_epoch": best_epoch,
             "best_validation_seed": best_validation_seed,
+            "final_validation_seed": final_validation_seed,
             "epochs_without_improvement": epochs_without_improvement,
             "train_loss_history": train_loss_history,
             "val_loss_history": val_loss_history,
             "train_marginal_loss_history": train_marginal_loss_history,
             "val_marginal_loss_history": val_marginal_loss_history,
-            "train_seed_history": train_seed_history,
-            "validation_seed_history": validation_seed_history,
 
-            "live_training": True,
             "prior": prior,
             "batch_size": batch_size,
             "n_batches": n_batches,
@@ -833,14 +808,22 @@ def train_live_cnn(
             "use_amp": use_amp,
             "deterministic_torch": deterministic_torch,
             "lr": lr,
-            "weight_decay": weight_decay,
             "n_epochs": n_epochs,
             "patience": patience,
             "min_delta": min_delta,
             "grad_clip_norm": grad_clip_norm,
             "warn_nonfinite_grad": warn_nonfinite_grad,
             "seed": seed,
+            "seed_derivation": "SeedSequence([seed, stream, epoch_index])",
+            "seed_streams": {
+                "train": TRAIN_SEED_STREAM,
+                "validation": VALIDATION_SEED_STREAM,
+                "final_validation": FINAL_VALIDATION_SEED_STREAM,
+            },
             "trainable_parameters": count_parameters(model),
+            "latest_checkpoint_path": latest_checkpoint_path,
+            "best_checkpoint_path": best_checkpoint_path,
+            "resume_from": resume_from,
         }
 
     if resume_from is not None:
@@ -860,9 +843,6 @@ def train_live_cnn(
         val_marginal_loss_history = resume_checkpoint.get("val_marginal_loss_history", [])
         train_loss_history = resume_checkpoint.get("train_loss_history", [])
         val_loss_history = resume_checkpoint.get("val_loss_history", [])
-        train_seed_history = resume_checkpoint.get("train_seed_history", [])
-        validation_seed_history = resume_checkpoint.get("validation_seed_history", [])
-
         best_val_loss = float(resume_checkpoint.get("best_val_loss", float("inf")))
         best_epoch = resume_checkpoint.get("best_epoch")
         best_validation_seed = resume_checkpoint.get("best_validation_seed")
@@ -870,11 +850,31 @@ def train_live_cnn(
             resume_checkpoint.get("epochs_without_improvement", 0)
         )
         start_epoch = int(resume_checkpoint.get("epoch", len(train_loss_history)))
+        completed_epoch = start_epoch
 
-        if "best_model_state_dict" in resume_checkpoint:
-            best_state = resume_checkpoint["best_model_state_dict"]
+        history_lengths = {
+            "train_loss_history": len(train_loss_history),
+            "val_loss_history": len(val_loss_history),
+            "train_marginal_loss_history": len(train_marginal_loss_history),
+            "val_marginal_loss_history": len(val_marginal_loss_history),
+        }
+        inconsistent_histories = {
+            name: length
+            for name, length in history_lengths.items()
+            if length != start_epoch
+        }
+        if inconsistent_histories:
+            raise ValueError(
+                "Checkpoint epoch does not match its loss-history lengths: "
+                f"epoch={start_epoch}, lengths={history_lengths}."
+            )
+
+        if resume_checkpoint.get("best_model_state_dict") is not None:
+            best_state = state_dict_to_cpu(
+                resume_checkpoint["best_model_state_dict"]
+            )
         elif np.isfinite(best_val_loss):
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = state_dict_to_cpu(model.state_dict())
 
         if verbose:
             print(f"Resumed training from {resume_from}")
@@ -887,7 +887,6 @@ def train_live_cnn(
             TRAIN_SEED_STREAM,
             epoch + 1,
         )
-        train_seed_history.append(train_seed)
 
         if verbose and epoch == 0:
             print("Generating live training data...")
@@ -928,6 +927,7 @@ def train_live_cnn(
                 mean.float(),
                 var.float(),
                 target_batch.float(),
+                min_var=min_var,
             )
             train_loss = train_marginal_losses.sum()
 
@@ -1002,8 +1002,6 @@ def train_live_cnn(
                 show_progress=simulation_progress,
             )
 
-        validation_seed_history.append(validation_seed)
-
         val_marginal_losses_value = evaluate_array(model, val_x, val_target)
 
         if not fixed_validation:
@@ -1025,7 +1023,7 @@ def train_live_cnn(
 
         if improved:
             best_val_loss = val_loss_value
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = state_dict_to_cpu(model.state_dict())
             best_epoch = epoch + 1
             best_validation_seed = validation_seed
             epochs_without_improvement = 0
@@ -1056,14 +1054,16 @@ def train_live_cnn(
                 f"val marginal NLLs:   {val_parts}"
             )
 
-        latest_checkpoint = make_training_checkpoint(
+        completed_epoch = epoch + 1
+
+        latest_checkpoint = make_checkpoint(
             epoch_completed=epoch + 1,
             checkpoint_kind="latest",
         )
         save_checkpoint_atomic(latest_checkpoint, latest_checkpoint_path)
 
         if improved:
-            best_checkpoint = make_training_checkpoint(
+            best_checkpoint = make_checkpoint(
                 epoch_completed=epoch + 1,
                 checkpoint_kind="best",
             )
@@ -1103,7 +1103,7 @@ def train_live_cnn(
         final_validation_seed = make_child_seed(
             seed,
             FINAL_VALIDATION_SEED_STREAM,
-            len(val_loss_history) + 1,
+            completed_epoch + 1,
         )
 
         final_val_x, final_val_target = simulate_live_dataset(
@@ -1148,92 +1148,13 @@ def train_live_cnn(
     # Save checkpoint
     # ============================================================
 
-    activation_name = getattr(activation, "__name__", str(activation))
-
-    model_state_cpu = state_dict_to_cpu(model.state_dict())
-
-    checkpoint = {
-        "checkpoint_kind": "final",
-        "epoch": len(train_loss_history),
-        "model_state_dict": model_state_cpu,
-        "best_model_state_dict": state_dict_to_cpu(best_state) if best_state is not None else None,
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-
-        "model_class": "SVPosteriorTCN",
-        "sequence_length": sequence_length,
-        "tcn_channels": tuple(tcn_channels),
-        "kernel_size": kernel_size,
-        "dilations": tuple(model.dilations),
-        "temporal_receptive_field": temporal_receptive_field(kernel_size, model.dilations),
-        "hidden_dims_head": tuple(hidden_dims_head),
-        "activation": activation_name,
-        "use_batch_norm": use_batch_norm,
-        "min_var": min_var,
-
-        "input_mean": np.float32(input_mean),
-        "input_std": np.float32(input_std),
-        "standardize_input": standardize_input,
-        "standardization_source": "LOG_Y_SQUARED_INPUT_MOMENTS",
-
-        "target_names": target_names,
-        "target_transform": {
-            "mu": "mu",
-            "psi": "2 * atanh(phi)",
-            "log_sigma": "log(sigma)",
-        },
-
-        "loss": "mean negative joint Gaussian log score, diagonal covariance",
-        "loss_components": "mean marginal Gaussian negative log scores for mu, psi, and log_sigma",
-        "best_val_loss": float(best_val_loss),
-        "final_val_loss": float(final_val_loss),
-        "final_val_marginal_losses": final_val_marginal_losses_np.astype(np.float32),
-        "best_epoch": best_epoch,
-        "best_validation_seed": best_validation_seed,
-        "final_validation_seed": final_validation_seed,
-
-        "train_loss_history": train_loss_history,
-        "val_loss_history": val_loss_history,
-        "train_marginal_loss_history": train_marginal_loss_history,
-        "val_marginal_loss_history": val_marginal_loss_history,
-        "train_seed_history": train_seed_history,
-        "validation_seed_history": validation_seed_history,
-
-        "live_training": True,
-        "prior": prior,
-        "batch_size": batch_size,
-        "n_batches": n_batches,
-        "train_size_per_validation": train_size,
-        "val_size": val_size,
-        "fixed_validation": fixed_validation,
-        "effective_val_batch_size": effective_val_batch_size,
-        "requested_n_workers": n_workers,
-        "resolved_n_workers": resolved_n_workers,
-        "chunks_per_worker": chunks_per_worker,
-        "train_chunk_size": train_chunk_size,
-        "val_chunk_size": val_chunk_size,
-        "random_init": random_init,
-        "k": k,
-        "center_y": center_y,
-        "out_dtype": str(np.dtype(out_dtype)),
-        "exp_clip": exp_clip,
-        "simulation_progress": simulation_progress,
-
-        "use_amp": use_amp,
-        "deterministic_torch": deterministic_torch,
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "n_epochs": n_epochs,
-        "patience": patience,
-        "min_delta": min_delta,
-        "grad_clip_norm": grad_clip_norm,
-        "warn_nonfinite_grad": warn_nonfinite_grad,
-        "seed": seed,
-        "trainable_parameters": count_parameters(model),
-        "latest_checkpoint_path": latest_checkpoint_path,
-        "best_checkpoint_path": best_checkpoint_path,
-        "resume_from": resume_from,
-    }
+    checkpoint = make_checkpoint(
+        epoch_completed=completed_epoch,
+        checkpoint_kind="final",
+        final_val_loss=final_val_loss,
+        final_val_marginal_losses=final_val_marginal_losses_np,
+        final_validation_seed=final_validation_seed,
+    )
 
     save_checkpoint_atomic(checkpoint, checkpoint_path)
 
@@ -1269,13 +1190,13 @@ def train_live_cnn(
 def main():
     train_live_cnn(
         sequence_length=253,
-        prior="finance",
+        prior="default",
         tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
         dilations=None, # Use default exponentially increasing dilations
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
-        use_batch_norm=True,
+        use_batch_norm=False,
         checkpoint_path="sv_posterior_tcn_live_finance.pt",
         latest_checkpoint_path="sv_posterior_tcn_live_finance.latest.pt",
         best_checkpoint_path="sv_posterior_tcn_live_finance.best.pt",
@@ -1286,7 +1207,6 @@ def main():
         val_size=500_000, # Larger validation to reduce noise between each epoch's validation scores 
         fixed_validation=False,
         lr=0.5e-3,
-        weight_decay=0.0,
         n_epochs=2000,
         patience=75, # A bit higher patience since live training is noisier than fixed datasets
         min_delta=1e-5,
