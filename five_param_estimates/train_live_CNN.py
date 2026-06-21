@@ -13,6 +13,17 @@ import torch.nn.functional as F
 import sim_5_param_data as sim
 
 
+SVGHST_TARGET_NAMES = ("mu", "psi", "log_s", "logit_r", "log_nu")
+TARGET_TRANSFORMS = {
+    "mu": "mu",
+    "psi": "2 * atanh(phi)",
+    "log_s": "log(s)",
+    "logit_r": "log(r/(1-r))",
+    "log_nu": "log(nu)",
+}
+LOSS_REDUCTION = "mean_over_active_parameters"
+
+
 def make_mlp(
     input_dim,
     hidden_dims,
@@ -125,7 +136,7 @@ class SVPosteriorTCN(nn.Module):
     The output columns follow ``param_names``.
     """
 
-    param_names = ("mu", "psi", "log_s", "logit_r", "log_nu")
+    supported_param_names = SVGHST_TARGET_NAMES
 
     def __init__(
         self,
@@ -135,6 +146,7 @@ class SVPosteriorTCN(nn.Module):
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
         use_batch_norm=False,
+        param_names=SVGHST_TARGET_NAMES,
         min_var=1e-12,
         input_mean=0.0,
         input_std=1.0,
@@ -143,6 +155,20 @@ class SVPosteriorTCN(nn.Module):
 
         if len(tcn_channels) == 0:
             raise ValueError("tcn_channels must contain at least one channel size.")
+
+        param_names = tuple(param_names)
+        if not param_names:
+            raise ValueError("param_names must contain at least one parameter name.")
+        if len(set(param_names)) != len(param_names):
+            raise ValueError("param_names must not contain duplicates.")
+
+        unknown_param_names = set(param_names) - set(self.supported_param_names)
+        if unknown_param_names:
+            raise ValueError(
+                "Unknown parameter names: "
+                f"{sorted(unknown_param_names)}. "
+                f"Valid names are: {self.supported_param_names}."
+            )
 
         if dilations is None:
             dilations = tuple(2 ** i for i in range(len(tcn_channels)))
@@ -155,6 +181,7 @@ class SVPosteriorTCN(nn.Module):
         self.dilations = tuple(dilations)
         self.hidden_dims_head = tuple(hidden_dims_head)
         self.use_batch_norm = use_batch_norm
+        self.param_names = param_names
         self.min_var = min_var
 
         self.register_buffer(
@@ -236,7 +263,7 @@ class SVPosteriorTCN(nn.Module):
         return mean, var
 
 
-def theta_to_target_numpy(theta, eps=1e-6):
+def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
     """
     Converts original SV parameters to transformed training targets.
 
@@ -247,13 +274,16 @@ def theta_to_target_numpy(theta, eps=1e-6):
         theta[:, 3] = r
         theta[:, 4] = nu
 
-    Returns target with columns:
-        mu
-        psi = 2 * atanh(phi)
-        log_s = log(s)
-        logit_r = logit(r)
-        log_nu = log(nu)
+    Returns only the transformed columns listed in ``target_names``, in the
+    same order.
     """
+    target_names = tuple(target_names)
+    unknown_target_names = set(target_names) - set(SVGHST_TARGET_NAMES)
+    if unknown_target_names:
+        raise ValueError(
+            f"Unknown target names: {sorted(unknown_target_names)}."
+        )
+
     mu = theta[:, 0]
     phi = theta[:, 1]
     s = theta[:, 2]
@@ -272,7 +302,14 @@ def theta_to_target_numpy(theta, eps=1e-6):
     log_nu = np.log(nu)
 
 
-    target = np.column_stack([mu, psi, log_s, logit_r, log_nu])
+    transformed = {
+        "mu": mu,
+        "psi": psi,
+        "log_s": log_s,
+        "logit_r": logit_r,
+        "log_nu": log_nu,
+    }
+    target = np.column_stack([transformed[name] for name in target_names])
 
     return target.astype(np.float32)
 
@@ -371,6 +408,8 @@ def simulate_live_dataset(
     n_workers,
     seed,
     prior,
+    fixed_nu,
+    target_names,
     random_init,
     k,
     center_y,
@@ -385,6 +424,7 @@ def simulate_live_dataset(
         n_workers=n_workers,
         seed=seed,
         prior=prior,
+        fixed_nu=fixed_nu,
         random_init=random_init,
         k=k,
         center_y=center_y,
@@ -393,7 +433,10 @@ def simulate_live_dataset(
         show_progress=show_progress,
     )
 
-    target = theta_to_target_numpy(theta).astype(np.float32, copy=False)
+    target = theta_to_target_numpy(
+        theta,
+        target_names=target_names,
+    ).astype(np.float32, copy=False)
 
     return log_y_squared.astype(np.float32, copy=False), target
 
@@ -405,6 +448,7 @@ def simulate_live_dataset(
 def train_live_cnn(
     sequence_length,
     prior="default",
+    fixed_nu=None,
     tcn_channels=(16, 32, 32, 64, 64, 64),
     kernel_size=5,
     dilations=None,
@@ -451,6 +495,9 @@ def train_live_cnn(
 
     If fixed_validation=True, the validation set is generated once and reused.
     Otherwise, a new deterministic validation set is generated each epoch.
+
+    If fixed_nu is not None, simulations condition on that value and the model
+    estimates only mu, psi, log_s, and logit_r.
     """
 
     # ============================================================
@@ -484,8 +531,22 @@ def train_live_cnn(
     if min_var <= 0:
         raise ValueError("min_var must be positive.")
 
+    if fixed_nu is not None and (
+        not np.isfinite(fixed_nu) or fixed_nu <= 4.0
+    ):
+        raise ValueError("fixed_nu must be greater than 4.")
+
+    fixed_nu = None if fixed_nu is None else float(fixed_nu)
+
+    target_names = tuple(
+        name
+        for name in SVGHST_TARGET_NAMES
+        if not (name == "log_nu" and fixed_nu is not None)
+    )
+
     # Validate the prior name through the 3-parameter simulator API.
-    sim.get_stochvol_prior_constants(prior)
+    sim.get_gh_skew_t_prior_constants(prior)
+
 
     default_latest_path, default_best_path = default_checkpoint_paths(checkpoint_path)
 
@@ -637,6 +698,7 @@ def train_live_cnn(
         hidden_dims_head=hidden_dims_head,
         activation=activation,
         use_batch_norm=use_batch_norm,
+        param_names=target_names,
         min_var=min_var,
         input_mean=input_mean,
         input_std=input_std,
@@ -649,6 +711,8 @@ def train_live_cnn(
 
     if verbose:
         print("Prior:", prior)
+        print("Fixed nu:", fixed_nu)
+        print("Estimated parameters:", target_names)
         print("Sequence length:", sequence_length)
         print("Input mean:", float(input_mean))
         print("Input std:", float(input_std))
@@ -690,6 +754,8 @@ def train_live_cnn(
             n_workers=resolved_n_workers,
             seed=fixed_validation_seed,
             prior=prior,
+            fixed_nu=fixed_nu,
+            target_names=target_names,
             random_init=random_init,
             k=k,
             center_y=center_y,
@@ -701,8 +767,6 @@ def train_live_cnn(
     # ============================================================
     # Training loop with early stopping
     # ============================================================
-
-    target_names = ["mu", "psi", "log_s", "logit_r", "log_nu"]
 
     train_marginal_loss_history = []
     val_marginal_loss_history = []
@@ -763,14 +827,12 @@ def train_live_cnn(
 
             "target_names": target_names,
             "target_transform": {
-                "mu": "mu",
-                "psi": "2 * atanh(phi)",
-                "log_s": "log(s)",
-                "logit_r": "log(r/(1-r))",
-                "log_nu": "log(nu)"
+                name: TARGET_TRANSFORMS[name]
+                for name in target_names
             },
-            "loss": "mean negative joint Gaussian log score, diagonal covariance",
+            "loss": "mean marginal Gaussian NLL across active parameters",
             "loss_components": "mean marginal Gaussian negative log scores",
+            "loss_reduction": LOSS_REDUCTION,
 
             "best_val_loss": float(best_val_loss),
             "final_val_loss": (
@@ -787,6 +849,7 @@ def train_live_cnn(
             "val_marginal_loss_history": val_marginal_loss_history,
 
             "prior": prior,
+            "fixed_nu": fixed_nu,
             "batch_size": batch_size,
             "n_batches": n_batches,
             "train_size_per_validation": train_size,
@@ -828,6 +891,38 @@ def train_live_cnn(
 
     if resume_from is not None:
         resume_checkpoint = torch_load_checkpoint(resume_from, map_location=device)
+
+        checkpoint_loss_reduction = resume_checkpoint.get("loss_reduction")
+        if checkpoint_loss_reduction != LOSS_REDUCTION:
+            raise ValueError(
+                "Cannot resume a checkpoint created with a different loss "
+                "reduction: "
+                f"checkpoint={checkpoint_loss_reduction}, "
+                f"requested={LOSS_REDUCTION}."
+            )
+
+        checkpoint_target_names = tuple(
+            resume_checkpoint.get("target_names", ())
+        )
+        if checkpoint_target_names != target_names:
+            raise ValueError(
+                "Cannot resume with different estimated parameters: "
+                f"checkpoint={checkpoint_target_names}, requested={target_names}."
+            )
+
+        checkpoint_fixed_nu = resume_checkpoint.get("fixed_nu")
+        same_fixed_nu = (
+            checkpoint_fixed_nu is None and fixed_nu is None
+        ) or (
+            checkpoint_fixed_nu is not None
+            and fixed_nu is not None
+            and float(checkpoint_fixed_nu) == fixed_nu
+        )
+        if not same_fixed_nu:
+            raise ValueError(
+                "Cannot resume with a different fixed_nu value: "
+                f"checkpoint={checkpoint_fixed_nu}, requested={fixed_nu}."
+            )
 
         model.load_state_dict(resume_checkpoint["model_state_dict"])
 
@@ -898,6 +993,8 @@ def train_live_cnn(
             n_workers=resolved_n_workers,
             seed=train_seed,
             prior=prior,
+            fixed_nu=fixed_nu,
+            target_names=target_names,
             random_init=random_init,
             k=k,
             center_y=center_y,
@@ -929,7 +1026,10 @@ def train_live_cnn(
                 target_batch.float(),
                 min_var=min_var,
             )
-            train_loss = train_marginal_losses.sum()
+            # Averaging over active parameters keeps the gradient scale, and
+            # therefore the learning-rate interpretation, independent of how
+            # many parameter heads are enabled.
+            train_loss = train_marginal_losses.mean()
 
             scaler.scale(train_loss).backward()
 
@@ -994,6 +1094,8 @@ def train_live_cnn(
                 n_workers=resolved_n_workers,
                 seed=validation_seed,
                 prior=prior,
+                fixed_nu=fixed_nu,
+                target_names=target_names,
                 random_init=random_init,
                 k=k,
                 center_y=center_y,
@@ -1011,8 +1113,8 @@ def train_live_cnn(
         train_marginal_losses_np = train_marginal_losses_value.cpu().numpy()
         val_marginal_losses_np = val_marginal_losses_value.cpu().numpy()
 
-        train_loss_value = float(train_marginal_losses_np.sum())
-        val_loss_value = float(val_marginal_losses_np.sum())
+        train_loss_value = float(train_marginal_losses_np.mean())
+        val_loss_value = float(val_marginal_losses_np.mean())
 
         train_loss_history.append(train_loss_value)
         val_loss_history.append(val_loss_value)
@@ -1113,6 +1215,8 @@ def train_live_cnn(
             n_workers=resolved_n_workers,
             seed=final_validation_seed,
             prior=prior,
+            fixed_nu=fixed_nu,
+            target_names=target_names,
             random_init=random_init,
             k=k,
             center_y=center_y,
@@ -1123,7 +1227,7 @@ def train_live_cnn(
 
     final_val_marginal_losses = evaluate_array(model, final_val_x, final_val_target)
     final_val_marginal_losses_np = final_val_marginal_losses.detach().cpu().numpy()
-    final_val_loss = float(final_val_marginal_losses_np.sum())
+    final_val_loss = float(final_val_marginal_losses_np.mean())
 
     if not fixed_validation:
         del final_val_x
@@ -1132,9 +1236,9 @@ def train_live_cnn(
     if verbose:
         print()
         print(f"Best epoch: {best_epoch}")
-        print(f"Best validation mean negative joint log score: {best_val_loss:.6f}")
+        print(f"Best validation mean marginal NLL: {best_val_loss:.6f}")
         print(f"Best validation seed: {best_validation_seed}")
-        print(f"Final validation mean negative joint log score: {final_val_loss:.6f}")
+        print(f"Final validation mean marginal NLL: {final_val_loss:.6f}")
         print(f"Final validation seed: {final_validation_seed}")
         print(
             "Final validation marginal NLLs:",
@@ -1169,7 +1273,7 @@ def train_live_cnn(
         plt.plot(train_loss_history, label="train")
         plt.plot(val_loss_history, label="validation")
         plt.xlabel("Epoch")
-        plt.ylabel("Mean negative joint log score")
+        plt.ylabel("Mean marginal NLL across active parameters")
         plt.legend()
         plt.show()
 
@@ -1191,17 +1295,18 @@ def main():
     train_live_cnn(
         sequence_length=253,
         prior="default",
+        fixed_nu=12,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500
         tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=5,
         dilations=None, # Use default exponentially increasing dilations
         hidden_dims_head=(32, 32),
         activation=nn.ReLU,
         use_batch_norm=False,
-        checkpoint_path="sv_posterior_tcn_live_finance.pt",
-        latest_checkpoint_path="sv_posterior_tcn_live_finance.latest.pt",
-        best_checkpoint_path="sv_posterior_tcn_live_finance.best.pt",
-        resume_from="sv_posterior_tcn_live_finance.latest.pt",  # Set to "sv_posterior_tcn_live_finance.latest.pt" to continue. Leave as None to start fresh.
-        seed=1,
+        checkpoint_path="svghst_posterior_tcn_live_default.pt",
+        latest_checkpoint_path="svghst_posterior_tcn_live_default.latest.pt",
+        best_checkpoint_path="svghst_posterior_tcn_live_default.best.pt",
+        resume_from=None,  # Set to "svghst_posterior_tcn_live_default.latest.pt" to continue. Leave as None to start fresh.
+        seed=2,
         batch_size=1024 * 8,
         n_batches=100,    # Number of batches done before each validation
         val_size=500_000, # Larger validation to reduce noise between each epoch's validation scores 
