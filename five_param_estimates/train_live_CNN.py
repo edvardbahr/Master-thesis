@@ -1305,7 +1305,7 @@ def main():
         checkpoint_path="svghst_posterior_tcn_live_default.pt",
         latest_checkpoint_path="svghst_posterior_tcn_live_default.latest.pt",
         best_checkpoint_path="svghst_posterior_tcn_live_default.best.pt",
-        resume_from=None,  # Set to "svghst_posterior_tcn_live_default.latest.pt" to continue. Leave as None to start fresh.
+        resume_from="svghst_posterior_tcn_live_default.latest.pt",  # Set to "svghst_posterior_tcn_live_default.latest.pt" to continue. Leave as None to start fresh.
         seed=2,
         batch_size=1024 * 8,
         n_batches=100,    # Number of batches done before each validation
