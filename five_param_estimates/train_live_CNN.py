@@ -1321,7 +1321,7 @@ def main():
         grad_clip_norm=5.0,
         warn_nonfinite_grad=True,
         deterministic_torch=True,
-        n_workers=-2, # Uses all but 2 cpu cores for data simulation
+        n_workers= -2, # Uses all but 2 cpu cores for data simulation
         chunks_per_worker=4,
         random_init=True,
         k=1e-12,

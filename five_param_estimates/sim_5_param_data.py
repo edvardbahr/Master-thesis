@@ -53,8 +53,8 @@ _GH_SKEW_T_PRIORS = {
         r_a0=None,  # When r_a0, r_b0 is None, r is sampled
         r_b0=None,  # from a uniform distribution on [0, r_max).
         r_max=0.999999,
-        nu_min=8.0,  # Under this condition the kurtosis exists
-        nu_rate=0.1, # Picked so that there should be at least 5% chance of observing dof > 30 (approx Gaussian)
+        nu_min=6.0,  # Under this condition skew exists ish
+        nu_rate=0.1, # Picked so that there should be a 10% chance of observing nu > 30 (approx Gaussian)
     ),
 }
 
