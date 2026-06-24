@@ -289,17 +289,18 @@ def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
     s = theta[:, 2]
     r = theta[:, 3]
     nu = theta[:, 4]
+    nu_min = sim.get_gh_skew_t_prior_constants(prior="default").nu_min
 
 
     phi = np.clip(phi, -1.0 + eps, 1.0 - eps)
     s= np.clip(s, eps, None)
     r = np.clip(r, eps, 1.0 - eps)
-    nu = np.clip(nu, eps, None)
+    nu_adjusted = np.clip(nu-nu_min, eps, None)
 
     psi = 2 * np.arctanh(phi)
     log_s = np.log(s)
     logit_r = np.log(r / (1 - r))
-    log_nu = np.log(nu)
+    log_nu = np.log(nu_adjusted)
 
 
     transformed = {
@@ -1295,7 +1296,7 @@ def main():
     train_live_cnn(
         sequence_length=253 * 2,
         prior="default",
-        fixed_nu=12,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500
+        fixed_nu=None,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500
         tcn_channels=(16, 32, 32, 64, 64, 64),
         kernel_size=5,
         dilations=None, # Use default exponentially increasing dilations
@@ -1305,7 +1306,7 @@ def main():
         checkpoint_path="svghst_posterior_tcn_live_default.pt",
         latest_checkpoint_path="svghst_posterior_tcn_live_default.latest.pt",
         best_checkpoint_path="svghst_posterior_tcn_live_default.best.pt",
-        resume_from="svghst_posterior_tcn_live_default.latest.pt",  # Set to "svghst_posterior_tcn_live_default.latest.pt" to continue. Leave as None to start fresh.
+        resume_from=None,  # Set to "svghst_posterior_tcn_live_default.latest.pt" to continue. Leave as None to start fresh.
         seed=2,
         batch_size=1024 * 8,
         n_batches=100,    # Number of batches done before each validation

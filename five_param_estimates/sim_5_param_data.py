@@ -54,7 +54,7 @@ _GH_SKEW_T_PRIORS = {
         r_b0=None,  # from a uniform distribution on [0, r_max).
         r_max=0.999999,
         nu_min=6.0,  # Under this condition skew exists ish
-        nu_rate=0.1, # Picked so that there should be a 10% chance of observing nu > 30 (approx Gaussian)
+        nu_rate=0.1, # Picked so that there is a 10% chance of observing nu > 30 (approx Gaussian)
     ),
 }
 
