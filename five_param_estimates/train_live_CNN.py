@@ -22,7 +22,8 @@ TARGET_TRANSFORMS = {
     "log_nu": "log(nu)",
 }
 LOSS_REDUCTION = "mean_over_active_parameters"
-
+CHUNKS_PER_WORKER = 4
+KAPPA = 1e-12
 
 def make_mlp(
     input_dim,
@@ -47,6 +48,45 @@ def make_mlp(
         return nn.Identity(), input_dim
 
     return nn.Sequential(*layers), d_prev
+
+
+def resolve_per_block_values(value, n_blocks, name):
+    if isinstance(value, int):
+        values = (int(value),) * n_blocks
+    else:
+        try:
+            values = tuple(int(item) for item in value)
+        except TypeError as exc:
+            raise ValueError(
+                f"{name} must be an integer or a sequence with one value per TCN block."
+            ) from exc
+
+    if len(values) != n_blocks:
+        raise ValueError(f"{name} must have the same length as tcn_channels.")
+
+    return values
+
+
+def resolve_name_tuple(value, supported_names, name):
+    if isinstance(value, str):
+        values = (value,)
+    else:
+        values = tuple(value)
+
+    if not values:
+        raise ValueError(f"{name} must contain at least one value.")
+
+    unknown_names = set(values) - set(supported_names)
+    if unknown_names:
+        raise ValueError(
+            f"Unknown {name}: {sorted(unknown_names)}. "
+            f"Valid values are: {supported_names}."
+        )
+
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} must not contain duplicates.")
+
+    return values
 
 
 
@@ -137,6 +177,8 @@ class SVPosteriorTCN(nn.Module):
     """
 
     supported_param_names = SVGHST_TARGET_NAMES
+    supported_input_feature_names = ("level", "diff", "pos_diff", "neg_diff")
+    supported_pooling_modes = ("mean", "max", "std", "topk_mean")
 
     def __init__(
         self,
@@ -144,6 +186,9 @@ class SVPosteriorTCN(nn.Module):
         kernel_size=5,
         dilations=None,
         hidden_dims_head=(32, 32),
+        input_feature_names=("level",),
+        pooling_modes=("mean", "max"),
+        topk_pool_fraction=0.05,
         activation=nn.ReLU,
         use_batch_norm=False,
         param_names=SVGHST_TARGET_NAMES,
@@ -172,14 +217,48 @@ class SVPosteriorTCN(nn.Module):
 
         if dilations is None:
             dilations = tuple(2 ** i for i in range(len(tcn_channels)))
+        else:
+            dilations = tuple(int(dilation) for dilation in dilations)
 
         if len(dilations) != len(tcn_channels):
             raise ValueError("dilations must have the same length as tcn_channels.")
+        if any(dilation < 1 for dilation in dilations):
+            raise ValueError("dilations must be positive integers.")
+
+        kernel_sizes = resolve_per_block_values(
+            kernel_size,
+            len(tcn_channels),
+            "kernel_size",
+        )
+        for block_kernel_size in kernel_sizes:
+            if block_kernel_size < 1:
+                raise ValueError("kernel_size values must be at least 1.")
+            if block_kernel_size % 2 == 0:
+                raise ValueError("Use odd kernel_size values so padding preserves length.")
+
+        input_feature_names = resolve_name_tuple(
+            input_feature_names,
+            self.supported_input_feature_names,
+            "input_feature_names",
+        )
+        pooling_modes = resolve_name_tuple(
+            pooling_modes,
+            self.supported_pooling_modes,
+            "pooling_modes",
+        )
+
+        topk_pool_fraction = float(topk_pool_fraction)
+        if not 0.0 < topk_pool_fraction <= 1.0:
+            raise ValueError("topk_pool_fraction must be in (0, 1].")
 
         self.tcn_channels = tuple(tcn_channels)
         self.kernel_size = kernel_size
+        self.kernel_sizes = kernel_sizes
         self.dilations = tuple(dilations)
         self.hidden_dims_head = tuple(hidden_dims_head)
+        self.input_feature_names = input_feature_names
+        self.pooling_modes = pooling_modes
+        self.topk_pool_fraction = topk_pool_fraction
         self.use_batch_norm = use_batch_norm
         self.param_names = param_names
         self.min_var = min_var
@@ -194,14 +273,18 @@ class SVPosteriorTCN(nn.Module):
         )
 
         blocks = []
-        in_channels = 1
+        in_channels = len(input_feature_names)
 
-        for out_channels, dilation in zip(tcn_channels, dilations):
+        for out_channels, dilation, block_kernel_size in zip(
+            tcn_channels,
+            dilations,
+            kernel_sizes,
+        ):
             blocks.append(
                 TemporalResidualBlock(
                     in_channels=in_channels,
                     out_channels=out_channels,
-                    kernel_size=kernel_size,
+                    kernel_size=block_kernel_size,
                     dilation=dilation,
                     activation=activation,
                     use_batch_norm=use_batch_norm,
@@ -211,8 +294,7 @@ class SVPosteriorTCN(nn.Module):
 
         self.encoder = nn.Sequential(*blocks)
 
-        # We multiply by 2 as we are collapsing every channel to h_avg and h_max.
-        representation_dim = 2 * tcn_channels[-1]
+        representation_dim = len(pooling_modes) * tcn_channels[-1]
 
         self.heads = nn.ModuleDict()
 
@@ -225,6 +307,49 @@ class SVPosteriorTCN(nn.Module):
             )
             self.heads[name] = head
 
+    def make_input_features(self, x):
+        diff = None
+        features = []
+
+        for name in self.input_feature_names:
+            if name == "level":
+                features.append(x)
+                continue
+
+            if diff is None:
+                diff = F.pad(x[:, :, 1:] - x[:, :, :-1], (1, 0))
+
+            if name == "diff":
+                features.append(diff)
+            elif name == "pos_diff":
+                features.append(F.relu(diff))
+            elif name == "neg_diff":
+                features.append(F.relu(-diff))
+            else:
+                raise RuntimeError(f"Unhandled input feature: {name}")
+
+        return torch.cat(features, dim=1)
+
+    def pool_representation(self, h):
+        pooled = []
+
+        for mode in self.pooling_modes:
+            if mode == "mean":
+                pooled.append(h.mean(dim=-1))
+            elif mode == "max":
+                pooled.append(h.amax(dim=-1))
+            elif mode == "std":
+                pooled.append(h.std(dim=-1, unbiased=False))
+            elif mode == "topk_mean":
+                topk_count = max(1, int(h.shape[-1] * self.topk_pool_fraction))
+                pooled.append(
+                    h.topk(topk_count, dim=-1, sorted=False).values.mean(dim=-1)
+                )
+            else:
+                raise RuntimeError(f"Unhandled pooling mode: {mode}")
+
+        return torch.cat(pooled, dim=1)
+
     def forward(self, x):
         if x.ndim == 2:
             x = x.unsqueeze(1)
@@ -235,14 +360,10 @@ class SVPosteriorTCN(nn.Module):
             raise ValueError("x must have exactly one input channel.")
 
         x = (x - self.input_mean) / self.input_std.clamp_min(1e-8)
+        x = self.make_input_features(x)
 
         h = self.encoder(x)
-
-        # Direct reductions avoid nondeterministic adaptive-max-pool backward
-        # implementations while preserving the same representation shape.
-        h_avg = h.mean(dim=-1)
-        h_max = h.amax(dim=-1)
-        h = torch.cat([h_avg, h_max], dim=1)
+        h = self.pool_representation(h)
 
         means = []
         variances = []
@@ -319,7 +440,17 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def temporal_receptive_field(kernel_size, dilations, convs_per_block=2):
-    return 1 + convs_per_block * (kernel_size - 1) * sum(dilations)
+    dilations = tuple(dilations)
+    kernel_sizes = resolve_per_block_values(
+        kernel_size,
+        len(dilations),
+        "kernel_size",
+    )
+
+    return 1 + convs_per_block * sum(
+        (block_kernel_size - 1) * dilation
+        for block_kernel_size, dilation in zip(kernel_sizes, dilations)
+    )
 
 def diagonal_gaussian_nll(mean, var, target, min_var):
     """
@@ -351,8 +482,6 @@ def diagonal_gaussian_nll(mean, var, target, min_var):
 
     return losses
 
-
-K_MOMENT_WARNING_THRESHOLD = 1e-10
 
 TRAIN_SEED_STREAM = 101
 VALIDATION_SEED_STREAM = 202
@@ -412,11 +541,8 @@ def simulate_live_dataset(
     fixed_nu,
     target_names,
     random_init,
-    k,
-    center_y,
     out_dtype,
     exp_clip,
-    show_progress,
 ):
     log_y_squared, theta = sim.simulate_sv_log_y_squared_parallel(
         N=N,
@@ -427,11 +553,11 @@ def simulate_live_dataset(
         prior=prior,
         fixed_nu=fixed_nu,
         random_init=random_init,
-        k=k,
-        center_y=center_y,
+        k=KAPPA,
+        center_y=True,
         out_dtype=out_dtype,
         exp_clip=exp_clip,
-        show_progress=show_progress,
+        show_progress=False,
     )
 
     target = theta_to_target_numpy(
@@ -454,6 +580,9 @@ def train_live_cnn(
     kernel_size=5,
     dilations=None,
     hidden_dims_head=(64, 64),
+    input_feature_names=("level",),
+    pooling_modes=("mean", "max"),
+    topk_pool_fraction=0.05,
     activation=nn.ReLU,
     use_batch_norm=False,
     checkpoint_path="sv_posterior_tcn_live.pt",
@@ -476,13 +605,9 @@ def train_live_cnn(
     warn_nonfinite_grad=True,
     deterministic_torch=True,
     n_workers=-2,
-    chunks_per_worker=4,
     random_init=True,
-    k=1e-12,
-    center_y=True,
     out_dtype=np.float32,
     exp_clip=350.0,
-    simulation_progress=False,
     verbose=True,
     plot=True,
 ):
@@ -523,12 +648,6 @@ def train_live_cnn(
     if patience < 1:
         raise ValueError("patience must be at least 1.")
 
-    if chunks_per_worker < 1:
-        raise ValueError("chunks_per_worker must be at least 1.")
-
-    if k <= 0:
-        raise ValueError("k must be positive.")
-
     if min_var <= 0:
         raise ValueError("min_var must be positive.")
 
@@ -557,14 +676,6 @@ def train_live_cnn(
     if best_checkpoint_path is None:
         best_checkpoint_path = default_best_path
 
-    if k > K_MOMENT_WARNING_THRESHOLD:
-        warnings.warn(
-            "Input standardization moments are stored for log(y_t^2), but "
-            f"k={k:g} means the model sees log(y_t^2 + k). "
-            "For this k, the stored moments may no longer be accurate.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
 
     out_dtype = np.dtype(out_dtype).type
 
@@ -573,12 +684,12 @@ def train_live_cnn(
     train_chunk_size = sim.resolve_chunk_size(
         train_size,
         resolved_n_workers,
-        chunks_per_worker,
+        CHUNKS_PER_WORKER,
     )
     val_chunk_size = sim.resolve_chunk_size(
         val_size,
         resolved_n_workers,
-        chunks_per_worker,
+        CHUNKS_PER_WORKER,
     )
     effective_val_batch_size = min(val_size, batch_size)
 
@@ -697,6 +808,9 @@ def train_live_cnn(
         kernel_size=kernel_size,
         dilations=dilations,
         hidden_dims_head=hidden_dims_head,
+        input_feature_names=input_feature_names,
+        pooling_modes=pooling_modes,
+        topk_pool_fraction=topk_pool_fraction,
         activation=activation,
         use_batch_norm=use_batch_norm,
         param_names=target_names,
@@ -717,7 +831,15 @@ def train_live_cnn(
         print("Sequence length:", sequence_length)
         print("Input mean:", float(input_mean))
         print("Input std:", float(input_std))
-        print("Temporal receptive field:", temporal_receptive_field(kernel_size, model.dilations))
+        print("Kernel sizes:", model.kernel_sizes)
+        print("Dilations:", model.dilations)
+        print(
+            "Temporal receptive field:",
+            temporal_receptive_field(model.kernel_sizes, model.dilations),
+        )
+        print("Input features:", model.input_feature_names)
+        print("Pooling modes:", model.pooling_modes)
+        print("Top-k pooling fraction:", model.topk_pool_fraction)
         print("Trainable parameters:", count_parameters(model))
         print("Train samples per validation:", train_size)
         print("Train batch size:", batch_size)
@@ -758,11 +880,8 @@ def train_live_cnn(
             fixed_nu=fixed_nu,
             target_names=target_names,
             random_init=random_init,
-            k=k,
-            center_y=center_y,
             out_dtype=out_dtype,
             exp_clip=exp_clip,
-            show_progress=simulation_progress,
         )
 
     # ============================================================
@@ -814,9 +933,16 @@ def train_live_cnn(
             "sequence_length": sequence_length,
             "tcn_channels": tuple(tcn_channels),
             "kernel_size": kernel_size,
+            "kernel_sizes": tuple(model.kernel_sizes),
             "dilations": tuple(model.dilations),
-            "temporal_receptive_field": temporal_receptive_field(kernel_size, model.dilations),
+            "temporal_receptive_field": temporal_receptive_field(
+                model.kernel_sizes,
+                model.dilations,
+            ),
             "hidden_dims_head": tuple(hidden_dims_head),
+            "input_feature_names": tuple(model.input_feature_names),
+            "pooling_modes": tuple(model.pooling_modes),
+            "topk_pool_fraction": float(model.topk_pool_fraction),
             "activation": activation_name,
             "use_batch_norm": use_batch_norm,
             "min_var": min_var,
@@ -859,15 +985,13 @@ def train_live_cnn(
             "effective_val_batch_size": effective_val_batch_size,
             "requested_n_workers": n_workers,
             "resolved_n_workers": resolved_n_workers,
-            "chunks_per_worker": chunks_per_worker,
             "train_chunk_size": train_chunk_size,
             "val_chunk_size": val_chunk_size,
             "random_init": random_init,
-            "k": k,
-            "center_y": center_y,
+            "k": KAPPA,
+            "center_y": True,
             "out_dtype": str(np.dtype(out_dtype)),
             "exp_clip": exp_clip,
-            "simulation_progress": simulation_progress,
 
             "use_amp": use_amp,
             "deterministic_torch": deterministic_torch,
@@ -997,11 +1121,8 @@ def train_live_cnn(
             fixed_nu=fixed_nu,
             target_names=target_names,
             random_init=random_init,
-            k=k,
-            center_y=center_y,
             out_dtype=out_dtype,
             exp_clip=exp_clip,
-            show_progress=simulation_progress,
         )
 
         model.train()
@@ -1098,11 +1219,8 @@ def train_live_cnn(
                 fixed_nu=fixed_nu,
                 target_names=target_names,
                 random_init=random_init,
-                k=k,
-                center_y=center_y,
                 out_dtype=out_dtype,
                 exp_clip=exp_clip,
-                show_progress=simulation_progress,
             )
 
         val_marginal_losses_value = evaluate_array(model, val_x, val_target)
@@ -1219,11 +1337,8 @@ def train_live_cnn(
             fixed_nu=fixed_nu,
             target_names=target_names,
             random_init=random_init,
-            k=k,
-            center_y=center_y,
             out_dtype=out_dtype,
             exp_clip=exp_clip,
-            show_progress=simulation_progress,
         )
 
     final_val_marginal_losses = evaluate_array(model, final_val_x, final_val_target)
@@ -1294,23 +1409,26 @@ def train_live_cnn(
 
 def main():
     train_live_cnn(
-        sequence_length=253 * 2,
+        sequence_length=253 * 10,
         prior="default",
         fixed_nu=None,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500
         tcn_channels=(16, 32, 32, 64, 64, 64),
-        kernel_size=5,
-        dilations=None, # Use default exponentially increasing dilations
+        kernel_size=(9, 9, 7, 5, 5, 5),
+        dilations=(1, 2, 4, 16, 64, 256),
         hidden_dims_head=(32, 32),
+        input_feature_names=("level", "diff", "pos_diff", "neg_diff"),
+        pooling_modes=("mean", "max", "std", "topk_mean"),
+        topk_pool_fraction=0.05,
         activation=nn.ReLU,
         use_batch_norm=False,
-        checkpoint_path="svghst_posterior_tcn_live_default.pt",
-        latest_checkpoint_path="svghst_posterior_tcn_live_default.latest.pt",
-        best_checkpoint_path="svghst_posterior_tcn_live_default.best.pt",
-        resume_from=None,  # Set to "svghst_posterior_tcn_live_default.latest.pt" to continue. Leave as None to start fresh.
+        checkpoint_path="svghst_posterior_tcn_live_default_n2530_local.pt",
+        latest_checkpoint_path="svghst_posterior_tcn_live_default_n2530_local.latest.pt",
+        best_checkpoint_path="svghst_posterior_tcn_live_default_n2530_local.best.pt",
+        resume_from=None,  # Set to the n2530_local latest checkpoint to continue.
         seed=2,
-        batch_size=1024 * 8,
+        batch_size=1024 * 2,
         n_batches=100,    # Number of batches done before each validation
-        val_size=500_000, # Larger validation to reduce noise between each epoch's validation scores 
+        val_size=100_000, # Similar validation memory footprint to the 253 * 2 run
         fixed_validation=False,
         lr=0.5e-3,
         n_epochs=2000,
@@ -1323,13 +1441,9 @@ def main():
         warn_nonfinite_grad=True,
         deterministic_torch=True,
         n_workers= -2, # Uses all but 2 cpu cores for data simulation
-        chunks_per_worker=4,
         random_init=True,
-        k=1e-12,
-        center_y=True,
         out_dtype=np.float32,
         exp_clip=350.0,
-        simulation_progress=False,
         verbose=True,
         plot=True,
     )

@@ -20,7 +20,7 @@ from train_live_CNN import SVGHST_TARGET_NAMES, SVPosteriorTCN
 HERE = Path(__file__).resolve().parent
 
 DEFAULT_ALPHA = 0.05
-DEFAULT_SEQUENCE_LENGTH = 253 * 2
+DEFAULT_SEQUENCE_LENGTH = 253 * 10
 DEFAULT_PRIOR_DRAWS = 1000
 DEFAULT_MCMC_DRAWS = 2000
 DEFAULT_MCMC_BURNIN = 500
@@ -150,9 +150,12 @@ def load_tcn_model(checkpoint_path, device):
 
     model = SVPosteriorTCN(
         tcn_channels=tuple(checkpoint["tcn_channels"]),
-        kernel_size=int(checkpoint["kernel_size"]),
+        kernel_size=checkpoint.get("kernel_sizes", checkpoint["kernel_size"]),
         dilations=tuple(checkpoint["dilations"]),
         hidden_dims_head=tuple(checkpoint["hidden_dims_head"]),
+        input_feature_names=tuple(checkpoint.get("input_feature_names", ("level",))),
+        pooling_modes=tuple(checkpoint.get("pooling_modes", ("mean", "max"))),
+        topk_pool_fraction=float(checkpoint.get("topk_pool_fraction", 0.05)),
         activation=activation_from_checkpoint(checkpoint),
         use_batch_norm=bool(checkpoint["use_batch_norm"]),
         param_names=tuple(checkpoint["target_names"]),
@@ -315,7 +318,7 @@ def prepare_model_input(loaded_model, y):
 
 
 @torch.no_grad()
-def predict_transformed_gaussian(model, x, device, batch_size=4096):
+def predict_transformed_gaussian(model, x, device, batch_size=1024):
     model.eval()
 
     means = []
@@ -556,7 +559,7 @@ def run_parameter_sweep_test(
     mcmc_burnin=DEFAULT_MCMC_BURNIN,
     mcmc_thinpara=DEFAULT_MCMC_THINPARA,
     mcmc_max_cores=DEFAULT_MCMC_MAX_CORES,
-    batch_size=4096,
+    batch_size=1024,
 ):
     rng = np.random.default_rng(seed)
     datasets, sweeps, baseline = make_single_parameter_sweep_datasets(
@@ -612,7 +615,7 @@ def run_prior_draw_metric_test(
     mcmc_thinpara=DEFAULT_MCMC_THINPARA,
     mcmc_max_cores=DEFAULT_MCMC_MAX_CORES,
     alpha=DEFAULT_ALPHA,
-    batch_size=4096,
+    batch_size=1024,
 ):
     y, theta, targets = simulate_prior_sv_dataset(
         n_prior_draws=n_prior_draws,
@@ -790,7 +793,7 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
 
 
 def main():
-    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default.pt"
+    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default_n2530_local.pt"
     output_dir = Path("tcn_5_param_test")
 
     baseline = DEFAULT_BASELINE.copy()
@@ -799,8 +802,8 @@ def main():
 
     n = DEFAULT_SEQUENCE_LENGTH
     sweep_size = 10
-    seed = 2
-    metric_seed = 3
+    seed = 1
+    metric_seed = 2
     alpha = DEFAULT_ALPHA
 
     mcmc_draws = DEFAULT_MCMC_DRAWS
@@ -809,7 +812,7 @@ def main():
     mcmc_max_cores = DEFAULT_MCMC_MAX_CORES
     n_prior_draws = DEFAULT_PRIOR_DRAWS
 
-    batch_size = 4096
+    batch_size = 1024
     device_name = None
 
     device = torch.device(
