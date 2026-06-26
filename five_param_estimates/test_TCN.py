@@ -10,37 +10,42 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from R_to_py_interface import run_stochvol_mcmc, validate_series_matrix
-import sim_3_param_data as sim
+import sim_5_param_data as sim
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from train_live_CNN import LiveSVPosteriorTCN
-from train_summary_NN import SVPosteriorNN
+from train_live_CNN import SVGHST_TARGET_NAMES, SVPosteriorTCN
 
 
 HERE = Path(__file__).resolve().parent
 
 DEFAULT_ALPHA = 0.05
-DEFAULT_SEQUENCE_LENGTH = 253
+DEFAULT_SEQUENCE_LENGTH = 253 * 2
 DEFAULT_PRIOR_DRAWS = 1000
 DEFAULT_MCMC_DRAWS = 2000
 DEFAULT_MCMC_BURNIN = 500
 DEFAULT_MCMC_THINPARA = 1
 GAUSSIAN_NLL_EPS = 1e-6
 
-PARAMETER_NAMES = ("mu", "phi", "sigma")
-TRANSFORMED_TARGET_NAMES = ["mu", "psi", "log_sigma"]
-METHOD_NAMES = ("MCMC", "NN", "TCN")
+PARAMETER_NAMES = ("mu", "phi", "s", "r", "nu")
+MCMC_COMPARISON_PARAMETERS = ("mu", "phi", "s")
+TRANSFORMED_TARGET_NAMES = tuple(SVGHST_TARGET_NAMES)
+MCMC_TRANSFORMED_TARGET_NAMES = ("mu", "psi", "log_s")
+METHOD_NAMES = ("MCMC", "TCN")
 
 DEFAULT_BASELINE = {
     "mu": -9.0,
-    "phi": 0.98,
-    "sigma": 0.20,
+    "phi": 0.95,
+    "s": 0.25,
+    "r": 0.50,
+    "nu": 15.0,
 }
 DEFAULT_SWEEP_DELTAS = {
-    "mu": 2.0,
-    "phi": 0.015,
-    "sigma": 0.10,
+    "mu": 3.0,
+    "phi": 0.045,
+    "s": 0.20,
+    "r": 0.30,
+    "nu": 7.0,
 }
 
 
@@ -96,76 +101,13 @@ def activation_from_checkpoint(checkpoint):
 
 
 def validate_target_names(checkpoint, checkpoint_path):
-    target_names = list(checkpoint["target_names"])
+    target_names = tuple(checkpoint["target_names"])
 
     if target_names != TRANSFORMED_TARGET_NAMES:
         raise ValueError(
             f"{checkpoint_path} has target_names={target_names}; expected "
-            f"{TRANSFORMED_TARGET_NAMES}."
+            f"{TRANSFORMED_TARGET_NAMES}. This analysis needs all five parameters."
         )
-
-
-def load_summary_model(checkpoint_path, device):
-    checkpoint_path = resolve_path(checkpoint_path)
-    checkpoint = torch_load_checkpoint(checkpoint_path, device)
-
-    require_keys(
-        checkpoint,
-        [
-            "model_class",
-            "model_state_dict",
-            "input_dim",
-            "hidden_dims_shared_trunk",
-            "hidden_dims_head",
-            "activation",
-            "min_var",
-            "dropout",
-            "layer_norm",
-            "z_mean",
-            "z_std",
-            "target_names",
-            "feature_names",
-            "n_acvf_ratios",
-            "compute_arima_coeff",
-            "k",
-            "eps",
-            "center_y",
-            "remove_NaNs",
-        ],
-        checkpoint_path,
-    )
-
-    if checkpoint["model_class"] != "SVPosteriorNN":
-        raise ValueError(
-            f"{checkpoint_path} has model_class={checkpoint['model_class']}; "
-            "expected SVPosteriorNN."
-        )
-
-    validate_target_names(checkpoint, checkpoint_path)
-
-    if not bool(checkpoint["center_y"]):
-        raise ValueError(f"{checkpoint_path} must have center_y=True.")
-
-    model = SVPosteriorNN(
-        input_dim=int(checkpoint["input_dim"]),
-        hidden_dims_shared_trunk=tuple(checkpoint["hidden_dims_shared_trunk"]),
-        hidden_dims_head=tuple(checkpoint["hidden_dims_head"]),
-        activation=activation_from_checkpoint(checkpoint),
-        min_var=float(checkpoint["min_var"]),
-        dropout=float(checkpoint["dropout"]),
-        layer_norm=bool(checkpoint["layer_norm"]),
-    ).to(device)
-
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    return LoadedModel(
-        label="NN",
-        kind="summary",
-        model=model,
-        checkpoint=checkpoint,
-        device=device,
-    )
 
 
 def load_tcn_model(checkpoint_path, device):
@@ -183,7 +125,6 @@ def load_tcn_model(checkpoint_path, device):
             "dilations",
             "hidden_dims_head",
             "activation",
-            "dropout",
             "use_batch_norm",
             "min_var",
             "input_mean",
@@ -206,15 +147,14 @@ def load_tcn_model(checkpoint_path, device):
     if not bool(checkpoint["center_y"]):
         raise ValueError(f"{checkpoint_path} must have center_y=True.")
 
-    model = LiveSVPosteriorTCN(
-        sequence_length=int(checkpoint["sequence_length"]),
+    model = SVPosteriorTCN(
         tcn_channels=tuple(checkpoint["tcn_channels"]),
         kernel_size=int(checkpoint["kernel_size"]),
         dilations=tuple(checkpoint["dilations"]),
         hidden_dims_head=tuple(checkpoint["hidden_dims_head"]),
         activation=activation_from_checkpoint(checkpoint),
-        dropout=float(checkpoint["dropout"]),
         use_batch_norm=bool(checkpoint["use_batch_norm"]),
+        param_names=tuple(checkpoint["target_names"]),
         min_var=float(checkpoint["min_var"]),
         input_mean=float(checkpoint["input_mean"]),
         input_std=float(checkpoint["input_std"]),
@@ -232,12 +172,82 @@ def load_tcn_model(checkpoint_path, device):
     )
 
 
+def validate_original_parameters(theta):
+    theta = np.asarray(theta, dtype=np.float64)
+
+    if theta.ndim != 2 or theta.shape[1] != len(PARAMETER_NAMES):
+        raise ValueError(
+            f"theta must have shape (n, {len(PARAMETER_NAMES)}) with columns "
+            f"{PARAMETER_NAMES}."
+        )
+
+    return theta
+
+
+def transform_five_parameters(theta, target_names=TRANSFORMED_TARGET_NAMES, eps=1e-6):
+    theta = validate_original_parameters(theta)
+    target_names = tuple(target_names)
+
+    unknown_target_names = set(target_names).difference(TRANSFORMED_TARGET_NAMES)
+    if unknown_target_names:
+        raise ValueError(f"Unknown target name(s): {sorted(unknown_target_names)}.")
+
+    nu_min = sim.get_gh_skew_t_prior_constants("default").nu_min
+
+    mu = theta[:, 0]
+    phi = np.clip(theta[:, 1], -1.0 + eps, 1.0 - eps)
+    s = np.clip(theta[:, 2], eps, None)
+    r = np.clip(theta[:, 3], eps, 1.0 - eps)
+    nu_minus_min = np.clip(theta[:, 4] - nu_min, eps, None)
+
+    transformed = {
+        "mu": mu,
+        "psi": 2.0 * np.arctanh(phi),
+        "log_s": np.log(s),
+        "logit_r": np.log(r / (1.0 - r)),
+        "log_nu": np.log(nu_minus_min),
+    }
+
+    return np.column_stack([transformed[name] for name in target_names])
+
+
+def simulate_prior_sv_dataset(
+    n_prior_draws=DEFAULT_PRIOR_DRAWS,
+    n=DEFAULT_SEQUENCE_LENGTH,
+    seed=12345,
+    random_init=True,
+):
+    rng = np.random.default_rng(seed)
+    mu, phi, s, r, nu = sim.sample_stochvol_prior(
+        n_prior_draws,
+        rng=rng,
+        prior="default",
+        return_s2=False,
+        dtype=np.float64,
+    )
+    y = sim.simulate_sv_chunk(
+        mu=mu,
+        phi=phi,
+        s=s,
+        r=r,
+        nu=nu,
+        n=n,
+        rng=rng,
+        random_init=random_init,
+    )
+
+    theta = np.column_stack([mu, phi, s, r, nu])
+    transformed_targets = transform_five_parameters(theta)
+
+    return y, theta, transformed_targets
+
+
 def make_single_parameter_sweep_datasets(
     baseline=None,
     sweeps=None,
     sweep_deltas=None,
     sweep_size=9,
-    n=253,
+    n=DEFAULT_SEQUENCE_LENGTH,
     rng=None,
     random_init=True,
 ):
@@ -264,98 +274,20 @@ def make_single_parameter_sweep_datasets(
             parameter: np.full(m, baseline[parameter])
             for parameter in PARAMETER_NAMES
         }
-        params[swept_parameter] = np.asarray(sweeps[swept_parameter])
+        params[swept_parameter] = np.asarray(sweeps[swept_parameter], dtype=np.float64)
 
         datasets[swept_parameter] = sim.simulate_sv_chunk(
             mu=params["mu"],
             phi=params["phi"],
-            sigma=params["sigma"],
+            s=params["s"],
+            r=params["r"],
+            nu=params["nu"],
             n=n,
             rng=rng,
             random_init=random_init,
         )
 
     return datasets, sweeps, baseline
-
-
-def transform_sv_parameters(theta, eps=1e-6):
-    theta = np.asarray(theta, dtype=np.float64)
-
-    if theta.ndim != 2 or theta.shape[1] != len(PARAMETER_NAMES):
-        raise ValueError(
-            f"theta must have shape (n, {len(PARAMETER_NAMES)}) with columns "
-            f"{PARAMETER_NAMES}."
-        )
-
-    mu = theta[:, 0]
-    phi = np.clip(theta[:, 1], -1.0 + eps, 1.0 - eps)
-    sigma = np.clip(theta[:, 2], eps, None)
-
-    psi = 2.0 * np.arctanh(phi)
-    log_sigma = np.log(sigma)
-
-    return np.column_stack([mu, psi, log_sigma])
-
-
-def simulate_prior_sv_dataset(
-    prior="default",
-    n_prior_draws=DEFAULT_PRIOR_DRAWS,
-    n=DEFAULT_SEQUENCE_LENGTH,
-    seed=12345,
-    random_init=True,
-):
-    rng = np.random.default_rng(seed)
-    mu, phi, sigma = sim.sample_stochvol_prior(
-        n_prior_draws,
-        rng=rng,
-        prior=prior,
-        return_sigma2=False,
-        dtype=np.float64,
-    )
-    y = sim.simulate_sv_chunk(
-        mu=mu,
-        phi=phi,
-        sigma=sigma,
-        n=n,
-        rng=rng,
-        random_init=random_init,
-    )
-
-    theta = np.column_stack([mu, phi, sigma])
-    transformed_targets = transform_sv_parameters(theta)
-
-    return y, theta, transformed_targets
-
-
-def prepare_summary_input(y, checkpoint):
-    y = validate_series_matrix(y)
-
-    expected_feature_names = sim.summary_stats_sv_feature_names(
-        n_acvf_ratios=int(checkpoint["n_acvf_ratios"]),
-        compute_arima_coeff=bool(checkpoint["compute_arima_coeff"]),
-    )
-
-    if list(checkpoint["feature_names"]) != expected_feature_names:
-        raise ValueError("Checkpoint feature_names do not match sim_3_param_data.py.")
-
-    summaries = np.empty((y.shape[0], int(checkpoint["input_dim"])), dtype=np.float32)
-
-    for i in range(y.shape[0]):
-        summaries[i] = sim.summary_stats_sv(
-            y[i],
-            k=float(checkpoint["k"]),
-            n_acvf_ratios=int(checkpoint["n_acvf_ratios"]),
-            eps=float(checkpoint["eps"]),
-            compute_arima_coeff=bool(checkpoint["compute_arima_coeff"]),
-            center_y=bool(checkpoint["center_y"]),
-            remove_NaNs=bool(checkpoint["remove_NaNs"]),
-        ).astype(np.float32, copy=False)
-
-    z_mean = np.asarray(checkpoint["z_mean"], dtype=np.float32)
-    z_std = np.asarray(checkpoint["z_std"], dtype=np.float32)
-    z_std = np.where(z_std < 1e-8, 1.0, z_std)
-
-    return ((summaries - z_mean) / z_std).astype(np.float32, copy=False)
 
 
 def prepare_tcn_input(y, checkpoint):
@@ -375,9 +307,6 @@ def prepare_tcn_input(y, checkpoint):
 
 
 def prepare_model_input(loaded_model, y):
-    if loaded_model.kind == "summary":
-        return prepare_summary_input(y, loaded_model.checkpoint)
-
     if loaded_model.kind == "tcn":
         return prepare_tcn_input(y, loaded_model.checkpoint)
 
@@ -402,37 +331,6 @@ def predict_transformed_gaussian(model, x, device, batch_size=4096):
     return np.vstack(means), np.vstack(variances)
 
 
-def transformed_gaussian_to_ci_frame(transformed_mean, transformed_var, alpha):
-    transformed_mean = np.asarray(transformed_mean, dtype=np.float64)
-    transformed_var = np.asarray(transformed_var, dtype=np.float64)
-
-    zcrit = NormalDist().inv_cdf(1.0 - alpha / 2.0)
-    transformed_sd = np.sqrt(transformed_var)
-
-    mu_mean = transformed_mean[:, 0]
-    mu_sd = transformed_sd[:, 0]
-
-    psi_mean = transformed_mean[:, 1]
-    psi_sd = transformed_sd[:, 1]
-
-    log_sigma_mean = transformed_mean[:, 2]
-    log_sigma_sd = transformed_sd[:, 2]
-
-    return pd.DataFrame({
-        "alpha": alpha,
-        "credible_level": 1.0 - alpha,
-        "mu_median": mu_mean,
-        "mu_ci_lower": mu_mean - zcrit * mu_sd,
-        "mu_ci_upper": mu_mean + zcrit * mu_sd,
-        "phi_median": np.tanh(psi_mean / 2.0),
-        "phi_ci_lower": np.tanh((psi_mean - zcrit * psi_sd) / 2.0),
-        "phi_ci_upper": np.tanh((psi_mean + zcrit * psi_sd) / 2.0),
-        "sigma_median": np.exp(log_sigma_mean),
-        "sigma_ci_lower": np.exp(log_sigma_mean - zcrit * log_sigma_sd),
-        "sigma_ci_upper": np.exp(log_sigma_mean + zcrit * log_sigma_sd),
-    })
-
-
 def predict_model_transformed_gaussian(loaded_model, y, batch_size):
     x = prepare_model_input(loaded_model, y)
     return predict_transformed_gaussian(
@@ -443,14 +341,73 @@ def predict_model_transformed_gaussian(loaded_model, y, batch_size):
     )
 
 
+def inverse_logit(x):
+    x = np.asarray(x, dtype=np.float64)
+    positive = x >= 0.0
+    out = np.empty_like(x, dtype=np.float64)
+    out[positive] = 1.0 / (1.0 + np.exp(-x[positive]))
+    exp_x = np.exp(x[~positive])
+    out[~positive] = exp_x / (1.0 + exp_x)
+    return out
+
+
+def transformed_gaussian_to_ci_frame(transformed_mean, transformed_var, alpha):
+    transformed_mean = np.asarray(transformed_mean, dtype=np.float64)
+    transformed_var = np.asarray(transformed_var, dtype=np.float64)
+
+    if transformed_mean.shape[1] != len(TRANSFORMED_TARGET_NAMES):
+        raise ValueError(
+            f"Expected {len(TRANSFORMED_TARGET_NAMES)} transformed columns, "
+            f"got {transformed_mean.shape[1]}."
+        )
+
+    zcrit = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    transformed_sd = np.sqrt(transformed_var)
+    nu_min = sim.get_gh_skew_t_prior_constants("default").nu_min
+
+    mu_mean = transformed_mean[:, 0]
+    mu_sd = transformed_sd[:, 0]
+
+    psi_mean = transformed_mean[:, 1]
+    psi_sd = transformed_sd[:, 1]
+
+    log_s_mean = transformed_mean[:, 2]
+    log_s_sd = transformed_sd[:, 2]
+
+    logit_r_mean = transformed_mean[:, 3]
+    logit_r_sd = transformed_sd[:, 3]
+
+    log_nu_mean = transformed_mean[:, 4]
+    log_nu_sd = transformed_sd[:, 4]
+
+    return pd.DataFrame({
+        "alpha": alpha,
+        "credible_level": 1.0 - alpha,
+        "mu_median": mu_mean,
+        "mu_ci_lower": mu_mean - zcrit * mu_sd,
+        "mu_ci_upper": mu_mean + zcrit * mu_sd,
+        "phi_median": np.tanh(psi_mean / 2.0),
+        "phi_ci_lower": np.tanh((psi_mean - zcrit * psi_sd) / 2.0),
+        "phi_ci_upper": np.tanh((psi_mean + zcrit * psi_sd) / 2.0),
+        "s_median": np.exp(log_s_mean),
+        "s_ci_lower": np.exp(log_s_mean - zcrit * log_s_sd),
+        "s_ci_upper": np.exp(log_s_mean + zcrit * log_s_sd),
+        "r_median": inverse_logit(logit_r_mean),
+        "r_ci_lower": inverse_logit(logit_r_mean - zcrit * logit_r_sd),
+        "r_ci_upper": inverse_logit(logit_r_mean + zcrit * logit_r_sd),
+        "nu_median": nu_min + np.exp(log_nu_mean),
+        "nu_ci_lower": nu_min + np.exp(log_nu_mean - zcrit * log_nu_sd),
+        "nu_ci_upper": nu_min + np.exp(log_nu_mean + zcrit * log_nu_sd),
+    })
+
+
 def predict_model_ci(loaded_model, y, alpha, batch_size):
     mean, var = predict_model_transformed_gaussian(loaded_model, y, batch_size)
-
     return transformed_gaussian_to_ci_frame(mean, var, alpha)
 
 
 def transform_mcmc_draw_frame(parameter_draws, eps=1e-6):
-    required_columns = {"series_index", "draw_index", *PARAMETER_NAMES}
+    required_columns = {"series_index", "draw_index", "mu", "phi", "sigma"}
     missing = sorted(required_columns.difference(parameter_draws.columns))
 
     if missing:
@@ -458,12 +415,21 @@ def transform_mcmc_draw_frame(parameter_draws, eps=1e-6):
             "MCMC draw frame is missing required column(s): " + ", ".join(missing)
         )
 
-    transformed = parameter_draws[["series_index", "draw_index"]].copy()
-    theta = parameter_draws.loc[:, list(PARAMETER_NAMES)].to_numpy(dtype=np.float64)
-    transformed_values = transform_sv_parameters(theta, eps=eps)
+    phi = np.clip(
+        parameter_draws["phi"].to_numpy(dtype=np.float64),
+        -1.0 + eps,
+        1.0 - eps,
+    )
+    sigma = np.clip(
+        parameter_draws["sigma"].to_numpy(dtype=np.float64),
+        eps,
+        None,
+    )
 
-    for column_index, name in enumerate(TRANSFORMED_TARGET_NAMES):
-        transformed[name] = transformed_values[:, column_index]
+    transformed = parameter_draws[["series_index", "draw_index"]].copy()
+    transformed["mu"] = parameter_draws["mu"].to_numpy(dtype=np.float64)
+    transformed["psi"] = 2.0 * np.arctanh(phi)
+    transformed["log_s"] = np.log(sigma)
 
     return transformed
 
@@ -486,8 +452,8 @@ def summarize_transformed_mcmc_draws(parameter_draws, n_series=None, eps=1e-6):
     if draw_counts.iloc[0] < 2:
         raise ValueError("At least two MCMC draws are needed to estimate variance.")
 
-    means = grouped[TRANSFORMED_TARGET_NAMES].mean()
-    variances = grouped[TRANSFORMED_TARGET_NAMES].var(ddof=1)
+    means = grouped[list(MCMC_TRANSFORMED_TARGET_NAMES)].mean()
+    variances = grouped[list(MCMC_TRANSFORMED_TARGET_NAMES)].var(ddof=1)
 
     if n_series is not None:
         expected_index = pd.Index(np.arange(1, n_series + 1), name="series_index")
@@ -504,10 +470,18 @@ def summarize_transformed_mcmc_draws(parameter_draws, n_series=None, eps=1e-6):
     )
 
 
-def marginal_gaussian_metrics(target, mean, var, method, eps=GAUSSIAN_NLL_EPS):
+def marginal_gaussian_metrics(
+    target,
+    mean,
+    var,
+    method,
+    parameter_names,
+    eps=GAUSSIAN_NLL_EPS,
+):
     target = np.asarray(target, dtype=np.float64)
     mean = np.asarray(mean, dtype=np.float64)
     var = np.asarray(var, dtype=np.float64)
+    parameter_names = tuple(parameter_names)
 
     if target.shape != mean.shape or target.shape != var.shape:
         raise ValueError(
@@ -515,9 +489,9 @@ def marginal_gaussian_metrics(target, mean, var, method, eps=GAUSSIAN_NLL_EPS):
             f"{target.shape}, {mean.shape}, and {var.shape}."
         )
 
-    if target.ndim != 2 or target.shape[1] != len(TRANSFORMED_TARGET_NAMES):
+    if target.ndim != 2 or target.shape[1] != len(parameter_names):
         raise ValueError(
-            f"target must have shape (n, {len(TRANSFORMED_TARGET_NAMES)})."
+            f"target must have shape (n, {len(parameter_names)})."
         )
 
     var = np.clip(var, eps, None)
@@ -539,7 +513,7 @@ def marginal_gaussian_metrics(target, mean, var, method, eps=GAUSSIAN_NLL_EPS):
     mean_variance = torch.mean(var_t, dim=0)
 
     rows = []
-    for index, parameter in enumerate(TRANSFORMED_TARGET_NAMES):
+    for index, parameter in enumerate(parameter_names):
         rows.append({
             "method": method,
             "parameter": parameter,
@@ -549,6 +523,19 @@ def marginal_gaussian_metrics(target, mean, var, method, eps=GAUSSIAN_NLL_EPS):
         })
 
     return pd.DataFrame(rows)
+
+
+def blank_metric_rows(method, parameter_names):
+    return pd.DataFrame([
+        {
+            "method": method,
+            "parameter": parameter,
+            "mse": np.nan,
+            "mean_variance": np.nan,
+            "negative_log_score": np.nan,
+        }
+        for parameter in parameter_names
+    ])
 
 
 def build_transformed_estimate_frame(theta, targets, estimates_by_method):
@@ -561,8 +548,9 @@ def build_transformed_estimate_frame(theta, targets, estimates_by_method):
         method_key = method.lower()
         mean = estimate["mean"]
         var = estimate["var"]
+        parameter_names = tuple(estimate["parameter_names"])
 
-        for index, parameter in enumerate(TRANSFORMED_TARGET_NAMES):
+        for index, parameter in enumerate(parameter_names):
             frame[f"{method_key}_{parameter}_mean"] = mean[:, index]
             frame[f"{method_key}_{parameter}_var"] = var[:, index]
 
@@ -578,12 +566,18 @@ def print_transformed_metric_table(metrics):
     table = table.swaplevel(0, 1, axis=1).sort_index(axis=1, level=0)
 
     print("\nTransformed-scale marginal Gaussian metrics:")
-    with pd.option_context("display.width", 160):
-        print(table.to_string(float_format=lambda value: f"{value:.6g}"))
+    with pd.option_context("display.width", 180):
+        print(
+            table.to_string(
+                float_format=lambda value: f"{value:.6g}",
+                na_rep="",
+            )
+        )
 
 
-def add_ci_rows(rows, swept_parameter, true_values, method, ci_frame):
+def add_ci_rows(rows, swept_parameter, true_values, method, ci_frame, ci_parameter=None):
     ci_frame = ci_frame.reset_index(drop=True)
+    ci_parameter = swept_parameter if ci_parameter is None else ci_parameter
 
     for value_index, true_value in enumerate(true_values):
         rows.append({
@@ -591,23 +585,21 @@ def add_ci_rows(rows, swept_parameter, true_values, method, ci_frame):
             "value_index": value_index,
             "true_value": float(true_value),
             "method": method,
-            "median": float(ci_frame.loc[value_index, f"{swept_parameter}_median"]),
-            "ci_lower": float(ci_frame.loc[value_index, f"{swept_parameter}_ci_lower"]),
-            "ci_upper": float(ci_frame.loc[value_index, f"{swept_parameter}_ci_upper"]),
+            "median": float(ci_frame.loc[value_index, f"{ci_parameter}_median"]),
+            "ci_lower": float(ci_frame.loc[value_index, f"{ci_parameter}_ci_lower"]),
+            "ci_upper": float(ci_frame.loc[value_index, f"{ci_parameter}_ci_upper"]),
         })
 
 
 def run_parameter_sweep_test(
-    summary_model,
     tcn_model,
     baseline=None,
     sweep_deltas=None,
     sweeps=None,
-    n=253,
+    n=DEFAULT_SEQUENCE_LENGTH,
     sweep_size=9,
     seed=12345,
     alpha=DEFAULT_ALPHA,
-    mcmc_prior="default",
     mcmc_draws=DEFAULT_MCMC_DRAWS,
     mcmc_burnin=DEFAULT_MCMC_BURNIN,
     mcmc_thinpara=DEFAULT_MCMC_THINPARA,
@@ -631,28 +623,33 @@ def run_parameter_sweep_test(
 
         print(f"Running sweep for {swept_parameter} with {len(true_values)} values.")
 
-        mcmc_ci = run_stochvol_mcmc(
-            y,
-            prior=mcmc_prior,
-            draws=mcmc_draws,
-            burnin=mcmc_burnin,
-            thinpara=mcmc_thinpara,
-            alpha=alpha,
-        ).sort_values("index").reset_index(drop=True)
+        if swept_parameter in MCMC_COMPARISON_PARAMETERS:
+            mcmc_ci = run_stochvol_mcmc(
+                y,
+                prior="default",
+                draws=mcmc_draws,
+                burnin=mcmc_burnin,
+                thinpara=mcmc_thinpara,
+                alpha=alpha,
+            ).sort_values("index").reset_index(drop=True)
+            mcmc_ci_parameter = "sigma" if swept_parameter == "s" else swept_parameter
+            add_ci_rows(
+                rows,
+                swept_parameter,
+                true_values,
+                "MCMC",
+                mcmc_ci,
+                ci_parameter=mcmc_ci_parameter,
+            )
 
-        nn_ci = predict_model_ci(summary_model, y, alpha, batch_size)
         tcn_ci = predict_model_ci(tcn_model, y, alpha, batch_size)
-
-        add_ci_rows(rows, swept_parameter, true_values, "MCMC", mcmc_ci)
-        add_ci_rows(rows, swept_parameter, true_values, "NN", nn_ci)
         add_ci_rows(rows, swept_parameter, true_values, "TCN", tcn_ci)
 
     return pd.DataFrame(rows), sweeps, baseline
 
 
 def run_prior_draw_metric_test(
-    loaded_models,
-    prior="default",
+    tcn_model,
     n_prior_draws=DEFAULT_PRIOR_DRAWS,
     n=DEFAULT_SEQUENCE_LENGTH,
     seed=12345,
@@ -663,7 +660,6 @@ def run_prior_draw_metric_test(
     batch_size=4096,
 ):
     y, theta, targets = simulate_prior_sv_dataset(
-        prior=prior,
         n_prior_draws=n_prior_draws,
         n=n,
         seed=seed,
@@ -671,7 +667,7 @@ def run_prior_draw_metric_test(
 
     print(
         "Running transformed-scale metrics for "
-        f"{n_prior_draws} prior draws, sequence length {n}, prior='{prior}'."
+        f"{n_prior_draws} prior draws, sequence length {n}."
     )
     print(
         f"Running stochvol MCMC with draws={mcmc_draws}, "
@@ -680,7 +676,7 @@ def run_prior_draw_metric_test(
 
     _, parameter_draws = run_stochvol_mcmc(
         y,
-        prior=prior,
+        prior="default",
         draws=mcmc_draws,
         burnin=mcmc_burnin,
         thinpara=mcmc_thinpara,
@@ -692,40 +688,54 @@ def run_prior_draw_metric_test(
         n_series=n_prior_draws,
     )
 
+    print("Predicting transformed posterior Gaussian with TCN.")
+    tcn_mean, tcn_var = predict_model_transformed_gaussian(
+        tcn_model,
+        y,
+        batch_size=batch_size,
+    )
+
+    mcmc_target_indices = [
+        TRANSFORMED_TARGET_NAMES.index(parameter)
+        for parameter in MCMC_TRANSFORMED_TARGET_NAMES
+    ]
+    metric_frames = [
+        marginal_gaussian_metrics(
+            target=targets[:, mcmc_target_indices],
+            mean=mcmc_mean,
+            var=mcmc_var,
+            method="MCMC",
+            parameter_names=MCMC_TRANSFORMED_TARGET_NAMES,
+        ),
+        blank_metric_rows(
+            method="MCMC",
+            parameter_names=tuple(
+                parameter
+                for parameter in TRANSFORMED_TARGET_NAMES
+                if parameter not in MCMC_TRANSFORMED_TARGET_NAMES
+            ),
+        ),
+        marginal_gaussian_metrics(
+            target=targets,
+            mean=tcn_mean,
+            var=tcn_var,
+            method="TCN",
+            parameter_names=TRANSFORMED_TARGET_NAMES,
+        ),
+    ]
+
     estimates_by_method = {
         "MCMC": {
             "mean": mcmc_mean,
             "var": mcmc_var,
-        }
+            "parameter_names": MCMC_TRANSFORMED_TARGET_NAMES,
+        },
+        "TCN": {
+            "mean": tcn_mean,
+            "var": tcn_var,
+            "parameter_names": TRANSFORMED_TARGET_NAMES,
+        },
     }
-    metric_frames = [
-        marginal_gaussian_metrics(
-            target=targets,
-            mean=mcmc_mean,
-            var=mcmc_var,
-            method="MCMC",
-        )
-    ]
-
-    for loaded_model in loaded_models:
-        print(f"Predicting transformed posterior Gaussian with {loaded_model.label}.")
-        mean, var = predict_model_transformed_gaussian(
-            loaded_model,
-            y,
-            batch_size=batch_size,
-        )
-        estimates_by_method[loaded_model.label] = {
-            "mean": mean,
-            "var": var,
-        }
-        metric_frames.append(
-            marginal_gaussian_metrics(
-                target=targets,
-                mean=mean,
-                var=var,
-                method=loaded_model.label,
-            )
-        )
 
     metrics = pd.concat(metric_frames, ignore_index=True)
     estimates = build_transformed_estimate_frame(theta, targets, estimates_by_method)
@@ -736,16 +746,15 @@ def run_prior_draw_metric_test(
 def plot_parameter_sweep_ci(comparison, output_path, alpha):
     colors = {
         "MCMC": "tab:blue",
-        "NN": "tab:orange",
         "TCN": "tab:green",
     }
     markers = {
         "MCMC": "o",
-        "NN": "s",
         "TCN": "^",
     }
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8.6))
+    axes = axes.ravel()
 
     for ax, swept_parameter in zip(axes, PARAMETER_NAMES):
         subset = comparison[comparison["swept_parameter"] == swept_parameter]
@@ -761,18 +770,24 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
         else:
             spacing = 1.0
 
-        offsets = {
-            "MCMC": -0.18 * spacing,
-            "NN": 0.0,
-            "TCN": 0.18 * spacing,
-        }
+        methods = [
+            method for method in METHOD_NAMES
+            if method in set(subset["method"])
+        ]
+        if len(methods) > 1:
+            offsets = {
+                method: offset * spacing
+                for method, offset in zip(methods, np.linspace(-0.16, 0.16, len(methods)))
+            }
+        else:
+            offsets = {method: 0.0 for method in methods}
 
         ax.plot(true_values, true_values, color="0.45", linewidth=1.0, linestyle="--")
 
-        y_min = np.inf
-        y_max = -np.inf
+        y_min = float(np.min(true_values))
+        y_max = float(np.max(true_values))
 
-        for method in METHOD_NAMES:
+        for method in methods:
             method_data = (
                 subset[subset["method"] == method]
                 .sort_values("value_index")
@@ -784,8 +799,8 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
             lower = method_data["ci_lower"].to_numpy()
             upper = method_data["ci_upper"].to_numpy()
 
-            y_min = min(y_min, float(np.min(lower)), float(np.min(true_values)))
-            y_max = max(y_max, float(np.max(upper)), float(np.max(true_values)))
+            y_min = min(y_min, float(np.min(lower)))
+            y_max = max(y_max, float(np.max(upper)))
 
             ax.errorbar(
                 x,
@@ -809,8 +824,9 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
         ax.set_ylabel(f"posterior {swept_parameter}")
         ax.grid(alpha=0.25)
 
+    axes[len(PARAMETER_NAMES)].axis("off")
     axes[0].legend(loc="best")
-    fig.suptitle(f"{100 * (1.0 - alpha):.0f}% credible intervals by swept parameter using default prior")
+    fig.suptitle(f"{100 * (1.0 - alpha):.0f}% credible intervals by swept parameter")
     fig.tight_layout()
 
     output_path = Path(output_path)
@@ -822,20 +838,11 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
 
 
 def main():
-    summary_checkpoint_path = "weights/sv_posterior_nn_1M_ARIMA.pt"
-    tcn_checkpoint_path = "weights/sv_posterior_tcn_live_default.pt"
-    output_dir = Path("nn_parameter_sweep_test")
+    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default.pt"
+    output_dir = Path("tcn_5_param_test")
 
-    baseline = {
-        "mu": -9.0,
-        "phi": 0.95,
-        "sigma": 0.25,
-    }
-    sweep_deltas = {
-        "mu": 3.0,
-        "phi": 0.045,
-        "sigma": 0.20,
-    }
+    baseline = DEFAULT_BASELINE.copy()
+    sweep_deltas = DEFAULT_SWEEP_DELTAS.copy()
     sweeps = None
 
     n = DEFAULT_SEQUENCE_LENGTH
@@ -844,7 +851,6 @@ def main():
     metric_seed = 3
     alpha = DEFAULT_ALPHA
 
-    prior = "default"
     mcmc_draws = DEFAULT_MCMC_DRAWS
     mcmc_burnin = DEFAULT_MCMC_BURNIN
     mcmc_thinpara = DEFAULT_MCMC_THINPARA
@@ -858,13 +864,11 @@ def main():
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
 
-    summary_model = load_summary_model(summary_checkpoint_path, device)
     tcn_model = load_tcn_model(tcn_checkpoint_path, device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     comparison, sweeps, baseline = run_parameter_sweep_test(
-        summary_model=summary_model,
         tcn_model=tcn_model,
         baseline=baseline,
         sweep_deltas=sweep_deltas,
@@ -873,7 +877,6 @@ def main():
         sweep_size=sweep_size,
         seed=seed,
         alpha=alpha,
-        mcmc_prior=prior,
         mcmc_draws=mcmc_draws,
         mcmc_burnin=mcmc_burnin,
         mcmc_thinpara=mcmc_thinpara,
@@ -881,8 +884,7 @@ def main():
     )
 
     metrics, transformed_estimates = run_prior_draw_metric_test(
-        loaded_models=(summary_model, tcn_model),
-        prior=prior,
+        tcn_model=tcn_model,
         n_prior_draws=n_prior_draws,
         n=n,
         seed=metric_seed,
