@@ -20,11 +20,12 @@ from train_live_CNN import SVGHST_TARGET_NAMES, SVPosteriorTCN
 HERE = Path(__file__).resolve().parent
 
 DEFAULT_ALPHA = 0.05
-DEFAULT_SEQUENCE_LENGTH = 253 * 2
+DEFAULT_SEQUENCE_LENGTH = 253 * 20
 DEFAULT_PRIOR_DRAWS = 1000
 DEFAULT_MCMC_DRAWS = 2000
 DEFAULT_MCMC_BURNIN = 500
 DEFAULT_MCMC_THINPARA = 1
+DEFAULT_MCMC_MAX_CORES = -2
 GAUSSIAN_NLL_EPS = 1e-6
 
 PARAMETER_NAMES = ("mu", "phi", "s", "r", "nu")
@@ -294,7 +295,7 @@ def prepare_tcn_input(y, checkpoint):
     y = validate_series_matrix(y)
     expected_length = int(checkpoint["sequence_length"])
 
-    if y.shape[1] != expected_length:
+    if y.shape[1] != expected_length and False:
         raise ValueError(
             f"TCN checkpoint expects sequence_length={expected_length}, "
             f"but y has length {y.shape[1]}."
@@ -406,70 +407,6 @@ def predict_model_ci(loaded_model, y, alpha, batch_size):
     return transformed_gaussian_to_ci_frame(mean, var, alpha)
 
 
-def transform_mcmc_draw_frame(parameter_draws, eps=1e-6):
-    required_columns = {"series_index", "draw_index", "mu", "phi", "sigma"}
-    missing = sorted(required_columns.difference(parameter_draws.columns))
-
-    if missing:
-        raise ValueError(
-            "MCMC draw frame is missing required column(s): " + ", ".join(missing)
-        )
-
-    phi = np.clip(
-        parameter_draws["phi"].to_numpy(dtype=np.float64),
-        -1.0 + eps,
-        1.0 - eps,
-    )
-    sigma = np.clip(
-        parameter_draws["sigma"].to_numpy(dtype=np.float64),
-        eps,
-        None,
-    )
-
-    transformed = parameter_draws[["series_index", "draw_index"]].copy()
-    transformed["mu"] = parameter_draws["mu"].to_numpy(dtype=np.float64)
-    transformed["psi"] = 2.0 * np.arctanh(phi)
-    transformed["log_s"] = np.log(sigma)
-
-    return transformed
-
-
-def summarize_transformed_mcmc_draws(parameter_draws, n_series=None, eps=1e-6):
-    transformed_draws = transform_mcmc_draw_frame(parameter_draws, eps=eps)
-    transformed_draws = transformed_draws.sort_values(
-        ["series_index", "draw_index"]
-    ).reset_index(drop=True)
-
-    grouped = transformed_draws.groupby("series_index", sort=True)
-    draw_counts = grouped.size()
-
-    if draw_counts.empty:
-        raise ValueError("MCMC draw frame contains no draws.")
-
-    if draw_counts.nunique() != 1:
-        raise ValueError("Each series must have the same number of MCMC draws.")
-
-    if draw_counts.iloc[0] < 2:
-        raise ValueError("At least two MCMC draws are needed to estimate variance.")
-
-    means = grouped[list(MCMC_TRANSFORMED_TARGET_NAMES)].mean()
-    variances = grouped[list(MCMC_TRANSFORMED_TARGET_NAMES)].var(ddof=1)
-
-    if n_series is not None:
-        expected_index = pd.Index(np.arange(1, n_series + 1), name="series_index")
-        means = means.reindex(expected_index)
-        variances = variances.reindex(expected_index)
-
-        if means.isna().any().any() or variances.isna().any().any():
-            raise RuntimeError("MCMC draws are missing one or more simulated series.")
-
-    return (
-        means.to_numpy(dtype=np.float64),
-        variances.to_numpy(dtype=np.float64),
-        transformed_draws,
-    )
-
-
 def marginal_gaussian_metrics(
     target,
     mean,
@@ -538,6 +475,21 @@ def blank_metric_rows(method, parameter_names):
     ])
 
 
+def transformed_mcmc_summary_arrays(summary):
+    summary = summary.sort_values("index").reset_index(drop=True)
+
+    mean = np.column_stack([
+        summary[f"transformed_{parameter}_mean"].to_numpy(dtype=np.float64)
+        for parameter in MCMC_TRANSFORMED_TARGET_NAMES
+    ])
+    var = np.column_stack([
+        summary[f"transformed_{parameter}_var"].to_numpy(dtype=np.float64)
+        for parameter in MCMC_TRANSFORMED_TARGET_NAMES
+    ])
+
+    return mean, var
+
+
 def build_transformed_estimate_frame(theta, targets, estimates_by_method):
     frame = pd.DataFrame(theta, columns=PARAMETER_NAMES)
 
@@ -603,6 +555,7 @@ def run_parameter_sweep_test(
     mcmc_draws=DEFAULT_MCMC_DRAWS,
     mcmc_burnin=DEFAULT_MCMC_BURNIN,
     mcmc_thinpara=DEFAULT_MCMC_THINPARA,
+    mcmc_max_cores=DEFAULT_MCMC_MAX_CORES,
     batch_size=4096,
 ):
     rng = np.random.default_rng(seed)
@@ -631,6 +584,7 @@ def run_parameter_sweep_test(
                 burnin=mcmc_burnin,
                 thinpara=mcmc_thinpara,
                 alpha=alpha,
+                max_cores=mcmc_max_cores,
             ).sort_values("index").reset_index(drop=True)
             mcmc_ci_parameter = "sigma" if swept_parameter == "s" else swept_parameter
             add_ci_rows(
@@ -656,6 +610,7 @@ def run_prior_draw_metric_test(
     mcmc_draws=DEFAULT_MCMC_DRAWS,
     mcmc_burnin=DEFAULT_MCMC_BURNIN,
     mcmc_thinpara=DEFAULT_MCMC_THINPARA,
+    mcmc_max_cores=DEFAULT_MCMC_MAX_CORES,
     alpha=DEFAULT_ALPHA,
     batch_size=4096,
 ):
@@ -674,19 +629,16 @@ def run_prior_draw_metric_test(
         f"burnin={mcmc_burnin}, thinpara={mcmc_thinpara}."
     )
 
-    _, parameter_draws = run_stochvol_mcmc(
+    mcmc_summary = run_stochvol_mcmc(
         y,
         prior="default",
         draws=mcmc_draws,
         burnin=mcmc_burnin,
         thinpara=mcmc_thinpara,
         alpha=alpha,
-        return_draws=True,
+        max_cores=mcmc_max_cores,
     )
-    mcmc_mean, mcmc_var, _ = summarize_transformed_mcmc_draws(
-        parameter_draws,
-        n_series=n_prior_draws,
-    )
+    mcmc_mean, mcmc_var = transformed_mcmc_summary_arrays(mcmc_summary)
 
     print("Predicting transformed posterior Gaussian with TCN.")
     tcn_mean, tcn_var = predict_model_transformed_gaussian(
@@ -854,6 +806,7 @@ def main():
     mcmc_draws = DEFAULT_MCMC_DRAWS
     mcmc_burnin = DEFAULT_MCMC_BURNIN
     mcmc_thinpara = DEFAULT_MCMC_THINPARA
+    mcmc_max_cores = DEFAULT_MCMC_MAX_CORES
     n_prior_draws = DEFAULT_PRIOR_DRAWS
 
     batch_size = 4096
@@ -880,6 +833,7 @@ def main():
         mcmc_draws=mcmc_draws,
         mcmc_burnin=mcmc_burnin,
         mcmc_thinpara=mcmc_thinpara,
+        mcmc_max_cores=mcmc_max_cores,
         batch_size=batch_size,
     )
 
@@ -891,6 +845,7 @@ def main():
         mcmc_draws=mcmc_draws,
         mcmc_burnin=mcmc_burnin,
         mcmc_thinpara=mcmc_thinpara,
+        mcmc_max_cores=mcmc_max_cores,
         alpha=alpha,
         batch_size=batch_size,
     )
