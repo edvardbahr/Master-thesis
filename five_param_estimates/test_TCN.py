@@ -20,7 +20,7 @@ from train_live_CNN import SVGHST_TARGET_NAMES, SVPosteriorTCN
 HERE = Path(__file__).resolve().parent
 
 DEFAULT_ALPHA = 0.05
-DEFAULT_SEQUENCE_LENGTH = 253 * 20
+DEFAULT_SEQUENCE_LENGTH = 253 * 2
 DEFAULT_PRIOR_DRAWS = 1000
 DEFAULT_MCMC_DRAWS = 2000
 DEFAULT_MCMC_BURNIN = 500
@@ -295,7 +295,7 @@ def prepare_tcn_input(y, checkpoint):
     y = validate_series_matrix(y)
     expected_length = int(checkpoint["sequence_length"])
 
-    if y.shape[1] != expected_length and False:
+    if y.shape[1] != expected_length:
         raise ValueError(
             f"TCN checkpoint expects sequence_length={expected_length}, "
             f"but y has length {y.shape[1]}."
