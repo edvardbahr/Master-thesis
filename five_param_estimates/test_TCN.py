@@ -153,6 +153,7 @@ def load_tcn_model(checkpoint_path, device):
         kernel_size=checkpoint.get("kernel_sizes", checkpoint["kernel_size"]),
         dilations=tuple(checkpoint["dilations"]),
         hidden_dims_head=tuple(checkpoint["hidden_dims_head"]),
+        topk_pool_fraction=checkpoint.get("topk_pool_fraction"),
         activation=activation_from_checkpoint(checkpoint),
         use_batch_norm=bool(checkpoint["use_batch_norm"]),
         param_names=tuple(checkpoint["target_names"]),
@@ -790,7 +791,7 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
 
 
 def main():
-    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default_n2530_multiscale.pt"
+    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default_n2530_multiscale_topk.pt"
     output_dir = Path("tcn_5_param_test")
 
     baseline = DEFAULT_BASELINE.copy()

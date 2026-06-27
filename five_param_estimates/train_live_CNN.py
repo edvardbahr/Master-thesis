@@ -161,6 +161,7 @@ class SVPosteriorTCN(nn.Module):
         kernel_size=5,
         dilations=None,
         hidden_dims_head=(32, 32),
+        topk_pool_fraction=None,
         activation=nn.ReLU,
         use_batch_norm=False,
         param_names=SVGHST_TARGET_NAMES,
@@ -208,11 +209,17 @@ class SVPosteriorTCN(nn.Module):
             if block_kernel_size % 2 == 0:
                 raise ValueError("Use odd kernel_size values so padding preserves length.")
 
+        if topk_pool_fraction is not None:
+            topk_pool_fraction = float(topk_pool_fraction)
+            if not 0.0 < topk_pool_fraction <= 1.0:
+                raise ValueError("topk_pool_fraction must be in (0, 1] or None.")
+
         self.tcn_channels = tuple(tcn_channels)
         self.kernel_size = kernel_size
         self.kernel_sizes = kernel_sizes
         self.dilations = tuple(dilations)
         self.hidden_dims_head = tuple(hidden_dims_head)
+        self.topk_pool_fraction = topk_pool_fraction
         self.use_batch_norm = use_batch_norm
         self.param_names = param_names
         self.min_var = min_var
@@ -248,8 +255,8 @@ class SVPosteriorTCN(nn.Module):
 
         self.encoder = nn.Sequential(*blocks)
 
-        # We multiply by 2 as we are collapsing every channel to h_avg and h_max.
-        representation_dim = 2 * tcn_channels[-1]
+        n_pooling_summaries = 3 if topk_pool_fraction is not None else 2
+        representation_dim = n_pooling_summaries * tcn_channels[-1]
 
         self.heads = nn.ModuleDict()
 
@@ -279,7 +286,18 @@ class SVPosteriorTCN(nn.Module):
         # implementations while preserving the same representation shape.
         h_avg = h.mean(dim=-1)
         h_max = h.amax(dim=-1)
-        h = torch.cat([h_avg, h_max], dim=1)
+        pooled = [h_avg, h_max]
+
+        if self.topk_pool_fraction is not None:
+            topk_count = max(1, int(h.shape[-1] * self.topk_pool_fraction))
+            h_topk_mean = h.topk(
+                topk_count,
+                dim=-1,
+                sorted=False,
+            ).values.mean(dim=-1)
+            pooled.append(h_topk_mean)
+
+        h = torch.cat(pooled, dim=1)
 
         means = []
         variances = []
@@ -501,6 +519,7 @@ def train_live_cnn(
     kernel_size=5,
     dilations=None,
     hidden_dims_head=(64, 64),
+    topk_pool_fraction=None,
     activation=nn.ReLU,
     use_batch_norm=False,
     checkpoint_path="sv_posterior_tcn_live.pt",
@@ -578,6 +597,11 @@ def train_live_cnn(
 
     if min_var <= 0:
         raise ValueError("min_var must be positive.")
+
+    if topk_pool_fraction is not None:
+        topk_pool_fraction = float(topk_pool_fraction)
+        if not 0.0 < topk_pool_fraction <= 1.0:
+            raise ValueError("topk_pool_fraction must be in (0, 1] or None.")
 
     if fixed_nu is not None and (
         not np.isfinite(fixed_nu) or fixed_nu <= 4.0
@@ -744,6 +768,7 @@ def train_live_cnn(
         kernel_size=kernel_size,
         dilations=dilations,
         hidden_dims_head=hidden_dims_head,
+        topk_pool_fraction=topk_pool_fraction,
         activation=activation,
         use_batch_norm=use_batch_norm,
         param_names=target_names,
@@ -770,6 +795,12 @@ def train_live_cnn(
             "Temporal receptive field:",
             temporal_receptive_field(model.kernel_sizes, model.dilations),
         )
+        print("Top-k pooling fraction:", model.topk_pool_fraction)
+        if model.topk_pool_fraction is not None:
+            print(
+                "Top-k activations per channel:",
+                max(1, int(sequence_length * model.topk_pool_fraction)),
+            )
         print("Trainable parameters:", count_parameters(model))
         print("Train samples per validation:", train_size)
         print("Train batch size:", batch_size)
@@ -873,6 +904,12 @@ def train_live_cnn(
                 model.dilations,
             ),
             "hidden_dims_head": tuple(hidden_dims_head),
+            "topk_pool_fraction": model.topk_pool_fraction,
+            "pooling_modes": (
+                ("mean", "max", "topk_mean")
+                if model.topk_pool_fraction is not None
+                else ("mean", "max")
+            ),
             "activation": activation_name,
             "use_batch_norm": use_batch_norm,
             "min_var": min_var,
@@ -979,6 +1016,14 @@ def train_live_cnn(
             raise ValueError(
                 "Cannot resume with a different fixed_nu value: "
                 f"checkpoint={checkpoint_fixed_nu}, requested={fixed_nu}."
+            )
+
+        checkpoint_topk_pool_fraction = resume_checkpoint.get("topk_pool_fraction")
+        if checkpoint_topk_pool_fraction != model.topk_pool_fraction:
+            raise ValueError(
+                "Cannot resume with a different top-k pooling fraction: "
+                f"checkpoint={checkpoint_topk_pool_fraction}, "
+                f"requested={model.topk_pool_fraction}."
             )
 
         model.load_state_dict(resume_checkpoint["model_state_dict"])
@@ -1357,12 +1402,13 @@ def main():
         kernel_size=(9, 9, 7, 5, 5, 5),
         dilations=(1, 2, 4, 16, 64, 256),
         hidden_dims_head=(32, 32),
+        topk_pool_fraction=0.05,
         activation=nn.ReLU,
         use_batch_norm=False,
-        checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale.pt",
-        latest_checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale.latest.pt",
-        best_checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale.best.pt",
-        resume_from=None,  # Set to the n2530_multiscale latest checkpoint to continue.
+        checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.pt",
+        latest_checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.latest.pt",
+        best_checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.best.pt",
+        resume_from=None,  # Set to the n2530_multiscale_topk latest checkpoint to continue.
         seed=2,
         batch_size=1024 * 4,
         n_batches=100,    # Number of batches done before each validation
