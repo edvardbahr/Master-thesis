@@ -120,6 +120,7 @@ def sample_stochvol_prior(
     n,
     rng,
     prior="default",
+    fixed_r=None,
     fixed_nu=None,
     return_s2=False,
     dtype=np.float64,
@@ -132,9 +133,11 @@ def sample_stochvol_prior(
         mu ~ N(mu_mean, mu_sd^2)
         (phi + 1) / 2 ~ Beta(phi_a0, phi_b0)
         s^2 ~ Bs * ChiSq(df = 1)
+        r = fixed_r if fixed_r is not None, otherwise
         r / r_max ~ Beta(r_a0, r_b0), or
         r ~ Uniform(0, r_max) if r_a0 and r_b0 are both None
-        nu = fixed_nu if fixed_nu is not None, otherwise
+        nu = fixed_nu if fixed_nu is not None (np.inf gives Gaussian
+        innovations), otherwise
         nu = nu_min + X, X ~ Exponential(rate = nu_rate)
 
     Returns
@@ -152,8 +155,16 @@ def sample_stochvol_prior(
     hyper = get_gh_skew_t_prior_constants(prior)
     validate_gh_skew_t_prior_constants(hyper)
 
-    if fixed_nu is not None and (not np.isfinite(fixed_nu) or fixed_nu <= 4.0):
-        raise ValueError("fixed_nu must be greater than 4.")
+    if fixed_r is not None and (
+        not np.isfinite(fixed_r) or not 0.0 <= fixed_r < 1.0
+    ):
+        raise ValueError("fixed_r must satisfy 0 <= fixed_r < 1.")
+
+    if fixed_nu is not None and (
+        not (np.isfinite(fixed_nu) or np.isposinf(fixed_nu))
+        or fixed_nu <= 4.0
+    ):
+        raise ValueError("fixed_nu must be greater than 4 or np.inf.")
 
     mu = rng.normal(
         loc=hyper.mu_mean,
@@ -175,18 +186,21 @@ def sample_stochvol_prior(
     ).astype(dtype, copy=False)
     s = np.sqrt(s2).astype(dtype, copy=False)
 
-    if hyper.r_a0 is not None and hyper.r_b0 is not None:
-        r = (
-            hyper.r_max * rng.beta(
-                a=hyper.r_a0,
-                b=hyper.r_b0,
-                size=n,
-            )
-        ).astype(dtype, copy=False)
+    if fixed_r is None:
+        if hyper.r_a0 is not None and hyper.r_b0 is not None:
+            r = (
+                hyper.r_max * rng.beta(
+                    a=hyper.r_a0,
+                    b=hyper.r_b0,
+                    size=n,
+                )
+            ).astype(dtype, copy=False)
+        else:
+            r = (
+                hyper.r_max * rng.uniform(low=0.0, high=1.0, size=n)
+            ).astype(dtype, copy=False)
     else:
-        r = (
-            hyper.r_max * rng.uniform(low=0.0, high=1.0, size=n)
-        ).astype(dtype, copy=False)
+        r = np.full((n,), fixed_r, dtype=dtype)
 
     if fixed_nu is None:
         nu = (
@@ -232,19 +246,59 @@ def gh_skew_t_params_from_s_r_nu(s, r, nu):
 def sample_centered_gh_skew_t_innovations(s, r, nu, rng, dtype=np.float64):
     """
     Sample centered GH skew-t innovations with mean 0 and standard deviation s.
+
+    Entries with nu=np.inf are sampled directly from N(0, s^2).
     """
 
     s = np.asarray(s, dtype=np.float64)
     r = np.asarray(r, dtype=np.float64)
     nu = np.asarray(nu, dtype=np.float64)
     s, r, nu = np.broadcast_arrays(s, r, nu)
-    mu_gh, delta, beta = gh_skew_t_params_from_s_r_nu(s, r, nu)
-    gamma_draw = rng.gamma(shape=0.5 * nu, scale=1.0)
+
+    if np.any(s <= 0.0):
+        raise ValueError("All s values must be positive.")
+
+    if np.any((r < 0.0) | (r >= 1.0)):
+        raise ValueError("All r values must satisfy 0 <= r < 1.")
+
+    if np.any(~(np.isfinite(nu) | np.isposinf(nu))) or np.any(nu <= 4.0):
+        raise ValueError("All nu values must be greater than 4 or np.inf.")
+
+    gaussian = np.isposinf(nu)
+    if np.all(gaussian):
+        return np.asarray(
+            s * rng.standard_normal(size=s.shape),
+            dtype=dtype,
+        )
+
+    if not np.any(gaussian):
+        mu_gh, delta, beta = gh_skew_t_params_from_s_r_nu(s, r, nu)
+        gamma_draw = rng.gamma(shape=0.5 * nu, scale=1.0)
+        # 1/gamma(shape = 0.5 * nu, rate = k) -> inv-gamma(shape = 0.5 * nu, scale = k)
+        # 0.5 * delta^2 * inv-gamma(shape = 0.5 * nu, scale = 1.0) -> inv-gamma(shape = 0.5 * nu, scale = 0.5 * delta^2)
+        w = 0.5 * delta * delta / gamma_draw
+        z = rng.standard_normal(size=np.shape(w))
+        innovations = mu_gh + beta * w + np.sqrt(w) * z
+
+        return np.asarray(innovations, dtype=dtype)
+
+    innovations = np.empty(s.shape, dtype=np.float64)
+    innovations[gaussian] = (
+        s[gaussian] * rng.standard_normal(size=np.count_nonzero(gaussian))
+    )
+
+    finite = ~gaussian
+    mu_gh, delta, beta = gh_skew_t_params_from_s_r_nu(
+        s[finite],
+        r[finite],
+        nu[finite],
+    )
+    gamma_draw = rng.gamma(shape=0.5 * nu[finite], scale=1.0)
     # 1/gamma(shape = 0.5 * nu, rate = k) -> inv-gamma(shape = 0.5 * nu, scale = k)
     # 0.5 * delta^2 * inv-gamma(shape = 0.5 * nu, scale = 1.0) -> inv-gamma(shape = 0.5 * nu, scale = 0.5 * delta^2)
-    w = 0.5 * delta * delta / gamma_draw    
+    w = 0.5 * delta * delta / gamma_draw
     z = rng.standard_normal(size=np.shape(w))
-    innovations = mu_gh + beta * w + np.sqrt(w) * z
+    innovations[finite] = mu_gh + beta * w + np.sqrt(w) * z
 
     return np.asarray(innovations, dtype=dtype)
 
@@ -285,6 +339,8 @@ def simulate_sv_chunk(
     random_init:
         If True, initialize from a Gaussian with the stationary mean and
         variance, then apply 20 GHST transitions before generating y_0.
+        For Gaussian innovations (all nu=np.inf), no burn-in transitions are
+        needed because this initialization is exactly stationary.
 
     dtype:
         Floating point type for the returned y array.
@@ -316,7 +372,14 @@ def simulate_sv_chunk(
     if np.any(np.abs(phi) >= 1.0):
         raise ValueError("All phi values must satisfy abs(phi) < 1.")
 
-    gh_skew_t_params_from_s_r_nu(s, r, nu)
+    if np.any(s <= 0.0):
+        raise ValueError("All s values must be positive.")
+
+    if np.any((r < 0.0) | (r >= 1.0)):
+        raise ValueError("All r values must satisfy 0 <= r < 1.")
+
+    if np.any(~(np.isfinite(nu) | np.isposinf(nu))) or np.any(nu <= 4.0):
+        raise ValueError("All nu values must be greater than 4 or np.inf.")
 
     m = len(mu)
     y = np.empty((m, n), dtype=dtype)
@@ -325,7 +388,11 @@ def simulate_sv_chunk(
         stationary_sd = s / np.sqrt(1.0 - phi**2)
         h_prev = mu + stationary_sd * rng.standard_normal(m)
 
-        for _ in range(_STATIONARY_INIT_BURN_IN_STEPS):
+        stationary_init_burn_in_steps = (
+            0 if np.all(np.isposinf(nu)) else _STATIONARY_INIT_BURN_IN_STEPS
+        )
+
+        for _ in range(stationary_init_burn_in_steps):
             h_prev = (
                 mu
                 + phi * (h_prev - mu)
@@ -372,6 +439,7 @@ def _simulate_log_y_squared_chunk(job):
         n,
         seed_seq,
         prior,
+        fixed_r,
         fixed_nu,
         random_init,
         k,
@@ -386,6 +454,7 @@ def _simulate_log_y_squared_chunk(job):
         n_chunk,
         rng=rng,
         prior=prior,
+        fixed_r=fixed_r,
         fixed_nu=fixed_nu,
         return_s2=False,
         dtype=np.float64,
@@ -474,6 +543,7 @@ def simulate_sv_log_y_squared_parallel(
     N,
     n,
     chunk_size,
+    fixed_r=None,
     fixed_nu=None,
     n_workers=-1,
     seed=1,
@@ -487,6 +557,10 @@ def simulate_sv_log_y_squared_parallel(
 ):
     """
     Generate log(y^2 + k) series and true five-parameter SV values in parallel.
+
+    If fixed_r or fixed_nu is provided, that value is used for every simulated
+    series instead of sampling the corresponding parameter from its prior.
+    Setting fixed_nu=np.inf gives Gaussian log-volatility innovations.
 
     Returns
     -------
@@ -534,6 +608,7 @@ def simulate_sv_log_y_squared_parallel(
                 n,
                 child_seeds[chunk_id],
                 prior,
+                fixed_r,
                 fixed_nu,
                 random_init,
                 k,
