@@ -1350,25 +1350,25 @@ def train_live_cnn(
 
 def main():
     train_live_cnn(
-        sequence_length=253 * 10,
+        sequence_length=253, # times ten when fitting the full model
         prior="default",
-        fixed_r=None,
-        fixed_nu=None,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500. Set to np.inf for Gaussian innovations
-        tcn_channels=(16, 32, 32, 64, 64, 64),
-        kernel_size=(9, 9, 7, 5, 5, 5),
-        dilations=(1, 2, 4, 16, 64, 256),
+        fixed_r=0,
+        fixed_nu=np.inf,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500. Set to np.inf for Gaussian innovations
+        tcn_channels=(16, 32, 32, 64, 64), #tcn_channels=(16, 32, 32, 64, 64, 64),
+        kernel_size=(9, 9, 7, 5, 5),
+        dilations = None, #dilations=(1, 2, 4, 16, 64, 256),
         hidden_dims_head=(32, 32),
         topk_pool_fraction=0.05,
         activation=nn.ReLU,
         use_batch_norm=False,
-        checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.pt",
+        checkpoint_path="svghst_posterior_tcn_live_default_n253_multiscale_topk.pt",
         resume_from=None,  # Set to the n2530_multiscale_topk latest checkpoint to continue.
         seed=2,
         batch_size=1024 * 4,
         n_batches=100,    # Number of batches done before each validation
-        val_size=200_000, # Similar validation memory footprint to the 253 * 2 run
+        val_size=1024 * 2 * 100,
         fixed_validation=False,
-        lr=0.5e-3,
+        lr=5e-4,
         n_epochs=2000,
         patience=75, # A bit higher patience since live training is noisier than fixed datasets
         min_delta=1e-5,
