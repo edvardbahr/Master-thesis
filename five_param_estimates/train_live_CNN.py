@@ -1,7 +1,6 @@
 import os
 import warnings
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -22,6 +21,10 @@ TARGET_TRANSFORMS = {
     "log_nu": "log(nu)",
 }
 LOSS_REDUCTION = "mean_over_active_parameters"
+CHUNKS_PER_WORKER = 4
+KAPPA = 1e-12
+CENTER_Y = True
+EXP_CLIP = 350.0
 
 
 def make_mlp(
@@ -417,8 +420,6 @@ def diagonal_gaussian_nll(mean, var, target, min_var):
     return losses
 
 
-K_MOMENT_WARNING_THRESHOLD = 1e-10
-
 TRAIN_SEED_STREAM = 101
 VALIDATION_SEED_STREAM = 202
 FINAL_VALIDATION_SEED_STREAM = 303
@@ -476,12 +477,7 @@ def simulate_live_dataset(
     prior,
     fixed_nu,
     target_names,
-    random_init,
-    k,
-    center_y,
     out_dtype,
-    exp_clip,
-    show_progress,
 ):
     log_y_squared, theta = sim.simulate_sv_log_y_squared_parallel(
         N=N,
@@ -491,12 +487,12 @@ def simulate_live_dataset(
         seed=seed,
         prior=prior,
         fixed_nu=fixed_nu,
-        random_init=random_init,
-        k=k,
-        center_y=center_y,
+        random_init=True,
+        k=KAPPA,
+        center_y=CENTER_Y,
         out_dtype=out_dtype,
-        exp_clip=exp_clip,
-        show_progress=show_progress,
+        exp_clip=EXP_CLIP,
+        show_progress=False,
     )
 
     target = theta_to_target_numpy(
@@ -523,8 +519,6 @@ def train_live_cnn(
     activation=nn.ReLU,
     use_batch_norm=False,
     checkpoint_path="sv_posterior_tcn_live.pt",
-    latest_checkpoint_path=None,
-    best_checkpoint_path=None,
     resume_from=None,
     seed=1,
     batch_size=1024,
@@ -536,21 +530,12 @@ def train_live_cnn(
     patience=50,
     min_delta=1e-4,
     min_var=1e-12,
-    standardize_input=True,
     use_amp=None,
     grad_clip_norm=None,
-    warn_nonfinite_grad=True,
     deterministic_torch=True,
     n_workers=-2,
-    chunks_per_worker=4,
-    random_init=True,
-    k=1e-12,
-    center_y=True,
     out_dtype=np.float32,
-    exp_clip=350.0,
-    simulation_progress=False,
     verbose=True,
-    plot=True,
 ):
     """
     Train a TCN on SV time series generated live during training.
@@ -589,12 +574,6 @@ def train_live_cnn(
     if patience < 1:
         raise ValueError("patience must be at least 1.")
 
-    if chunks_per_worker < 1:
-        raise ValueError("chunks_per_worker must be at least 1.")
-
-    if k <= 0:
-        raise ValueError("k must be positive.")
-
     if min_var <= 0:
         raise ValueError("min_var must be positive.")
 
@@ -620,21 +599,14 @@ def train_live_cnn(
     sim.get_gh_skew_t_prior_constants(prior)
 
 
-    default_latest_path, default_best_path = default_checkpoint_paths(checkpoint_path)
+    latest_checkpoint_path, best_checkpoint_path = default_checkpoint_paths(
+        checkpoint_path
+    )
 
-    if latest_checkpoint_path is None:
-        latest_checkpoint_path = default_latest_path
-
-    if best_checkpoint_path is None:
-        best_checkpoint_path = default_best_path
-
-    if k > K_MOMENT_WARNING_THRESHOLD:
-        warnings.warn(
-            "Input standardization moments are stored for log(y_t^2), but "
-            f"k={k:g} means the model sees log(y_t^2 + k). "
-            "For this k, the stored moments may no longer be accurate.",
-            RuntimeWarning,
-            stacklevel=2,
+    if resume_from is not None and not os.path.isfile(resume_from):
+        raise FileNotFoundError(
+            "Cannot resume training because the checkpoint does not exist: "
+            f"{resume_from}"
         )
 
     out_dtype = np.dtype(out_dtype).type
@@ -644,23 +616,18 @@ def train_live_cnn(
     train_chunk_size = sim.resolve_chunk_size(
         train_size,
         resolved_n_workers,
-        chunks_per_worker,
+        CHUNKS_PER_WORKER,
     )
     val_chunk_size = sim.resolve_chunk_size(
         val_size,
         resolved_n_workers,
-        chunks_per_worker,
+        CHUNKS_PER_WORKER,
     )
     effective_val_batch_size = min(val_size, batch_size)
 
-    if standardize_input:
-        moments = sim.log_y_squared_moments(prior=prior)
-        input_mean = np.float32(moments["mean"])
-        input_std = np.float32(moments["std"])
-
-    else:
-        input_mean = np.float32(0.0)
-        input_std = np.float32(1.0)
+    moments = sim.log_y_squared_moments(prior=prior)
+    input_mean = np.float32(moments["mean"])
+    input_std = np.float32(moments["std"])
 
     # ============================================================
     # Reproducibility
@@ -840,12 +807,7 @@ def train_live_cnn(
             prior=prior,
             fixed_nu=fixed_nu,
             target_names=target_names,
-            random_init=random_init,
-            k=k,
-            center_y=center_y,
             out_dtype=out_dtype,
-            exp_clip=exp_clip,
-            show_progress=simulation_progress,
         )
 
     # ============================================================
@@ -916,7 +878,7 @@ def train_live_cnn(
 
             "input_mean": np.float32(input_mean),
             "input_std": np.float32(input_std),
-            "standardize_input": standardize_input,
+            "standardize_input": True,
             "standardization_source": "sim_5_param_data.log_y_squared_moments",
 
             "target_names": target_names,
@@ -952,15 +914,12 @@ def train_live_cnn(
             "effective_val_batch_size": effective_val_batch_size,
             "requested_n_workers": n_workers,
             "resolved_n_workers": resolved_n_workers,
-            "chunks_per_worker": chunks_per_worker,
+            "chunks_per_worker": CHUNKS_PER_WORKER,
             "train_chunk_size": train_chunk_size,
             "val_chunk_size": val_chunk_size,
-            "random_init": random_init,
-            "k": k,
-            "center_y": center_y,
+            "random_init": True,
+            "k": KAPPA,
             "out_dtype": str(np.dtype(out_dtype)),
-            "exp_clip": exp_clip,
-            "simulation_progress": simulation_progress,
 
             "use_amp": use_amp,
             "deterministic_torch": deterministic_torch,
@@ -969,7 +928,7 @@ def train_live_cnn(
             "patience": patience,
             "min_delta": min_delta,
             "grad_clip_norm": grad_clip_norm,
-            "warn_nonfinite_grad": warn_nonfinite_grad,
+            "warn_nonfinite_grad": True,
             "seed": seed,
             "seed_derivation": "SeedSequence([seed, stream, epoch_index])",
             "seed_streams": {
@@ -1097,12 +1056,7 @@ def train_live_cnn(
             prior=prior,
             fixed_nu=fixed_nu,
             target_names=target_names,
-            random_init=random_init,
-            k=k,
-            center_y=center_y,
             out_dtype=out_dtype,
-            exp_clip=exp_clip,
-            show_progress=simulation_progress,
         )
 
         model.train()
@@ -1135,10 +1089,9 @@ def train_live_cnn(
 
             scaler.scale(train_loss).backward()
 
-            if grad_clip_norm is not None or warn_nonfinite_grad:
-                scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer)
 
-            nonfinite_grad = warn_nonfinite_grad and has_nonfinite_gradient(model)
+            nonfinite_grad = has_nonfinite_gradient(model)
 
             if nonfinite_grad and verbose:
                 if amp_enabled:
@@ -1198,12 +1151,7 @@ def train_live_cnn(
                 prior=prior,
                 fixed_nu=fixed_nu,
                 target_names=target_names,
-                random_init=random_init,
-                k=k,
-                center_y=center_y,
                 out_dtype=out_dtype,
-                exp_clip=exp_clip,
-                show_progress=simulation_progress,
             )
 
         val_marginal_losses_value = evaluate_array(model, val_x, val_target)
@@ -1319,12 +1267,7 @@ def train_live_cnn(
             prior=prior,
             fixed_nu=fixed_nu,
             target_names=target_names,
-            random_init=random_init,
-            k=k,
-            center_y=center_y,
             out_dtype=out_dtype,
-            exp_clip=exp_clip,
-            show_progress=simulation_progress,
         )
 
     final_val_marginal_losses = evaluate_array(model, final_val_x, final_val_target)
@@ -1367,29 +1310,6 @@ def train_live_cnn(
     if verbose:
         print(f"Model saved to {checkpoint_path}")
 
-    # ============================================================
-    # Plot loss curves
-    # ============================================================
-
-    if plot:
-        plt.plot(train_loss_history, label="train")
-        plt.plot(val_loss_history, label="validation")
-        plt.xlabel("Epoch")
-        plt.ylabel("Mean marginal NLL across active parameters")
-        plt.legend()
-        plt.show()
-
-        train_marginal_loss_array = np.array(train_marginal_loss_history)
-        val_marginal_loss_array = np.array(val_marginal_loss_history)
-
-        for i, name in enumerate(target_names):
-            plt.plot(train_marginal_loss_array[:, i], label=f"train {name}")
-            plt.plot(val_marginal_loss_array[:, i], label=f"validation {name}")
-        plt.xlabel("Epoch")
-        plt.ylabel("Mean marginal negative log score")
-        plt.legend()
-        plt.show()
-
     return model, checkpoint
 
 
@@ -1406,8 +1326,6 @@ def main():
         activation=nn.ReLU,
         use_batch_norm=False,
         checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.pt",
-        latest_checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.latest.pt",
-        best_checkpoint_path="svghst_posterior_tcn_live_default_n2530_multiscale_topk.best.pt",
         resume_from=None,  # Set to the n2530_multiscale_topk latest checkpoint to continue.
         seed=2,
         batch_size=1024 * 4,
@@ -1419,21 +1337,12 @@ def main():
         patience=75, # A bit higher patience since live training is noisier than fixed datasets
         min_delta=1e-5,
         min_var=1e-12, # Minimum variance to ensure numerical stability in the loss and gradients
-        standardize_input=True,
         use_amp=True,  # Use automatic mixed precision to save on vram
         grad_clip_norm=5.0,
-        warn_nonfinite_grad=True,
         deterministic_torch=True,
         n_workers= -2, # Uses all but 2 cpu cores for data simulation
-        chunks_per_worker=4,
-        random_init=True,
-        k=1e-12,
-        center_y=True,
         out_dtype=np.float32,
-        exp_clip=350.0,
-        simulation_progress=False,
         verbose=True,
-        plot=True,
     )
 
 

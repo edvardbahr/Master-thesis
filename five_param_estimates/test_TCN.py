@@ -132,7 +132,6 @@ def load_tcn_model(checkpoint_path, device):
             "input_std",
             "target_names",
             "k",
-            "center_y",
         ],
         checkpoint_path,
     )
@@ -144,9 +143,6 @@ def load_tcn_model(checkpoint_path, device):
         )
 
     validate_target_names(checkpoint, checkpoint_path)
-
-    if not bool(checkpoint["center_y"]):
-        raise ValueError(f"{checkpoint_path} must have center_y=True.")
 
     model = SVPosteriorTCN(
         tcn_channels=tuple(checkpoint["tcn_channels"]),
@@ -302,8 +298,7 @@ def prepare_tcn_input(y, checkpoint):
             f"but y has length {y.shape[1]}."
         )
 
-    if bool(checkpoint["center_y"]):
-        y = y - np.mean(y, axis=1, keepdims=True)
+    y = y - np.mean(y, axis=1, keepdims=True)
 
     return np.log(y * y + float(checkpoint["k"])).astype(np.float32, copy=False)
 
