@@ -476,6 +476,7 @@ def simulate_live_dataset(
     seed,
     prior,
     fixed_nu,
+    fixed_r,
     target_names,
     out_dtype,
 ):
@@ -487,6 +488,7 @@ def simulate_live_dataset(
         seed=seed,
         prior=prior,
         fixed_nu=fixed_nu,
+        fixed_r=fixed_r,
         random_init=True,
         k=KAPPA,
         center_y=CENTER_Y,
@@ -511,6 +513,7 @@ def train_live_cnn(
     sequence_length,
     prior="default",
     fixed_nu=None,
+    fixed_r=None,
     tcn_channels=(16, 32, 32, 64, 64, 64),
     kernel_size=5,
     dilations=None,
@@ -548,8 +551,10 @@ def train_live_cnn(
     If fixed_validation=True, the validation set is generated once and reused.
     Otherwise, a new deterministic validation set is generated each epoch.
 
-    If fixed_nu is not None, simulations condition on that value and the model
-    estimates only mu, psi, log_s, and logit_r.
+    If fixed_nu or fixed_r is not None, simulations condition on that value
+    and the corresponding log_nu or logit_r target and model head are omitted.
+    Set fixed_nu=np.inf and fix r to obtain the three-parameter standard SV
+    model setup.
     """
 
     # ============================================================
@@ -582,17 +587,27 @@ def train_live_cnn(
         if not 0.0 < topk_pool_fraction <= 1.0:
             raise ValueError("topk_pool_fraction must be in (0, 1] or None.")
 
-    if fixed_nu is not None and (
-        not np.isfinite(fixed_nu) or fixed_nu <= 4.0
+    if fixed_r is not None and (
+        not np.isfinite(fixed_r) or not 0.0 <= fixed_r < 1.0
     ):
-        raise ValueError("fixed_nu must be greater than 4.")
+        raise ValueError("fixed_r must satisfy 0 <= fixed_r < 1.")
 
+    if fixed_nu is not None and (
+        not (np.isfinite(fixed_nu) or np.isposinf(fixed_nu))
+        or fixed_nu <= 4.0
+    ):
+        raise ValueError("fixed_nu must be greater than 4 or np.inf.")
+
+    fixed_r = None if fixed_r is None else float(fixed_r)
     fixed_nu = None if fixed_nu is None else float(fixed_nu)
 
     target_names = tuple(
         name
         for name in SVGHST_TARGET_NAMES
-        if not (name == "log_nu" and fixed_nu is not None)
+        if not (
+            (name == "logit_r" and fixed_r is not None)
+            or (name == "log_nu" and fixed_nu is not None)
+        )
     )
 
     # Validate the prior name through the 3-parameter simulator API.
@@ -751,6 +766,7 @@ def train_live_cnn(
 
     if verbose:
         print("Prior:", prior)
+        print("Fixed r:", fixed_r)
         print("Fixed nu:", fixed_nu)
         print("Estimated parameters:", target_names)
         print("Sequence length:", sequence_length)
@@ -806,6 +822,7 @@ def train_live_cnn(
             seed=fixed_validation_seed,
             prior=prior,
             fixed_nu=fixed_nu,
+            fixed_r=fixed_r,
             target_names=target_names,
             out_dtype=out_dtype,
         )
@@ -905,6 +922,7 @@ def train_live_cnn(
             "val_marginal_loss_history": val_marginal_loss_history,
 
             "prior": prior,
+            "fixed_r": fixed_r,
             "fixed_nu": fixed_nu,
             "batch_size": batch_size,
             "n_batches": n_batches,
@@ -975,6 +993,20 @@ def train_live_cnn(
             raise ValueError(
                 "Cannot resume with a different fixed_nu value: "
                 f"checkpoint={checkpoint_fixed_nu}, requested={fixed_nu}."
+            )
+
+        checkpoint_fixed_r = resume_checkpoint.get("fixed_r")
+        same_fixed_r = (
+            checkpoint_fixed_r is None and fixed_r is None
+        ) or (
+            checkpoint_fixed_r is not None
+            and fixed_r is not None
+            and float(checkpoint_fixed_r) == fixed_r
+        )
+        if not same_fixed_r:
+            raise ValueError(
+                "Cannot resume with a different fixed_r value: "
+                f"checkpoint={checkpoint_fixed_r}, requested={fixed_r}."
             )
 
         checkpoint_topk_pool_fraction = resume_checkpoint.get("topk_pool_fraction")
@@ -1055,6 +1087,7 @@ def train_live_cnn(
             seed=train_seed,
             prior=prior,
             fixed_nu=fixed_nu,
+            fixed_r=fixed_r,
             target_names=target_names,
             out_dtype=out_dtype,
         )
@@ -1150,6 +1183,7 @@ def train_live_cnn(
                 seed=validation_seed,
                 prior=prior,
                 fixed_nu=fixed_nu,
+                fixed_r=fixed_r,
                 target_names=target_names,
                 out_dtype=out_dtype,
             )
@@ -1266,6 +1300,7 @@ def train_live_cnn(
             seed=final_validation_seed,
             prior=prior,
             fixed_nu=fixed_nu,
+            fixed_r=fixed_r,
             target_names=target_names,
             out_dtype=out_dtype,
         )
@@ -1317,7 +1352,8 @@ def main():
     train_live_cnn(
         sequence_length=253 * 10,
         prior="default",
-        fixed_nu=None,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500
+        fixed_r=None,
+        fixed_nu=None,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500. Set to np.inf for Gaussian innovations
         tcn_channels=(16, 32, 32, 64, 64, 64),
         kernel_size=(9, 9, 7, 5, 5, 5),
         dilations=(1, 2, 4, 16, 64, 256),
