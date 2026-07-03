@@ -20,7 +20,7 @@ from train_live_CNN import SVGHST_TARGET_NAMES, SVPosteriorTCN
 HERE = Path(__file__).resolve().parent
 
 DEFAULT_ALPHA = 0.05
-DEFAULT_SEQUENCE_LENGTH = 253 * 10
+DEFAULT_SEQUENCE_LENGTH = 253 * 2
 DEFAULT_PRIOR_DRAWS = 1000
 DEFAULT_MCMC_DRAWS = 2000
 DEFAULT_MCMC_BURNIN = 500
@@ -786,7 +786,7 @@ def plot_parameter_sweep_ci(comparison, output_path, alpha):
 
 
 def main():
-    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default_n2530_multiscale_topk.pt"
+    tcn_checkpoint_path = "weights/svghst_posterior_tcn_live_default.pt"
     output_dir = Path("tcn_5_param_test")
 
     baseline = DEFAULT_BASELINE.copy()
@@ -846,10 +846,10 @@ def main():
         batch_size=batch_size,
     )
 
-    csv_path = output_dir / "parameter_sweep_ci_default_comparison.csv"
-    plot_path = output_dir / "parameter_sweep_ci_default_comparison.png"
-    metrics_path = output_dir / "prior_draw_transformed_metrics.csv"
-    estimates_path = output_dir / "prior_draw_transformed_estimates.csv"
+    csv_path = output_dir / "parameter_sweep_ci_default_comparison_n2.csv"
+    plot_path = output_dir / "parameter_sweep_ci_default_comparison_n2.png"
+    metrics_path = output_dir / "prior_draw_transformed_metrics_n2.csv"
+    estimates_path = output_dir / "prior_draw_transformed_estimates_n2.csv"
 
     comparison.to_csv(csv_path, index=False)
     plot_parameter_sweep_ci(comparison, plot_path, alpha)
