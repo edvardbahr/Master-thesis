@@ -30,20 +30,21 @@ class GHSkewTPriorConstants:
 
 
 _GH_SKEW_T_PRIORS = {
-    # TODO: Finalize finance prior before making it selectable. This can be done through "adaptive learning"
-    # by conditioning on the default prior first and then use the resulting posterior as a finance prior.
-    # "finance": GHSkewTPriorConstants(
-    #     mu_mean=-9.0,
-    #     mu_sd=1.0,
-    #     phi_a0=20.0,
-    #     phi_b0=1.5,
-    #     Bs=1.0,
-    #     r_a0=1.0,
-    #     r_b0=9.0,
-    #     r_max=0.8,
-    #     nu_min=8.0,
-    #     nu_rate=0.1,
-    # ),
+     #TODO: Adjust the hyper parameters for nu and r to better match financial time series.
+     "finance": GHSkewTPriorConstants(
+         mu_mean=-9.0,
+         mu_sd=1.0,
+         phi_a0=20.0,
+         phi_b0=1.5,
+         Bs=1.0,
+
+         # These are just the default parameter values for r and nu
+         r_a0=1.0,
+         r_b0=9.0,
+         r_max=0.8,
+         nu_min=8.0,
+         nu_rate=0.1,
+    ),
     "default": GHSkewTPriorConstants(
         mu_mean=0.0,
         mu_sd=10.0,

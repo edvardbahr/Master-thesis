@@ -1350,8 +1350,8 @@ def train_live_cnn(
 
 def main():
     train_live_cnn(
-        sequence_length=253, # times ten when fitting the full model
-        prior="default",
+        sequence_length=253, # times ten when fitting GHST model with r and nu unfixed
+        prior="finance",
         fixed_r=0,
         fixed_nu=np.inf,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500. Set to np.inf for Gaussian innovations
         tcn_channels=(16, 32, 32, 64, 64), #tcn_channels=(16, 32, 32, 64, 64, 64),
@@ -1361,8 +1361,8 @@ def main():
         topk_pool_fraction=0.05,
         activation=nn.ReLU,
         use_batch_norm=False,
-        checkpoint_path="svghst_posterior_tcn_live_default_n253_multiscale_topk.pt",
-        resume_from=None,  # Set to the n2530_multiscale_topk latest checkpoint to continue.
+        checkpoint_path="sv_posterior_tcn_live_finance_n253_multiscale_topk.pt",
+        resume_from="sv_posterior_tcn_live_finance_n253_multiscale_topk.latest.pt",  # Set to the n2530_multiscale_topk latest checkpoint to continue.
         seed=2,
         batch_size=1024 * 4,
         n_batches=100,    # Number of batches done before each validation
@@ -1376,7 +1376,7 @@ def main():
         use_amp=True,  # Use automatic mixed precision to save on vram
         grad_clip_norm=5.0,
         deterministic_torch=True,
-        n_workers= -2, # Uses all but 2 cpu cores for data simulation
+        n_workers= -4, # Uses all but 4 cpu cores for data simulation
         out_dtype=np.float32,
         verbose=True,
     )
