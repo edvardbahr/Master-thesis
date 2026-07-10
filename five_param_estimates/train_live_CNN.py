@@ -86,7 +86,6 @@ class TemporalResidualBlock(nn.Module):
         kernel_size=5,
         dilation=1,
         activation=nn.ReLU,
-        use_batch_norm=False,
     ):
         super().__init__()
 
@@ -108,8 +107,6 @@ class TemporalResidualBlock(nn.Module):
             ),
         ]
 
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(out_channels))
 
         layers.append(activation())
 
@@ -123,9 +120,6 @@ class TemporalResidualBlock(nn.Module):
                 dilation=dilation,
             )
         )
-
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(out_channels))
 
 
         self.net = nn.Sequential(*layers)
@@ -166,7 +160,6 @@ class SVPosteriorTCN(nn.Module):
         hidden_dims_head=(32, 32),
         topk_pool_fraction=None,
         activation=nn.ReLU,
-        use_batch_norm=False,
         param_names=SVGHST_TARGET_NAMES,
         min_var=1e-12,
         input_mean=0.0,
@@ -223,7 +216,6 @@ class SVPosteriorTCN(nn.Module):
         self.dilations = tuple(dilations)
         self.hidden_dims_head = tuple(hidden_dims_head)
         self.topk_pool_fraction = topk_pool_fraction
-        self.use_batch_norm = use_batch_norm
         self.param_names = param_names
         self.min_var = min_var
 
@@ -251,7 +243,6 @@ class SVPosteriorTCN(nn.Module):
                     kernel_size=block_kernel_size,
                     dilation=dilation,
                     activation=activation,
-                    use_batch_norm=use_batch_norm,
                 )
             )
             in_channels = out_channels
@@ -520,7 +511,6 @@ def train_live_cnn(
     hidden_dims_head=(64, 64),
     topk_pool_fraction=None,
     activation=nn.ReLU,
-    use_batch_norm=False,
     checkpoint_path="sv_posterior_tcn_live.pt",
     resume_from=None,
     seed=1,
@@ -752,7 +742,6 @@ def train_live_cnn(
         hidden_dims_head=hidden_dims_head,
         topk_pool_fraction=topk_pool_fraction,
         activation=activation,
-        use_batch_norm=use_batch_norm,
         param_names=target_names,
         min_var=min_var,
         input_mean=input_mean,
@@ -890,7 +879,6 @@ def train_live_cnn(
                 else ("mean", "max")
             ),
             "activation": activation_name,
-            "use_batch_norm": use_batch_norm,
             "min_var": min_var,
 
             "input_mean": np.float32(input_mean),
@@ -1360,7 +1348,6 @@ def main():
         hidden_dims_head=(32, 32),
         topk_pool_fraction=0.05,
         activation=nn.ReLU,
-        use_batch_norm=False,
         checkpoint_path="sv_posterior_tcn_live_finance_n253_multiscale_topk.pt",
         resume_from="sv_posterior_tcn_live_finance_n253_multiscale_topk.latest.pt",  # Set to the n2530_multiscale_topk latest checkpoint to continue.
         seed=2,
