@@ -229,7 +229,7 @@ def summary_stats_sv(
 
     # Location features
     mean_x = np.mean(x)
-    q_x = np.quantile(x, [0.05, 0.25, 0.50, 0.75, 0.95])
+    q_x = np.quantile(x, [0.05, 0.25, 0.50, 0.75, 0.95]) #why tf did I hardcode this..
 
     # ACVF ratio features
     gamma = acovf(
