@@ -239,20 +239,21 @@ def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
 
 
 def main():
-    mu = [-9.0]
-    phi = [0.98]
-    sigma = [0.20]
+    mu = [-2.0]
+    phi = [0.5]
+    sigma = [0.5]
 
     rng = np.random.default_rng(seed=1)
 
-    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=int(np.floor(253*4)), rng=rng)[0]
+    simulated_data = sim.simulate_sv_chunk(mu, phi, sigma, n=int(np.floor(253)), rng=rng)[0]
 
     summary, draws = run_stochvol_mcmc(
         simulated_data,
-        draws=10000,
-        burnin=2000,
+        draws=300,
+        burnin=0,
         thinpara=1,
         return_draws=True,
+        prior = "default",
     )
 
     print(summary[["mu_mean", "phi_mean", "sigma_mean"]])

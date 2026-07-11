@@ -1,7 +1,6 @@
 import copy
 import json
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -687,6 +686,8 @@ def train_summary_nn(
     # ============================================================
 
     if plot:
+        import matplotlib.pyplot as plt
+
         plt.plot(train_loss_history, label="train")
         plt.plot(val_loss_history, label="validation")
         plt.xlabel("Epoch")
