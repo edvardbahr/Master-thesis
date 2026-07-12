@@ -36,6 +36,7 @@ def _simulate_and_summarize_chunk(job):
         prior,
         random_init,
         n_acvf_ratios,
+        n_quantiles,
         compute_arima_coeff,
         k,
         eps,
@@ -78,6 +79,7 @@ def _simulate_and_summarize_chunk(job):
             y_chunk[i, :],
             k=k,
             n_acvf_ratios=n_acvf_ratios,
+            n_quantiles=n_quantiles,
             eps=eps,
             compute_arima_coeff=compute_arima_coeff,
             arima_method=arima_method,
@@ -148,6 +150,7 @@ def summary_stats_sv(
     y,
     k=1e-12,
     n_acvf_ratios=4,
+    n_quantiles=5,
     eps=1e-12,
     compute_arima_coeff=True,
     arima_method=None,
@@ -159,37 +162,23 @@ def summary_stats_sv(
 
     If compute_arima_coeff=True, feature order is:
         1. mean(log(y^2 + k))
-        2. q05
-        3. q25
-        4. q50
-        5. q75
-        6. q95
-        7. transformed ACVF ratios:
+        2. n_quantiles evenly spaced 5%-to-95% quantiles of log(y^2 + k)
+        3. transformed ACVF ratios:
 
               gamma(1) / gamma(0),
               gamma(2) / gamma(1),
               ...,
               gamma(n_acvf_ratios) / gamma(n_acvf_ratios - 1)
 
-        8. transformed ARMA(1,1) AR coefficient
-        9. transformed ARMA(1,1) MA coefficient
-        10. log ARMA innovation SD
-        11. 0.5 * log(var(log(y^2 + k)))
-        12. log MAD(log(y^2 + k))
-        13. plug-in log sigma estimate
+        4. transformed ARMA(1,1) AR coefficient
+        5. transformed ARMA(1,1) MA coefficient
+        6. log ARMA innovation SD
+        7. 0.5 * log(var(log(y^2 + k)))
+        8. log MAD(log(y^2 + k))
+        9. plug-in log sigma estimate
 
     If compute_arima_coeff=False, the ARMA-related features are omitted.
-    The feature order is then:
-        1. mean(log(y^2 + k))
-        2. q05
-        3. q25
-        4. q50
-        5. q75
-        6. q95
-        7. transformed ACVF ratios
-        8. 0.5 * log(var(log(y^2 + k)))
-        9. log MAD(log(y^2 + k))
-        10. plug-in log sigma estimate
+    The remaining feature groups keep the same order.
     
     NOTE: Remember to update summary_stats_sv_feature_names() if you change the features generated here.
     """
@@ -218,6 +207,8 @@ def summary_stats_sv(
     if n_acvf_ratios < 1:
         raise ValueError("n_acvf_ratios must be at least 1.")
 
+    quantile_probs = summary_quantile_probabilities(n_quantiles)
+
     if len(y) <= n_acvf_ratios:
         raise ValueError("y is too short for the requested number of ACVF ratios.")
 
@@ -229,7 +220,7 @@ def summary_stats_sv(
 
     # Location features
     mean_x = np.mean(x)
-    q_x = np.quantile(x, [0.05, 0.25, 0.50, 0.75, 0.95]) #why tf did I hardcode this..
+    q_x = np.quantile(x, quantile_probs)
 
     # ACVF ratio features
     gamma = acovf(
@@ -383,24 +374,19 @@ def summary_stats_sv(
 
     # Preallocate output
     if compute_arima_coeff:
-        p = 6 + n_acvf_ratios + 3 + 3
+        p = 1 + n_quantiles + n_acvf_ratios + 3 + 3
     else:
-        p = 6 + n_acvf_ratios + 3
+        p = 1 + n_quantiles + n_acvf_ratios + 3
 
     out = np.empty(p, dtype=float)
 
     i = 0
 
     # Location features
-    out[i:i + 6] = [
-        mean_x,
-        q_x[0],
-        q_x[1],
-        q_x[2],
-        q_x[3],
-        q_x[4],
-    ]
-    i += 6
+    out[i] = mean_x
+    i += 1
+    out[i:i + n_quantiles] = q_x
+    i += n_quantiles
 
     # Persistence features
     out[i:i + n_acvf_ratios] = acvf_ratio_features
@@ -420,19 +406,39 @@ def summary_stats_sv(
     return out
 
 
-def summary_stats_sv_feature_names(n_acvf_ratios=4, compute_arima_coeff=True):
+def summary_quantile_probabilities(n_quantiles):
+    if not isinstance(n_quantiles, int):
+        raise TypeError("n_quantiles must be an integer.")
+
+    if n_quantiles < 1:
+        raise ValueError("n_quantiles must be at least 1.")
+
+    return np.linspace(0.05, 0.95, n_quantiles)
+
+
+def quantile_feature_name(probability):
+    percentage = 100.0 * float(probability)
+    if np.isclose(percentage, round(percentage)):
+        return f"q{int(round(percentage)):02d}_x"
+
+    label = f"{percentage:05.2f}".rstrip("0").rstrip(".").replace(".", "p")
+    return f"q{label}_x"
+
+
+def summary_stats_sv_feature_names(
+    n_acvf_ratios=4,
+    n_quantiles=5,
+    compute_arima_coeff=True,
+):
     """
     Creates a list of the feature names generated in summary_stats_sv.
     The number of feature names is equal to the dimension of the output of summary_stats_sv.
     """
-    names = [
-        "mean_x",
-        "q05_x",
-        "q25_x",
-        "q50_x",
-        "q75_x",
-        "q95_x",
-    ]
+    names = ["mean_x"]
+    names.extend(
+        quantile_feature_name(probability)
+        for probability in summary_quantile_probabilities(n_quantiles)
+    )
 
     for j in range(1, n_acvf_ratios + 1):
         names.append(f"psi_gamma{j}_over_gamma{j-1}")
@@ -835,6 +841,7 @@ def simulate_sv_summaries_parallel(
     prior="default",
     random_init=True,
     n_acvf_ratios=4,
+    n_quantiles=5,
     compute_arima_coeff=True,
     k=1e-12,
     eps=1e-12,
@@ -876,6 +883,7 @@ def simulate_sv_summaries_parallel(
 
     feature_names = summary_stats_sv_feature_names(
         n_acvf_ratios=n_acvf_ratios,
+        n_quantiles=n_quantiles,
         compute_arima_coeff=compute_arima_coeff,
     )
     p = len(feature_names)
@@ -906,6 +914,7 @@ def simulate_sv_summaries_parallel(
                 prior,
                 random_init,
                 n_acvf_ratios,
+                n_quantiles,
                 compute_arima_coeff,
                 k,
                 eps,
@@ -1045,6 +1054,7 @@ def main1():
     center_y = True
     random_init = True
     n_acvf_ratios = 4
+    n_quantiles = 5
     out_dtype = np.float32
     exp_clip = 350.0
 
@@ -1052,7 +1062,7 @@ def main1():
     chunk_size = resolve_chunk_size(N, resolved_n_workers, chunks_per_worker)
 
     arima_label = "ARIMA" if compute_arima_coeff else "no_ARIMA"
-    file_name = f"sv_summaries_{prior}_1M_n{n}_{arima_label}.npz"
+    file_name = f"sv_summaries_{prior}_1M_n{n}_q{n_quantiles}_{arima_label}.npz"
 
     Z, theta, feature_names = simulate_sv_summaries_parallel(
         N=N,
@@ -1062,6 +1072,7 @@ def main1():
         prior=prior,
         random_init=random_init,
         n_acvf_ratios=n_acvf_ratios,
+        n_quantiles=n_quantiles,
         compute_arima_coeff=compute_arima_coeff,
         k=k,
         eps=eps,
@@ -1089,6 +1100,7 @@ def main1():
             "prior": prior,
             "random_init": random_init,
             "n_acvf_ratios": n_acvf_ratios,
+            "n_quantiles": n_quantiles,
             "compute_arima_coeff": compute_arima_coeff,
             "k": k,
             "eps": eps,

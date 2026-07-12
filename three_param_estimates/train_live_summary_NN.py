@@ -1,3 +1,4 @@
+import argparse
 import inspect
 import itertools
 import json
@@ -86,6 +87,7 @@ def simulate_live_summary_dataset(
     seed,
     prior,
     n_acvf_ratios,
+    n_quantiles,
     compute_arima_coeff,
     out_dtype,
 ):
@@ -99,6 +101,7 @@ def simulate_live_summary_dataset(
         prior=prior,
         random_init=True,
         n_acvf_ratios=n_acvf_ratios,
+        n_quantiles=n_quantiles,
         compute_arima_coeff=compute_arima_coeff,
         k=KAPPA,
         eps=SUMMARY_EPS,
@@ -139,11 +142,11 @@ def train_live_summary_nn(
     patience=100,
     min_delta=1e-5,
     min_var=1e-12,
-    dropout=0.0,
     layer_norm=True,
     grad_clip_norm=None,
     deterministic_torch=True,
     n_acvf_ratios=4,
+    n_quantiles=5,
     compute_arima_coeff=True,
     n_workers=-2,
     out_dtype=np.float32,
@@ -177,12 +180,12 @@ def train_live_summary_nn(
         raise ValueError("min_delta must be non-negative.")
     if min_var <= 0:
         raise ValueError("min_var must be positive.")
-    if not 0.0 <= dropout < 1.0:
-        raise ValueError("dropout must be in [0, 1).")
     if grad_clip_norm is not None and grad_clip_norm <= 0:
         raise ValueError("grad_clip_norm must be positive or None.")
     if not isinstance(n_acvf_ratios, int) or n_acvf_ratios < 1:
         raise ValueError("n_acvf_ratios must be a positive integer.")
+    if not isinstance(n_quantiles, int) or n_quantiles < 1:
+        raise ValueError("n_quantiles must be a positive integer.")
 
     hidden_dims_shared_trunk = tuple(int(value) for value in hidden_dims_shared_trunk)
     hidden_dims_head = tuple(int(value) for value in hidden_dims_head)
@@ -219,6 +222,7 @@ def train_live_summary_nn(
 
     feature_names = sim.summary_stats_sv_feature_names(
         n_acvf_ratios=n_acvf_ratios,
+        n_quantiles=n_quantiles,
         compute_arima_coeff=compute_arima_coeff,
     )
     input_dim = len(feature_names)
@@ -244,7 +248,6 @@ def train_live_summary_nn(
         hidden_dims_head=hidden_dims_head,
         activation=activation,
         min_var=min_var,
-        dropout=dropout,
         layer_norm=layer_norm,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -254,6 +257,7 @@ def train_live_summary_nn(
         print("Prior:", prior)
         print("Sequence length:", sequence_length)
         print("Summary features:", input_dim)
+        print("Summary quantiles:", n_quantiles)
         print("Trainable parameters:", count_parameters(model))
         print("Train samples per validation:", train_size)
         print("Train batches per validation:", n_batches)
@@ -351,7 +355,6 @@ def train_live_summary_nn(
             "hidden_dims_head": hidden_dims_head,
             "activation": activation_name,
             "min_var": min_var,
-            "dropout": float(dropout),
             "layer_norm": bool(layer_norm),
 
             "z_mean": z_mean.astype(np.float32),
@@ -360,6 +363,7 @@ def train_live_summary_nn(
 
             "feature_names": feature_names,
             "n_acvf_ratios": n_acvf_ratios,
+            "n_quantiles": n_quantiles,
             "compute_arima_coeff": bool(compute_arima_coeff),
             "k": KAPPA,
             "eps": SUMMARY_EPS,
@@ -370,6 +374,7 @@ def train_live_summary_nn(
                 "prior": prior,
                 "random_init": True,
                 "n_acvf_ratios": n_acvf_ratios,
+                "n_quantiles": n_quantiles,
                 "compute_arima_coeff": bool(compute_arima_coeff),
                 "k": KAPPA,
                 "eps": SUMMARY_EPS,
@@ -437,11 +442,11 @@ def train_live_summary_nn(
             "hidden_dims_shared_trunk": hidden_dims_shared_trunk,
             "hidden_dims_head": hidden_dims_head,
             "activation": activation_name,
-            "dropout": float(dropout),
             "layer_norm": bool(layer_norm),
             "sequence_length": sequence_length,
             "prior": prior,
             "n_acvf_ratios": n_acvf_ratios,
+            "n_quantiles": n_quantiles,
             "compute_arima_coeff": bool(compute_arima_coeff),
             "fixed_validation": bool(fixed_validation),
             "seed": seed,
@@ -529,6 +534,7 @@ def train_live_summary_nn(
                 seed=fixed_validation_seed,
                 prior=prior,
                 n_acvf_ratios=n_acvf_ratios,
+                n_quantiles=n_quantiles,
                 compute_arima_coeff=compute_arima_coeff,
                 out_dtype=out_dtype,
             )
@@ -550,6 +556,7 @@ def train_live_summary_nn(
                 seed=train_seed,
                 prior=prior,
                 n_acvf_ratios=n_acvf_ratios,
+                n_quantiles=n_quantiles,
                 compute_arima_coeff=compute_arima_coeff,
                 out_dtype=out_dtype,
             )
@@ -621,6 +628,7 @@ def train_live_summary_nn(
                     seed=validation_seed,
                     prior=prior,
                     n_acvf_ratios=n_acvf_ratios,
+                    n_quantiles=n_quantiles,
                     compute_arima_coeff=compute_arima_coeff,
                     out_dtype=out_dtype,
                 )
@@ -703,10 +711,12 @@ def train_live_summary_nn(
         final_val_targets = fixed_val_targets
         final_validation_seed = fixed_validation_seed
     else:
+        # Keep the final holdout fixed across hyperparameter trials with the
+        # same seed, even when early stopping ends at different epochs.
         final_validation_seed = make_child_seed(
             seed,
             FINAL_VALIDATION_SEED_STREAM,
-            completed_epoch + 1,
+            0,
         )
         final_val_summaries, final_val_targets, generated_feature_names = (
             simulate_live_summary_dataset(
@@ -717,6 +727,7 @@ def train_live_summary_nn(
                 seed=final_validation_seed,
                 prior=prior,
                 n_acvf_ratios=n_acvf_ratios,
+                n_quantiles=n_quantiles,
                 compute_arima_coeff=compute_arima_coeff,
                 out_dtype=out_dtype,
             )
@@ -853,20 +864,91 @@ def unique_checkpoint_path(checkpoint_path):
     return candidate_path
 
 
+def write_json_atomic(value, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(_json_safe(value), indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, path)
+
+
+def load_json_file(path):
+    path = Path(path)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def search_config_record(search_space, common_config, max_trials, parameter_names):
+    return _json_safe(
+        {
+            "search_space": search_space,
+            "common_config": common_config,
+            "max_trials": max_trials,
+            "parameter_names": parameter_names,
+        }
+    )
+
+
+def validate_resume_search_config(config_path, requested_config):
+    stored_config = load_json_file(config_path)
+    keys_to_compare = ["search_space", "common_config", "max_trials"]
+    if "parameter_names" in stored_config:
+        keys_to_compare.append("parameter_names")
+
+    mismatches = [
+        key
+        for key in keys_to_compare
+        if stored_config.get(key) != requested_config.get(key)
+    ]
+    if mismatches:
+        raise ValueError(
+            "Cannot resume this hyperparameter search because the requested "
+            f"configuration differs from {config_path}: {mismatches}."
+        )
+
+
+def completed_trial_record_from_checkpoint(trial_index, trial_parameters, checkpoint_path):
+    checkpoint = torch_load_checkpoint(checkpoint_path, map_location="cpu")
+    return {
+        "trial": trial_index,
+        "status": "completed",
+        "parameters": _json_safe(trial_parameters),
+        "checkpoint_path": os.fspath(checkpoint_path),
+        "best_val_loss": float(checkpoint["best_val_loss"]),
+        "final_val_loss": float(checkpoint["final_val_loss"]),
+        "best_epoch": checkpoint["best_epoch"],
+        "trainable_parameters": checkpoint["trainable_parameters"],
+    }
+
+
+def latest_checkpoint_for_resume(checkpoint_path):
+    latest_checkpoint_path, _ = default_checkpoint_paths(checkpoint_path)
+    if os.path.isfile(latest_checkpoint_path):
+        return latest_checkpoint_path
+    return None
+
+
 def run_hyperparameter_search(
     search_space,
     common_config,
     output_dir="summary_nn_search",
     max_trials=None,
     fail_fast=False,
+    resume_search=False,
 ):
     """
-    Run a reproducible Cartesian grid search and save progress after each trial.
+    Run a reproducible Cartesian grid search and save progress as trials run.
 
     ``search_space`` maps argument names to candidate lists. ``common_config``
     contains shared ``train_live_summary_nn`` arguments. Keep one seed and use
-    fixed validation when comparing trials; evaluate the eventual winner on a
-    separate held-out simulation before reporting its final performance.
+    a comparable final holdout when comparing trials.
+
+    With ``resume_search=True``, ``output_dir`` must point at an existing search
+    directory containing ``search_config.json``. Completed trials are skipped,
+    a running trial is resumed from its ``.latest.pt`` checkpoint when present,
+    and unstarted trials continue afterward.
     """
     if not search_space:
         raise ValueError("search_space must contain at least one parameter.")
@@ -894,52 +976,141 @@ def run_hyperparameter_search(
             raise ValueError(f"search_space[{name!r}] must not be empty.")
         candidate_lists.append(candidates)
 
+    requested_config = search_config_record(
+        search_space=search_space,
+        common_config=common_config,
+        max_trials=max_trials,
+        parameter_names=parameter_names,
+    )
+
     combinations = itertools.product(*candidate_lists)
     if max_trials is not None:
         combinations = itertools.islice(combinations, max_trials)
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(output_dir).resolve()
     results_path = output_dir / "search_results.json"
     config_path = output_dir / "search_config.json"
-    config_path.write_text(
-        json.dumps(
-            _json_safe(
-                {
-                    "search_space": search_space,
-                    "common_config": common_config,
-                    "max_trials": max_trials,
-                    "fail_fast": fail_fast,
-                }
-            ),
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
     results = []
+
+    if resume_search:
+        if not output_dir.is_dir():
+            raise FileNotFoundError(
+                "Cannot resume search because the output directory does not exist: "
+                f"{output_dir}"
+            )
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                "Cannot resume search because search_config.json is missing: "
+                f"{config_path}"
+            )
+        validate_resume_search_config(config_path, requested_config)
+        if results_path.is_file():
+            results = load_json_file(results_path)
+            if not isinstance(results, list):
+                raise ValueError(f"{results_path} must contain a JSON list.")
+        print(f"Resuming hyperparameter search in {output_dir}")
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if results_path.exists():
+            raise FileExistsError(
+                "Refusing to start a new search in a directory with existing "
+                f"results. Use resume_search=True for {output_dir}."
+            )
+        write_json_atomic(requested_config, config_path)
+
+    results_by_trial = {
+        int(record["trial"]): record
+        for record in results
+        if "trial" in record
+    }
 
     for trial_index, values in enumerate(combinations, start=1):
         trial_parameters = dict(zip(parameter_names, values))
+        safe_trial_parameters = _json_safe(trial_parameters)
         trial_config = dict(common_config)
         trial_config.update(trial_parameters)
         checkpoint_stem = trial_checkpoint_stem(trial_index, trial_parameters)
-        trial_config["checkpoint_path"] = str(
-            unique_checkpoint_path(output_dir / f"{checkpoint_stem}.pt")
-        )
-        trial_config["resume_from"] = None
+        default_checkpoint_path = output_dir / f"{checkpoint_stem}.pt"
+
+        record = results_by_trial.get(trial_index)
+        if record is not None:
+            if record.get("parameters") != safe_trial_parameters:
+                raise ValueError(
+                    f"Trial {trial_index} in {results_path} has parameters "
+                    "that do not match the requested search grid."
+                )
+            checkpoint_path = Path(record["checkpoint_path"])
+        elif resume_search and checkpoint_family_exists(default_checkpoint_path):
+            if default_checkpoint_path.is_file():
+                record = completed_trial_record_from_checkpoint(
+                    trial_index,
+                    trial_parameters,
+                    default_checkpoint_path,
+                )
+            else:
+                record = {
+                    "trial": trial_index,
+                    "status": "running",
+                    "parameters": safe_trial_parameters,
+                    "checkpoint_path": os.fspath(default_checkpoint_path),
+                }
+            results.append(record)
+            results_by_trial[trial_index] = record
+            write_json_atomic(results, results_path)
+            checkpoint_path = Path(record["checkpoint_path"])
+        else:
+            checkpoint_path = (
+                default_checkpoint_path
+                if resume_search
+                else unique_checkpoint_path(default_checkpoint_path)
+            )
+            record = {
+                "trial": trial_index,
+                "status": "running",
+                "parameters": safe_trial_parameters,
+                "checkpoint_path": os.fspath(checkpoint_path),
+            }
+            results.append(record)
+            results_by_trial[trial_index] = record
+            write_json_atomic(results, results_path)
+
+        checkpoint_path = Path(record["checkpoint_path"])
+        if checkpoint_path.is_file() and record.get("status") != "completed":
+            record.update(
+                completed_trial_record_from_checkpoint(
+                    trial_index,
+                    trial_parameters,
+                    checkpoint_path,
+                )
+            )
+            write_json_atomic(results, results_path)
+
+        if record["status"] == "completed":
+            if trial_config.get("verbose", True):
+                print(f"Skipping completed hyperparameter trial {trial_index}")
+            continue
+
+        if record["status"] == "failed":
+            if trial_config.get("verbose", True):
+                print(f"Skipping failed hyperparameter trial {trial_index}")
+            continue
+
+        if record["status"] != "running":
+            raise ValueError(
+                f"Trial {trial_index} has unsupported status: {record['status']!r}"
+            )
+
+        resume_from = latest_checkpoint_for_resume(checkpoint_path)
+        trial_config["checkpoint_path"] = os.fspath(checkpoint_path)
+        trial_config["resume_from"] = resume_from
 
         if trial_config.get("verbose", True):
             print()
-            print(f"Starting hyperparameter trial {trial_index}")
-            print("Parameters:", _json_safe(trial_parameters))
-
-        record = {
-            "trial": trial_index,
-            "status": "running",
-            "parameters": _json_safe(trial_parameters),
-            "checkpoint_path": trial_config["checkpoint_path"],
-        }
-        results.append(record)
+            action = "Resuming" if resume_from is not None else "Starting"
+            print(f"{action} hyperparameter trial {trial_index}")
+            print("Parameters:", safe_trial_parameters)
+            if resume_from is not None:
+                print(f"Resume checkpoint: {resume_from}")
 
         try:
             _, checkpoint = train_live_summary_nn(**trial_config)
@@ -956,16 +1127,10 @@ def run_hyperparameter_search(
                 error=f"{type(error).__name__}: {error}",
             )
             if fail_fast:
-                results_path.write_text(
-                    json.dumps(_json_safe(results), indent=2),
-                    encoding="utf-8",
-                )
+                write_json_atomic(results, results_path)
                 raise
 
-        results_path.write_text(
-            json.dumps(_json_safe(results), indent=2),
-            encoding="utf-8",
-        )
+        write_json_atomic(results, results_path)
 
     completed_results = [
         record for record in results if record["status"] == "completed"
@@ -981,7 +1146,7 @@ def run_hyperparameter_search(
     return completed_results
 
 
-def main():
+def default_hyperparameter_search_setup():
     common_config = {
         "sequence_length": 253,
         "prior": "default",
@@ -989,33 +1154,83 @@ def main():
         "batch_size": 1024,
         "n_batches": 10,
         "val_size": 20_000,
-        "fixed_validation": True,
+        "fixed_validation": False,
+        "n_quantiles": 19,
+        "compute_arima_coeff": False,
         "n_epochs": 2000,
-        "patience": 75,
+        "patience": 100,
         "min_delta": 1e-5,
         "layer_norm": True,
-        "n_workers": -4,
+        "n_workers": -2,
         "verbose": True,
+        "lr": 5e-4,
     }
 
     search_space = {
-        "lr": [3e-4, 5e-4, 8e-4],
-        "hidden_dims_shared_trunk": [(128, 64), (256, 128)],
-        "hidden_dims_head": [(32, 32), (64, 32)],
-        "dropout": [0.0, 0.05],
+        "hidden_dims_shared_trunk": [(64, 32), (128, 64), (256, 128)],
+        "hidden_dims_head": [(16, 16), (32, 32), (64, 64)],
     }
 
-    output_dir = make_unique_search_output_dir(
-        base_dir=Path(__file__).resolve().parent / "summary_nn_search",
-        run_label="three_param_default",
+    return common_config, search_space
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Run or resume the live summary-NN hyperparameter search."
     )
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for a new search. Defaults to a timestamped search folder.",
+    )
+    output_group.add_argument(
+        "--resume-search",
+        type=Path,
+        default=None,
+        help="Existing search output directory to resume.",
+    )
+    parser.add_argument(
+        "--max-trials",
+        type=int,
+        default=None,
+        help="Optional limit on Cartesian-grid trials.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    common_config, search_space = default_hyperparameter_search_setup()
+
+    if args.resume_search is not None:
+        output_dir = args.resume_search
+        resume_search = True
+
+        if args.max_trials is None:
+            config_path = output_dir / "search_config.json"
+            if config_path.is_file():
+                args.max_trials = load_json_file(config_path).get("max_trials")
+    elif args.output_dir is not None:
+        output_dir = args.output_dir
+        resume_search = False
+    else:
+        output_dir = make_unique_search_output_dir(
+            base_dir=Path(__file__).resolve().parent / "summary_nn_search",
+            run_label="three_param_default_no_arma_q19",
+        )
+        resume_search = False
+
     print(f"Saving hyperparameter-search outputs to {output_dir}")
 
     run_hyperparameter_search(
         search_space=search_space,
         common_config=common_config,
         output_dir=output_dir,
+        max_trials=args.max_trials,
         fail_fast=False,
+        resume_search=resume_search,
     )
 
 
