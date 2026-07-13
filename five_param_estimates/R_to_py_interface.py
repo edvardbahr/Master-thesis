@@ -16,12 +16,11 @@ import sim_5_param_data as sim
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvol_MCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
-DEFAULT_TRANSFORMED_PARAMETER_NAMES = ("mu", "psi", "log_s")
-
+#Important: if transformed name is identical to original name, it will be skipped in summary
+DEFAULT_TRANSFORMED_PARAMETER_NAMES = ("mu", "psi", "log_s") 
 
 def identity_transform(x):
     return x
-
 
 def psi_transform(phi, eps=1e-6):
     phi = np.clip(np.asarray(phi, dtype=np.float64), -1.0 + eps, 1.0 - eps)
@@ -143,7 +142,50 @@ def normalize_transforms(transform, transformed_parameter_names):
     return transforms, transformed_parameter_names
 
 
-def summarize_values(values, alpha):
+def estimate_ess_fft(values: np.ndarray) -> float:
+    """Estimate MCMC effective sample size using paired autocorrelations."""
+    x = np.asarray(values, dtype=float).ravel()
+    n = x.size
+
+    if n < 3:
+        return float(n)
+
+    x = x - np.mean(x)
+    variance = np.dot(x, x) / n
+
+    if not np.isfinite(variance) or variance <= 0:
+        return np.nan
+
+    # FFT-based autocovariance calculation: O(n log n).
+    fft_length = 1 << (2 * n - 1).bit_length()
+    fft_values = np.fft.rfft(x, n=fft_length)
+    autocovariance = np.fft.irfft(
+        fft_values * np.conjugate(fft_values),
+        n=fft_length,
+    )[:n]
+
+    # Biased normalization is generally more stable for ESS estimation.
+    autocorrelation = autocovariance / autocovariance[0]
+
+    # Geyer's initial positive sequence:
+    # sum autocorrelations in adjacent pairs and stop when a pair is nonpositive.
+    paired_sums = []
+    for lag in range(1, n - 1, 2):
+        pair_sum = autocorrelation[lag] + autocorrelation[lag + 1]
+
+        if not np.isfinite(pair_sum) or pair_sum <= 0:
+            break
+
+        paired_sums.append(pair_sum)
+
+    integrated_autocorrelation_time = (
+        1.0 + 2.0 * np.sum(paired_sums)
+    )
+
+    return n / integrated_autocorrelation_time
+
+
+def summarize_values(values, alpha, estimate_ess=False):
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
 
@@ -155,7 +197,9 @@ def summarize_values(values, alpha):
             "median": np.nan,
             "ci_lower": np.nan,
             "ci_upper": np.nan,
+            "ESS": np.nan,
         }
+
 
     return {
         "mean": float(np.mean(values)),
@@ -164,11 +208,12 @@ def summarize_values(values, alpha):
         "median": float(np.median(values)),
         "ci_lower": float(np.quantile(values, alpha / 2.0)),
         "ci_upper": float(np.quantile(values, 1.0 - alpha / 2.0)),
+        "ESS": estimate_ess_fft(values) if estimate_ess else np.nan,
     }
 
 
-def add_summary_columns(row, prefix, values, alpha):
-    summary = summarize_values(values, alpha)
+def add_summary_columns(row, prefix, values, alpha, estimate_ess=False):
+    summary = summarize_values(values, alpha, estimate_ess=estimate_ess)
 
     for statistic_name, statistic_value in summary.items():
         row[f"{prefix}_{statistic_name}"] = statistic_value
@@ -177,6 +222,7 @@ def add_summary_columns(row, prefix, values, alpha):
 def summarize_parameter_draws(
     parameter_draws,
     alpha=0.05,
+    estimate_ess=False,
     transform=DEFAULT_TRANSFORMS,
     transformed_parameter_names=DEFAULT_TRANSFORMED_PARAMETER_NAMES,
 ):
@@ -205,7 +251,7 @@ def summarize_parameter_draws(
 
         for parameter in PARAMETER_NAMES:
             values = group[parameter].to_numpy(dtype=np.float64)
-            add_summary_columns(row, parameter, values, alpha)
+            add_summary_columns(row, parameter, values, alpha, estimate_ess=estimate_ess)
 
         if transforms is not None:
             for parameter, transformed_name, transform_fn in zip(
@@ -213,13 +259,17 @@ def summarize_parameter_draws(
                 transformed_parameter_names,
                 transforms,
             ):
+                if transformed_name in PARAMETER_NAMES:
+                    continue
+                
                 values = group[parameter].to_numpy(dtype=np.float64)
                 transformed_values = transform_fn(values)
                 add_summary_columns(
                     row,
-                    f"transformed_{transformed_name}",
+                    transformed_name,
                     transformed_values,
                     alpha,
+                    estimate_ess=estimate_ess
                 )
 
         rows.append(row)
@@ -316,6 +366,7 @@ def run_and_summarize_chunk(
     burnin,
     thinpara,
     alpha,
+    estimate_ess,
     transform,
     transformed_parameter_names,
     return_draws,
@@ -334,6 +385,7 @@ def run_and_summarize_chunk(
     summary = summarize_parameter_draws(
         parameter_draws=parameter_draws,
         alpha=alpha,
+        estimate_ess=estimate_ess,
         transform=transform,
         transformed_parameter_names=transformed_parameter_names,
     )
@@ -351,6 +403,7 @@ def run_stochvol_mcmc(
     burnin=500,
     thinpara=1,
     alpha=0.05,
+    estimate_ess=False,
     transform=DEFAULT_TRANSFORMS,
     transformed_parameter_names=DEFAULT_TRANSFORMED_PARAMETER_NAMES,
     max_cores=1,
@@ -409,6 +462,7 @@ def run_stochvol_mcmc(
                     burnin=burnin,
                     thinpara=thinpara,
                     alpha=alpha,
+                    estimate_ess=estimate_ess,
                     transform=transforms,
                     transformed_parameter_names=transformed_parameter_names,
                     return_draws=return_draws,
@@ -431,6 +485,7 @@ def run_stochvol_mcmc(
                         burnin=burnin,
                         thinpara=thinpara,
                         alpha=alpha,
+                        estimate_ess=estimate_ess,
                         transform=transforms,
                         transformed_parameter_names=transformed_parameter_names,
                         return_draws=return_draws,
@@ -573,12 +628,12 @@ def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
     return output_path
 
 
-def main():
+def main0():
     mu = np.array([-9.0])
     phi = np.array([0.98])
     s = np.array([0.20])
-    r = np.array([0.50])
-    nu = np.array([15.0])
+    r = np.array([0.0])
+    nu = np.array([np.inf])
 
     rng = np.random.default_rng(seed=1)
     simulated_data = sim.simulate_sv_chunk(
@@ -587,28 +642,19 @@ def main():
         s=s,
         r=r,
         nu=nu,
-        n=253 * 2,
+        n=253,
         rng=rng,
-    )[0]
+    )
 
-    summary, draws = run_stochvol_mcmc(
+    _, draws = run_stochvol_mcmc(
         simulated_data,
         draws=2000,
         burnin=500,
         thinpara=1,
+        alpha=0.05,
+        estimate_ess=True,
         max_cores=1,
         return_draws=True,
-    )
-
-    print(summary[["mu_mean", "phi_mean", "sigma_mean"]])
-    print(
-        summary[
-            [
-                "transformed_mu_mean",
-                "transformed_psi_mean",
-                "transformed_log_s_mean",
-            ]
-        ]
     )
 
     true_values = {
@@ -638,5 +684,155 @@ def main():
     print(f"Saved histogram plot to {hist_path}")
 
 
+
+def main1():
+
+
+
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 11,
+            "axes.titlesize": 12,
+            "axes.labelsize": 11,
+            "legend.fontsize": 9,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "axes.linewidth": 0.8,
+            "lines.linewidth": 1.4,
+        }
+    )
+
+    colors = (
+        "#0000ff",
+        "#008000",
+        "#ff0000",
+        "#00bfbf",
+        "#bf00bf",
+        "#bfbf00",
+    )
+
+    
+    N = 2000
+    multiplier = 1.0
+    draws = 6000
+    burnin = 500
+    alpha = 0.05
+
+    priors = ("default", "finance")
+    ess_columns = ["mu_ESS", "phi_ESS", "sigma_ESS", "psi_ESS", "log_s_ESS"]
+    param_labels = np.array(
+        [r"$\mu$", r"$\phi$", r"$\sigma$", r"$\psi$", r"$\log s$"]
+    )
+
+    rng = np.random.default_rng(seed=2)
+    results = {}
+
+    for prior in priors:
+        sv_params = sim.sample_stochvol_prior(
+            N,
+            prior=prior,
+            fixed_r=0.0,
+            fixed_nu=np.inf,
+            rng=rng,
+        )
+
+        sv_chunk = sim.simulate_sv_chunk(
+            *sv_params,
+            n=int(np.floor(253 * multiplier)),
+            rng=rng,
+        )
+
+        summary = run_stochvol_mcmc(
+            y=sv_chunk,
+            draws=draws,
+            burnin=burnin,
+            thinpara=1,
+            alpha=alpha,
+            estimate_ess=True,
+            max_cores=-2,
+            return_draws=False,
+            prior=prior,
+        )
+
+        ess_values = summary[ess_columns].to_numpy()
+
+        worst_idx = np.argmin(ess_values, axis=1)
+        min_ess = ess_values[np.arange(N), worst_idx]
+
+        worst_param_ratio = (
+            pd.Series(param_labels[worst_idx])
+            .value_counts(normalize=True)
+            .reindex(param_labels, fill_value=0)
+        )
+
+        results[prior] = {
+            "min_ess": min_ess,
+            "lower_bound": np.quantile(min_ess, alpha),
+            "param_ratio": worst_param_ratio,
+        }
+
+        print(f"\n{prior.capitalize()} prior")
+        print(f"Mean minimum ESS: {min_ess.mean():.2f}")
+        print(f"{100 * alpha:.0f}% ESS quantile: {results[prior]['lower_bound']:.2f}")
+        print("Ratio of runs with lowest ESS:")
+        print(worst_param_ratio)
+
+
+    # Common bin edges make the histograms directly comparable
+    all_min_ess = np.concatenate(
+        [results[prior]["min_ess"] for prior in priors]
+    )
+    bins = np.histogram_bin_edges(all_min_ess, bins="fd")
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(11.5, 5.2),
+        sharex=True,
+        sharey=True,
+    )
+
+    for i, (ax, prior) in enumerate(zip(axes, priors)):
+        min_ess = results[prior]["min_ess"]
+        lower_bound = results[prior]["lower_bound"]
+
+        ax.set_axisbelow(True)
+        ax.grid(
+            axis="y",
+            linestyle=":",
+            linewidth=0.8,
+        )
+
+        ax.hist(
+            min_ess,
+            bins=bins,
+            color=colors[i],
+            edgecolor="white",
+            linewidth=0.8,
+        )
+
+        ax.axvline(
+            lower_bound,
+            color=colors[2],
+            linestyle="--",
+            linewidth=2,
+            label=rf"{100 * alpha:.0f}% quantile = {lower_bound:.1f}",
+        )
+
+        ax.set_title(f"{prior.capitalize()} prior")
+        ax.set_xlabel("Minimum effective sample size")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(frameon=False)
+
+    axes[0].set_ylabel("Number of MCMC runs")
+
+    fig.tight_layout()
+    fig.savefig("minimum_ess_histograms.pdf", bbox_inches="tight")
+    plt.show()
+
+
+
+
 if __name__ == "__main__":
-    main()
+    main1()

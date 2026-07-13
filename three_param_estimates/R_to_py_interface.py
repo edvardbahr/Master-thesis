@@ -239,6 +239,24 @@ def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
 
 
 def main():
+
+
+
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 11,
+            "axes.titlesize": 12,
+            "axes.labelsize": 11,
+            "legend.fontsize": 9,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "axes.linewidth": 0.8,
+            "lines.linewidth": 1.4,
+        }
+    )
+
+
     mu = [-2.0]
     phi = [0.5]
     sigma = [0.5]
@@ -249,8 +267,8 @@ def main():
 
     summary, draws = run_stochvol_mcmc(
         simulated_data,
-        draws=300,
-        burnin=0,
+        draws=2000,
+        burnin=500,
         thinpara=1,
         return_draws=True,
         prior = "default",
