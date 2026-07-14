@@ -634,12 +634,12 @@ def main0():
     plt.rcParams.update(
         {
             "font.family": "serif",
-            "font.size": 14,
-            "axes.titlesize": 16,
-            "axes.labelsize": 14,
-            "legend.fontsize": 13,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
+            "font.size": 15,
+            "axes.titlesize": 17,
+            "axes.labelsize": 15,
+            "legend.fontsize": 14,
+            "xtick.labelsize": 13,
+            "ytick.labelsize": 13,
             "axes.linewidth": 0.8,
             "lines.linewidth": 1.4,
         }
@@ -669,7 +669,7 @@ def main0():
     parameter_labels = (
         r"$\mu$",
         r"$\psi = 2\operatorname{atanh}(\phi)$",
-        r"$\rho = \log(\sigma^2)$",
+        r"$\rho = \log(\sigma)$",
     )
 
     prior_specs = {
@@ -720,7 +720,7 @@ def main0():
             df=1,
             size=draws,
         )
-        rho = np.log(sigma2)
+        rho = np.log(sigma2)/2.0
 
         return pd.DataFrame(
             {
