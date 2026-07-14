@@ -29,7 +29,7 @@ def psi_transform(phi, eps=1e-6):
 
 def log_positive_transform(x, eps=1e-12):
     x = np.clip(np.asarray(x, dtype=np.float64), eps, None)
-    return np.log(x)
+    return  np.log(x)
 
 
 DEFAULT_TRANSFORMS = (
@@ -629,59 +629,262 @@ def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
 
 
 def main0():
-    mu = np.array([-9.0])
-    phi = np.array([0.98])
-    s = np.array([0.20])
-    r = np.array([0.0])
-    nu = np.array([np.inf])
+    from scipy import stats
 
-    rng = np.random.default_rng(seed=1)
-    simulated_data = sim.simulate_sv_chunk(
-        mu=mu,
-        phi=phi,
-        s=s,
-        r=r,
-        nu=nu,
-        n=253,
-        rng=rng,
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 14,
+            "axes.titlesize": 16,
+            "axes.labelsize": 14,
+            "legend.fontsize": 13,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "axes.linewidth": 0.8,
+            "lines.linewidth": 1.4,
+        }
     )
 
-    _, draws = run_stochvol_mcmc(
-        simulated_data,
-        draws=2000,
-        burnin=500,
-        thinpara=1,
-        alpha=0.05,
-        estimate_ess=True,
-        max_cores=1,
-        return_draws=True,
+    colors = (
+        "#0000ff",
+        "#008000",
+        "#ff0000",
+        "#00bfbf",
+        "#bf00bf",
+        "#bfbf00",
     )
 
-    true_values = {
-        "mu": mu[0],
-        "phi": phi[0],
-        "sigma": s[0],
+
+    
+
+    draws = 6000
+    burnin = 500
+    alpha = 0.05
+
+    n_short = 253
+    n_long = 4 * n_short
+
+    priors = ("default", "finance")
+    parameter_names = ("mu", "psi", "log_s")
+    parameter_labels = (
+        r"$\mu$",
+        r"$\psi = 2\operatorname{atanh}(\phi)$",
+        r"$\rho = \log(\sigma^2)$",
+    )
+
+    prior_specs = {
+        "default": {
+            "mu": (0.0, 10.0),
+            "beta": (5.0, 1.5),
+        },
+        "finance": {
+            "mu": (-9.0, 1.0),
+            "beta": (20.0, 1.5),
+        },
+    }
+    qq_colors = {
+    "default": (
+        "#9ecae1",  # n = 0
+        "#4292c6",  # n = 253
+        "#08519c",  # n = 1012
+    ),
+    "finance": (
+        "#a1d99b",  # n = 0
+        "#41ab5d",  # n = 253
+        "#006d2c",  # n = 1012
+    ),
     }
 
-    traceplot_path = plot_parameter_trace(
-        draws,
-        output_path=HERE / "recovered_plots" / "stochvol_traceplot.png",
-        true_values=true_values,
-    )
-    print(f"Saved traceplot to {traceplot_path}")
 
-    hist_path = plot_parameter_histograms_with_normal(
-        draws,
-        output_path=HERE / "recovered_plots" / "stochvol_hist_normal_overlay_transformed.png",
-        true_values=true_values,
-        parameters=PARAMETER_NAMES,
-        bins=50,
-        transformations={
-            "phi": psi_transform,
-            "sigma": log_positive_transform,
-        },
+    rng = np.random.default_rng(seed=2)
+    chains = {}
+
+    def sample_transformed_prior(prior):
+        spec = prior_specs[prior]
+
+        mu = rng.normal(
+            loc=spec["mu"][0],
+            scale=spec["mu"][1],
+            size=draws,
+        )
+
+        u = rng.beta(
+            *spec["beta"],
+            size=draws,
+        )
+
+        phi = 2.0 * u - 1.0
+        psi = 2.0 * np.arctanh(phi)
+
+        sigma2 = rng.chisquare(
+            df=1,
+            size=draws,
+        )
+        rho = np.log(sigma2)
+
+        return pd.DataFrame(
+            {
+                "mu": mu,
+                "psi": psi,
+                "log_s": rho,
+            }
+        )
+
+    def add_transformed_parameters(param_chains):
+        for parameter, transformed_name, transform_fn in zip(
+            PARAMETER_NAMES,
+            DEFAULT_TRANSFORMED_PARAMETER_NAMES,
+            DEFAULT_TRANSFORMS,
+        ):
+            if transformed_name not in param_chains.columns:
+                param_chains[transformed_name] = transform_fn(
+                    param_chains[parameter]
+                )
+
+        return param_chains
+
+    for prior in priors:
+        chains[prior] = {
+            0: sample_transformed_prior(prior)
+        }
+
+        sv_params = sim.sample_stochvol_prior(
+            1,
+            prior=prior,
+            fixed_r=0.0,
+            fixed_nu=np.inf,
+            rng=rng,
+        )
+
+        # Simulate the longest series once.
+        y_full = sim.simulate_sv_chunk(
+            *sv_params,
+            n=n_long,
+            rng=rng,
+        )
+
+        for n in (n_short, n_long):
+            _, param_chains = run_stochvol_mcmc(
+                y=y_full[..., :n],
+                draws=draws,
+                burnin=burnin,
+                thinpara=1,
+                alpha=alpha,
+                estimate_ess=False,
+                max_cores=-2,
+                return_draws=True,
+                prior=prior,
+            )
+
+            param_chains = add_transformed_parameters(
+                param_chains
+            )
+
+            chains[prior][n] = param_chains[
+                list(parameter_names)
+            ]
+
+    # Common plotting probabilities ensure vertically aligned QQ points.
+    qq_points = 500
+    probabilities = (
+        np.arange(1, qq_points + 1) - 0.5
+    ) / qq_points
+    theoretical_quantiles = stats.norm.ppf(probabilities)
+
+    sample_sizes = (
+        (0, r"$n=0$"),
+        (n_short, rf"$n={n_short}$"),
+        (n_long, rf"$n={n_long}$"),
     )
-    print(f"Saved histogram plot to {hist_path}")
+
+    fig, axes = plt.subplots(
+        3,
+        2,
+        figsize=(11.5, 13.0),
+        sharex=True,
+        sharey=True,
+    )
+
+    for column, prior in enumerate(priors):
+        color = colors[column]
+
+        for row, (parameter, parameter_label) in enumerate(
+            zip(parameter_names, parameter_labels)
+        ):
+            ax = axes[row, column]
+
+            ax.plot(
+                theoretical_quantiles,
+                theoretical_quantiles,
+                color="black",
+                linestyle="--",
+                linewidth=1.4,
+                label="Gaussian reference",
+                zorder=1,
+            )
+
+            for curve_idx, (n, sample_label) in enumerate(sample_sizes):
+                values = chains[prior][n][parameter].to_numpy()
+
+                standardized_values = (
+                    values - values.mean()
+                ) / values.std(ddof=1)
+
+                empirical_quantiles = np.quantile(
+                    standardized_values,
+                    probabilities,
+                )
+
+                ax.scatter(
+                    theoretical_quantiles,
+                    empirical_quantiles,
+                    color=qq_colors[prior][curve_idx],
+                    s=16,
+                    alpha=0.85,
+                    edgecolors="none",
+                    label=sample_label,
+                    rasterized=True,
+                    zorder=2 + curve_idx,
+                )
+
+            ax.set_axisbelow(True)
+            ax.grid(
+                linestyle=":",
+                linewidth=0.8,
+            )
+            ax.spines[["top", "right"]].set_visible(False)
+
+            if row == 0:
+                ax.set_title(f"{prior.capitalize()} prior")
+                ax.legend(frameon=False)
+
+            if row == 2:
+                ax.set_xlabel(
+                    "Theoretical standard-normal quantiles"
+                )
+
+            if column == 0:
+                ax.set_ylabel(
+                    f"{parameter_label}\n"
+                    "Empirical quantiles"
+                )
+
+    fig.tight_layout()
+
+    fig.savefig(
+        "bernstein_von_mises_qq_plots.pdf",
+        bbox_inches="tight",
+    )
+    fig.savefig(
+        "bernstein_von_mises_qq_plots.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.show()
+
+
+
 
 
 
@@ -692,17 +895,16 @@ def main1():
     plt.rcParams.update(
         {
             "font.family": "serif",
-            "font.size": 11,
-            "axes.titlesize": 12,
-            "axes.labelsize": 11,
-            "legend.fontsize": 9,
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 10,
+            "font.size": 14,
+            "axes.titlesize": 16,
+            "axes.labelsize": 14,
+            "legend.fontsize": 13,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
             "axes.linewidth": 0.8,
             "lines.linewidth": 1.4,
         }
     )
-
     colors = (
         "#0000ff",
         "#008000",
@@ -835,4 +1037,4 @@ def main1():
 
 
 if __name__ == "__main__":
-    main1()
+    main0()
