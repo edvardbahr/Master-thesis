@@ -1,9 +1,5 @@
 import argparse
-import inspect
-import itertools
-import json
 import os
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -128,7 +124,7 @@ def train_live_summary_nn(
     sequence_length,
     prior="default",
     hidden_dims_shared_trunk=(128, 64),
-    hidden_dims_head=(32, 32),
+    hidden_dims_head=(16, 16),
     activation=nn.ReLU,
     checkpoint_path="sv_posterior_summary_nn_live.pt",
     resume_from=None,
@@ -711,8 +707,7 @@ def train_live_summary_nn(
         final_val_targets = fixed_val_targets
         final_validation_seed = fixed_validation_seed
     else:
-        # Keep the final holdout fixed across hyperparameter trials with the
-        # same seed, even when early stopping ends at different epochs.
+        # Keep the final holdout independent of the early-stopping epoch.
         final_validation_seed = make_child_seed(
             seed,
             FINAL_VALIDATION_SEED_STREAM,
@@ -768,469 +763,45 @@ def train_live_summary_nn(
     return model, checkpoint
 
 
-def _json_safe(value):
-    if isinstance(value, type) and issubclass(value, nn.Module):
-        return value.__name__
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.dtype):
-        return str(value)
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, tuple):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, list):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    return value
-
-
-def _filename_safe(value, max_length=60):
-    text = str(_json_safe(value))
-    replacements = {
-        " ": "",
-        "'": "",
-        '"': "",
-        "(": "",
-        ")": "",
-        "[": "",
-        "]": "",
-        "{": "",
-        "}": "",
-        ":": "-",
-        ",": "-",
-        "/": "-",
-        "\\": "-",
-        ".": "p",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    safe_text = "".join(
-        character if character.isalnum() or character in "-_=" else "-"
-        for character in text
-    ).strip("-_")
-    return safe_text[:max_length]
-
-
-def make_unique_search_output_dir(
-    base_dir="summary_nn_search",
-    run_label="live_summary_nn",
-):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_label = _filename_safe(run_label)
-    directory_name = f"{safe_label}_{timestamp}" if safe_label else timestamp
-    output_dir = Path(base_dir) / directory_name
-
-    counter = 2
-    while output_dir.exists():
-        output_dir = Path(base_dir) / f"{directory_name}_{counter:02d}"
-        counter += 1
-
-    return output_dir
-
-
-def trial_checkpoint_stem(trial_index, trial_parameters):
-    parts = [f"trial_{trial_index:03d}"]
-    for name, value in trial_parameters.items():
-        parts.append(f"{_filename_safe(name, 24)}-{_filename_safe(value, 48)}")
-    return "_".join(part for part in parts if part)
-
-
-def checkpoint_family_exists(checkpoint_path):
-    latest_checkpoint_path, best_checkpoint_path = default_checkpoint_paths(
-        os.fspath(checkpoint_path)
-    )
-    return any(
-        os.path.exists(path)
-        for path in (checkpoint_path, latest_checkpoint_path, best_checkpoint_path)
-    )
-
-
-def unique_checkpoint_path(checkpoint_path):
-    checkpoint_path = Path(checkpoint_path)
-    if checkpoint_path.suffix == "":
-        checkpoint_path = checkpoint_path.with_suffix(".pt")
-
-    candidate_path = checkpoint_path
-    counter = 2
-    while checkpoint_family_exists(candidate_path):
-        candidate_path = checkpoint_path.with_name(
-            f"{checkpoint_path.stem}_{counter:02d}{checkpoint_path.suffix}"
-        )
-        counter += 1
-
-    return candidate_path
-
-
-def write_json_atomic(value, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f"{path.name}.tmp")
-    temporary_path.write_text(
-        json.dumps(_json_safe(value), indent=2),
-        encoding="utf-8",
-    )
-    os.replace(temporary_path, path)
-
-
-def load_json_file(path):
-    path = Path(path)
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def search_config_record(search_space, common_config, max_trials, parameter_names):
-    return _json_safe(
-        {
-            "search_space": search_space,
-            "common_config": common_config,
-            "max_trials": max_trials,
-            "parameter_names": parameter_names,
-        }
-    )
-
-
-def validate_resume_search_config(config_path, requested_config):
-    stored_config = load_json_file(config_path)
-    keys_to_compare = ["search_space", "common_config", "max_trials"]
-    if "parameter_names" in stored_config:
-        keys_to_compare.append("parameter_names")
-
-    mismatches = [
-        key
-        for key in keys_to_compare
-        if stored_config.get(key) != requested_config.get(key)
-    ]
-    if mismatches:
-        raise ValueError(
-            "Cannot resume this hyperparameter search because the requested "
-            f"configuration differs from {config_path}: {mismatches}."
-        )
-
-
-def completed_trial_record_from_checkpoint(trial_index, trial_parameters, checkpoint_path):
-    checkpoint = torch_load_checkpoint(checkpoint_path, map_location="cpu")
-    return {
-        "trial": trial_index,
-        "status": "completed",
-        "parameters": _json_safe(trial_parameters),
-        "checkpoint_path": os.fspath(checkpoint_path),
-        "best_val_loss": float(checkpoint["best_val_loss"]),
-        "final_val_loss": float(checkpoint["final_val_loss"]),
-        "best_epoch": checkpoint["best_epoch"],
-        "trainable_parameters": checkpoint["trainable_parameters"],
-    }
-
-
-def latest_checkpoint_for_resume(checkpoint_path):
-    latest_checkpoint_path, _ = default_checkpoint_paths(checkpoint_path)
-    if os.path.isfile(latest_checkpoint_path):
-        return latest_checkpoint_path
-    return None
-
-
-def run_hyperparameter_search(
-    search_space,
-    common_config,
-    output_dir="summary_nn_search",
-    max_trials=None,
-    fail_fast=False,
-    resume_search=False,
-):
-    """
-    Run a reproducible Cartesian grid search and save progress as trials run.
-
-    ``search_space`` maps argument names to candidate lists. ``common_config``
-    contains shared ``train_live_summary_nn`` arguments. Keep one seed and use
-    a comparable final holdout when comparing trials.
-
-    With ``resume_search=True``, ``output_dir`` must point at an existing search
-    directory containing ``search_config.json``. Completed trials are skipped,
-    a running trial is resumed from its ``.latest.pt`` checkpoint when present,
-    and unstarted trials continue afterward.
-    """
-    if not search_space:
-        raise ValueError("search_space must contain at least one parameter.")
-
-    valid_parameters = set(inspect.signature(train_live_summary_nn).parameters)
-    unknown_parameters = (set(search_space) | set(common_config)) - valid_parameters
-    if unknown_parameters:
-        raise ValueError(
-            "Unknown train_live_summary_nn argument(s): "
-            f"{sorted(unknown_parameters)}"
-        )
-
-    if "checkpoint_path" in search_space or "resume_from" in search_space:
-        raise ValueError("checkpoint_path and resume_from cannot be search dimensions.")
-    if common_config.get("resume_from") is not None:
-        raise ValueError("Hyperparameter-search trials cannot resume a training run.")
-    if max_trials is not None and max_trials < 1:
-        raise ValueError("max_trials must be positive or None.")
-
-    parameter_names = list(search_space)
-    candidate_lists = []
-    for name in parameter_names:
-        candidates = list(search_space[name])
-        if not candidates:
-            raise ValueError(f"search_space[{name!r}] must not be empty.")
-        candidate_lists.append(candidates)
-
-    requested_config = search_config_record(
-        search_space=search_space,
-        common_config=common_config,
-        max_trials=max_trials,
-        parameter_names=parameter_names,
-    )
-
-    combinations = itertools.product(*candidate_lists)
-    if max_trials is not None:
-        combinations = itertools.islice(combinations, max_trials)
-
-    output_dir = Path(output_dir).resolve()
-    results_path = output_dir / "search_results.json"
-    config_path = output_dir / "search_config.json"
-    results = []
-
-    if resume_search:
-        if not output_dir.is_dir():
-            raise FileNotFoundError(
-                "Cannot resume search because the output directory does not exist: "
-                f"{output_dir}"
-            )
-        if not config_path.is_file():
-            raise FileNotFoundError(
-                "Cannot resume search because search_config.json is missing: "
-                f"{config_path}"
-            )
-        validate_resume_search_config(config_path, requested_config)
-        if results_path.is_file():
-            results = load_json_file(results_path)
-            if not isinstance(results, list):
-                raise ValueError(f"{results_path} must contain a JSON list.")
-        print(f"Resuming hyperparameter search in {output_dir}")
-    else:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if results_path.exists():
-            raise FileExistsError(
-                "Refusing to start a new search in a directory with existing "
-                f"results. Use resume_search=True for {output_dir}."
-            )
-        write_json_atomic(requested_config, config_path)
-
-    results_by_trial = {
-        int(record["trial"]): record
-        for record in results
-        if "trial" in record
-    }
-
-    for trial_index, values in enumerate(combinations, start=1):
-        trial_parameters = dict(zip(parameter_names, values))
-        safe_trial_parameters = _json_safe(trial_parameters)
-        trial_config = dict(common_config)
-        trial_config.update(trial_parameters)
-        checkpoint_stem = trial_checkpoint_stem(trial_index, trial_parameters)
-        default_checkpoint_path = output_dir / f"{checkpoint_stem}.pt"
-
-        record = results_by_trial.get(trial_index)
-        if record is not None:
-            if record.get("parameters") != safe_trial_parameters:
-                raise ValueError(
-                    f"Trial {trial_index} in {results_path} has parameters "
-                    "that do not match the requested search grid."
-                )
-            checkpoint_path = Path(record["checkpoint_path"])
-        elif resume_search and checkpoint_family_exists(default_checkpoint_path):
-            if default_checkpoint_path.is_file():
-                record = completed_trial_record_from_checkpoint(
-                    trial_index,
-                    trial_parameters,
-                    default_checkpoint_path,
-                )
-            else:
-                record = {
-                    "trial": trial_index,
-                    "status": "running",
-                    "parameters": safe_trial_parameters,
-                    "checkpoint_path": os.fspath(default_checkpoint_path),
-                }
-            results.append(record)
-            results_by_trial[trial_index] = record
-            write_json_atomic(results, results_path)
-            checkpoint_path = Path(record["checkpoint_path"])
-        else:
-            checkpoint_path = (
-                default_checkpoint_path
-                if resume_search
-                else unique_checkpoint_path(default_checkpoint_path)
-            )
-            record = {
-                "trial": trial_index,
-                "status": "running",
-                "parameters": safe_trial_parameters,
-                "checkpoint_path": os.fspath(checkpoint_path),
-            }
-            results.append(record)
-            results_by_trial[trial_index] = record
-            write_json_atomic(results, results_path)
-
-        checkpoint_path = Path(record["checkpoint_path"])
-        if checkpoint_path.is_file() and record.get("status") != "completed":
-            record.update(
-                completed_trial_record_from_checkpoint(
-                    trial_index,
-                    trial_parameters,
-                    checkpoint_path,
-                )
-            )
-            write_json_atomic(results, results_path)
-
-        if record["status"] == "completed":
-            if trial_config.get("verbose", True):
-                print(f"Skipping completed hyperparameter trial {trial_index}")
-            continue
-
-        if record["status"] == "failed":
-            if trial_config.get("verbose", True):
-                print(f"Skipping failed hyperparameter trial {trial_index}")
-            continue
-
-        if record["status"] != "running":
-            raise ValueError(
-                f"Trial {trial_index} has unsupported status: {record['status']!r}"
-            )
-
-        resume_from = latest_checkpoint_for_resume(checkpoint_path)
-        trial_config["checkpoint_path"] = os.fspath(checkpoint_path)
-        trial_config["resume_from"] = resume_from
-
-        if trial_config.get("verbose", True):
-            print()
-            action = "Resuming" if resume_from is not None else "Starting"
-            print(f"{action} hyperparameter trial {trial_index}")
-            print("Parameters:", safe_trial_parameters)
-            if resume_from is not None:
-                print(f"Resume checkpoint: {resume_from}")
-
-        try:
-            _, checkpoint = train_live_summary_nn(**trial_config)
-            record.update(
-                status="completed",
-                best_val_loss=float(checkpoint["best_val_loss"]),
-                final_val_loss=float(checkpoint["final_val_loss"]),
-                best_epoch=checkpoint["best_epoch"],
-                trainable_parameters=checkpoint["trainable_parameters"],
-            )
-        except Exception as error:
-            record.update(
-                status="failed",
-                error=f"{type(error).__name__}: {error}",
-            )
-            if fail_fast:
-                write_json_atomic(results, results_path)
-                raise
-
-        write_json_atomic(results, results_path)
-
-    completed_results = [
-        record for record in results if record["status"] == "completed"
-    ]
-    completed_results.sort(key=lambda record: record["final_val_loss"])
-
-    if completed_results:
-        print()
-        print("Best completed trial:", completed_results[0])
-    else:
-        print("No hyperparameter-search trial completed successfully.")
-
-    return completed_results
-
-
-def default_hyperparameter_search_setup():
-    common_config = {
-        "sequence_length": 253,
-        "prior": "default",
-        "seed": 2,
-        "batch_size": 1024,
-        "n_batches": 10,
-        "val_size": 20_000,
-        "fixed_validation": False,
-        "n_quantiles": 19,
-        "compute_arima_coeff": False,
-        "n_epochs": 2000,
-        "patience": 100,
-        "min_delta": 1e-5,
-        "layer_norm": True,
-        "n_workers": -2,
-        "verbose": True,
-        "lr": 5e-4,
-    }
-
-    search_space = {
-        "hidden_dims_shared_trunk": [(64, 32), (128, 64), (256, 128)],
-        "hidden_dims_head": [(16, 16), (32, 32), (64, 64)],
-    }
-
-    return common_config, search_space
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run or resume the live summary-NN hyperparameter search."
-    )
-    output_group = parser.add_mutually_exclusive_group()
-    output_group.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory for a new search. Defaults to a timestamped search folder.",
-    )
-    output_group.add_argument(
-        "--resume-search",
-        type=Path,
-        default=None,
-        help="Existing search output directory to resume.",
+        description="Train the live summary NN with the selected SV prior."
     )
     parser.add_argument(
-        "--max-trials",
-        type=int,
-        default=None,
-        help="Optional limit on Cartesian-grid trials.",
+        "prior",
+        choices=("default", "finance"),
+        help="Prior used to simulate the live training and validation data.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    common_config, search_space = default_hyperparameter_search_setup()
+    checkpoint_path = Path(__file__).resolve().parent / (
+        f"sv_posterior_summary_nn_live_{args.prior}_arima.pt"
+    )
 
-    if args.resume_search is not None:
-        output_dir = args.resume_search
-        resume_search = True
-
-        if args.max_trials is None:
-            config_path = output_dir / "search_config.json"
-            if config_path.is_file():
-                args.max_trials = load_json_file(config_path).get("max_trials")
-    elif args.output_dir is not None:
-        output_dir = args.output_dir
-        resume_search = False
-    else:
-        output_dir = make_unique_search_output_dir(
-            base_dir=Path(__file__).resolve().parent / "summary_nn_search",
-            run_label="three_param_default_no_arma_q19",
-        )
-        resume_search = False
-
-    print(f"Saving hyperparameter-search outputs to {output_dir}")
-
-    run_hyperparameter_search(
-        search_space=search_space,
-        common_config=common_config,
-        output_dir=output_dir,
-        max_trials=args.max_trials,
-        fail_fast=False,
-        resume_search=resume_search,
+    train_live_summary_nn(
+        sequence_length=253,
+        prior=args.prior,
+        hidden_dims_shared_trunk=(128, 64),
+        hidden_dims_head=(16, 16),
+        checkpoint_path=checkpoint_path,
+        resume_from=None,
+        seed=2,
+        batch_size=1024,
+        n_batches=10,
+        val_size=20_000,
+        fixed_validation=False,
+        n_quantiles=19,
+        compute_arima_coeff=True,
+        n_epochs=2000,
+        patience=100,
+        min_delta=1e-5,
+        layer_norm=True,
+        n_workers=-2,
+        verbose=True,
+        lr=5e-4,
     )
 
 

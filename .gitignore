@@ -25,6 +25,7 @@ env/
 *.pkl
 *.rds
 *.RData
+*.pt
 outputs/
 results/
 figures/generated/
