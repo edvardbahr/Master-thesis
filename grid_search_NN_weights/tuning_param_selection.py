@@ -48,5 +48,5 @@ if __name__ == "__main__":
         weights_only=False,
     )
 
-    print(checkpoint["final_val_marginal_losses"])
+    print(checkpoint["prior"])
 
