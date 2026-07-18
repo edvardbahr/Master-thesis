@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -16,11 +17,7 @@ import sim_5_param_data as sim
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvol_MCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
-#Important: if transformed name is identical to original name, it will be skipped in summary
-DEFAULT_TRANSFORMED_PARAMETER_NAMES = ("mu", "psi", "log_s") 
 
-def identity_transform(x):
-    return x
 
 def psi_transform(phi, eps=1e-6):
     phi = np.clip(np.asarray(phi, dtype=np.float64), -1.0 + eps, 1.0 - eps)
@@ -29,14 +26,26 @@ def psi_transform(phi, eps=1e-6):
 
 def log_positive_transform(x, eps=1e-12):
     x = np.clip(np.asarray(x, dtype=np.float64), eps, None)
-    return  np.log(x)
+    return np.log(x)
 
 
-DEFAULT_TRANSFORMS = (
-    identity_transform,
-    psi_transform,
-    log_positive_transform,
-)
+def centered_square_transform(x):
+    x = np.asarray(x, dtype=np.float64)
+    return (x - np.mean(x)) ** 2
+
+
+def psi_sq_transform(phi, eps=1e-6):
+    return centered_square_transform(psi_transform(phi, eps=eps))
+
+
+def log_positive_sq_transform(x, eps=1e-12):
+    return centered_square_transform(log_positive_transform(x, eps=eps))
+
+
+DEFAULT_TRANSFORMS = {
+    "phi": {"psi": psi_transform},
+    "sigma": {"rho": log_positive_transform},
+}
 
 
 def find_rscript():
@@ -114,32 +123,60 @@ def make_row_chunks(n_rows, n_workers):
     return chunks
 
 
-def normalize_transforms(transform, transformed_parameter_names):
-    if transform is None:
-        return None, None
+def normalize_transforms(transforms):
+    """Validate transforms of the form raw -> {summary name: function}."""
+    if transforms is None:
+        return {}
 
-    if isinstance(transform, dict):
-        transforms = tuple(transform[name] for name in PARAMETER_NAMES)
-    else:
-        transforms = tuple(transform)
-
-    if len(transforms) != len(PARAMETER_NAMES):
-        raise ValueError(
-            f"transform must contain {len(PARAMETER_NAMES)} functions, one for each "
-            f"parameter in {PARAMETER_NAMES}."
+    if not isinstance(transforms, Mapping):
+        raise TypeError(
+            "transforms must be a mapping from raw parameter names to mappings "
+            "of transformed summary names to functions."
         )
 
-    transformed_parameter_names = tuple(transformed_parameter_names)
-    if len(transformed_parameter_names) != len(PARAMETER_NAMES):
+    unknown_parameters = sorted(set(transforms).difference(PARAMETER_NAMES))
+    if unknown_parameters:
         raise ValueError(
-            f"transformed_parameter_names must contain {len(PARAMETER_NAMES)} names."
+            "Unknown raw parameter name(s) in transforms: "
+            + ", ".join(unknown_parameters)
         )
 
-    for transform_fn in transforms:
-        if not callable(transform_fn):
-            raise TypeError("Each transform entry must be callable.")
+    normalized = {}
+    transformed_names = set()
 
-    return transforms, transformed_parameter_names
+    for parameter, parameter_transforms in transforms.items():
+        if not isinstance(parameter_transforms, Mapping):
+            raise TypeError(
+                f"transforms[{parameter!r}] must map transformed summary names "
+                "to functions."
+            )
+
+        normalized[parameter] = {}
+        for transformed_name, transform_fn in parameter_transforms.items():
+            if not isinstance(transformed_name, str) or not transformed_name:
+                raise TypeError("Each transformed summary name must be a non-empty string.")
+
+            if transformed_name in PARAMETER_NAMES:
+                raise ValueError(
+                    f"Transformed summary name {transformed_name!r} conflicts with "
+                    "a raw parameter name."
+                )
+
+            if transformed_name in transformed_names:
+                raise ValueError(
+                    f"Transformed summary name {transformed_name!r} is used more "
+                    "than once."
+                )
+
+            if not callable(transform_fn):
+                raise TypeError(
+                    f"Transform for {transformed_name!r} must be callable."
+                )
+
+            normalized[parameter][transformed_name] = transform_fn
+            transformed_names.add(transformed_name)
+
+    return normalized
 
 
 def estimate_ess_fft(values: np.ndarray) -> float:
@@ -223,13 +260,21 @@ def summarize_parameter_draws(
     parameter_draws,
     alpha=0.05,
     estimate_ess=False,
-    transform=DEFAULT_TRANSFORMS,
-    transformed_parameter_names=DEFAULT_TRANSFORMED_PARAMETER_NAMES,
+    transforms=DEFAULT_TRANSFORMS,
 ):
-    transforms, transformed_parameter_names = normalize_transforms(
-        transform,
-        transformed_parameter_names,
-    )
+    """
+    Summarize raw and transformed draws separately for every series.
+
+    ``transforms`` maps a raw parameter to any number of named transforms::
+
+        {
+            "phi": {"psi": psi_transform, "psi_centered_sq": psi_sq_transform},
+            "sigma": {"rho": log_positive_transform},
+        }
+
+    Each transformed name becomes a summary-column prefix in the returned frame.
+    """
+    transforms = normalize_transforms(transforms)
     required_columns = {"series_index", "draw_index", *PARAMETER_NAMES}
     missing = sorted(required_columns.difference(parameter_draws.columns))
 
@@ -253,17 +298,19 @@ def summarize_parameter_draws(
             values = group[parameter].to_numpy(dtype=np.float64)
             add_summary_columns(row, parameter, values, alpha, estimate_ess=estimate_ess)
 
-        if transforms is not None:
-            for parameter, transformed_name, transform_fn in zip(
-                PARAMETER_NAMES,
-                transformed_parameter_names,
-                transforms,
-            ):
-                if transformed_name in PARAMETER_NAMES:
-                    continue
-                
-                values = group[parameter].to_numpy(dtype=np.float64)
+        for parameter, parameter_transforms in transforms.items():
+            values = group[parameter].to_numpy(dtype=np.float64)
+
+            for transformed_name, transform_fn in parameter_transforms.items():
                 transformed_values = transform_fn(values)
+                transformed_values = np.asarray(transformed_values, dtype=np.float64)
+
+                if transformed_values.shape != values.shape:
+                    raise ValueError(
+                        f"Transform {transformed_name!r} for {parameter!r} returned "
+                        f"shape {transformed_values.shape}; expected {values.shape}."
+                    )
+
                 add_summary_columns(
                     row,
                     transformed_name,
@@ -367,8 +414,7 @@ def run_and_summarize_chunk(
     thinpara,
     alpha,
     estimate_ess,
-    transform,
-    transformed_parameter_names,
+    transforms,
     return_draws,
 ):
     parameter_draws = run_stochvol_chunk(
@@ -386,8 +432,7 @@ def run_and_summarize_chunk(
         parameter_draws=parameter_draws,
         alpha=alpha,
         estimate_ess=estimate_ess,
-        transform=transform,
-        transformed_parameter_names=transformed_parameter_names,
+        transforms=transforms,
     )
 
     if return_draws:
@@ -404,8 +449,7 @@ def run_stochvol_mcmc(
     thinpara=1,
     alpha=0.05,
     estimate_ess=False,
-    transform=DEFAULT_TRANSFORMS,
-    transformed_parameter_names=DEFAULT_TRANSFORMED_PARAMETER_NAMES,
+    transforms=DEFAULT_TRANSFORMS,
     max_cores=1,
     return_draws=False,
 ):
@@ -433,10 +477,7 @@ def run_stochvol_mcmc(
     if thinpara < 1:
         raise ValueError("thinpara must be a positive integer.")
 
-    transforms, transformed_parameter_names = normalize_transforms(
-        transform,
-        transformed_parameter_names,
-    )
+    transforms = normalize_transforms(transforms)
 
     n_workers = resolve_n_workers(max_cores, y.shape[0])
     chunks = make_row_chunks(y.shape[0], n_workers)
@@ -463,8 +504,7 @@ def run_stochvol_mcmc(
                     thinpara=thinpara,
                     alpha=alpha,
                     estimate_ess=estimate_ess,
-                    transform=transforms,
-                    transformed_parameter_names=transformed_parameter_names,
+                    transforms=transforms,
                     return_draws=return_draws,
                 )
                 summary_frames.append(summary)
@@ -486,8 +526,7 @@ def run_stochvol_mcmc(
                         thinpara=thinpara,
                         alpha=alpha,
                         estimate_ess=estimate_ess,
-                        transform=transforms,
-                        transformed_parameter_names=transformed_parameter_names,
+                        transforms=transforms,
                         return_draws=return_draws,
                     )
                     for chunk_id, (start, stop) in enumerate(chunks)
@@ -655,8 +694,6 @@ def main0():
     )
 
 
-    
-
     draws = 6000
     burnin = 500
     alpha = 0.05
@@ -665,7 +702,7 @@ def main0():
     n_long = 4 * n_short
 
     priors = ("default", "finance")
-    parameter_names = ("mu", "psi", "log_s")
+    parameter_names = ("mu", "psi", "rho")
     parameter_labels = (
         r"$\mu$",
         r"$\psi = 2\operatorname{atanh}(\phi)$",
@@ -726,20 +763,17 @@ def main0():
             {
                 "mu": mu,
                 "psi": psi,
-                "log_s": rho,
+                "rho": rho,
             }
         )
 
     def add_transformed_parameters(param_chains):
-        for parameter, transformed_name, transform_fn in zip(
-            PARAMETER_NAMES,
-            DEFAULT_TRANSFORMED_PARAMETER_NAMES,
-            DEFAULT_TRANSFORMS,
-        ):
-            if transformed_name not in param_chains.columns:
-                param_chains[transformed_name] = transform_fn(
-                    param_chains[parameter]
-                )
+        for parameter, parameter_transforms in DEFAULT_TRANSFORMS.items():
+            for transformed_name, transform_fn in parameter_transforms.items():
+                if transformed_name not in param_chains.columns:
+                    param_chains[transformed_name] = transform_fn(
+                        param_chains[parameter]
+                    )
 
         return param_chains
 
@@ -875,16 +909,8 @@ def main0():
         "bernstein_von_mises_qq_plots.pdf",
         bbox_inches="tight",
     )
-    fig.savefig(
-        "bernstein_von_mises_qq_plots.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
 
     plt.show()
-
-
-
 
 
 
@@ -916,15 +942,41 @@ def main1():
 
     
     N = 2000
-    multiplier = 1.0
-    draws = 6000
+    draws = 6000*4
     burnin = 500
     alpha = 0.05
 
     priors = ("default", "finance")
-    ess_columns = ["mu_ESS", "phi_ESS", "sigma_ESS", "psi_ESS", "log_s_ESS"]
+    ess_transforms = {
+        "mu": {
+            "mu_centered_sq": centered_square_transform,
+        },
+        "phi": {
+            "psi": psi_transform,
+            "psi_centered_sq": psi_sq_transform,
+        },
+        "sigma": {
+            "rho": log_positive_transform,
+            "rho_centered_sq": log_positive_sq_transform,
+        },
+    }
+    ess_columns = [
+        "mu_ESS",
+        "psi_ESS",
+        "rho_ESS",
+        "mu_centered_sq_ESS",
+        "psi_centered_sq_ESS",
+        "rho_centered_sq_ESS",
+    ]
     param_labels = np.array(
-        [r"$\mu$", r"$\phi$", r"$\sigma$", r"$\psi$", r"$\log s$"]
+        [
+            r"$\mu$",
+            r"$\psi$",
+            r"$\rho$",
+            r"$(\mu-\bar{\mu})^2$",
+            r"$(\psi-\bar{\psi})^2$",
+            r"$(\rho-\bar{\rho})^2$",
+        ]
     )
 
     rng = np.random.default_rng(seed=2)
@@ -941,7 +993,7 @@ def main1():
 
         sv_chunk = sim.simulate_sv_chunk(
             *sv_params,
-            n=int(np.floor(253 * multiplier)),
+            n=253,
             rng=rng,
         )
 
@@ -952,6 +1004,7 @@ def main1():
             thinpara=1,
             alpha=alpha,
             estimate_ess=True,
+            transforms=ess_transforms,
             max_cores=-2,
             return_draws=False,
             prior=prior,
@@ -1037,4 +1090,4 @@ def main1():
 
 
 if __name__ == "__main__":
-    main0()
+    main1()
