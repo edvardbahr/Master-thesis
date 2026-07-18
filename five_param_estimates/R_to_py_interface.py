@@ -942,7 +942,7 @@ def main1():
 
     
     N = 2000
-    draws = 6000*4
+    draws = 20000
     burnin = 500
     alpha = 0.05
 
