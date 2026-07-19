@@ -684,19 +684,8 @@ def main0():
         }
     )
 
-    colors = (
-        "#0000ff",
-        "#008000",
-        "#ff0000",
-        "#00bfbf",
-        "#bf00bf",
-        "#bfbf00",
-    )
-
-
-    draws = 6000
+    draws = 20_000
     burnin = 500
-    alpha = 0.05
 
     n_short = 253
     n_long = 4 * n_short
@@ -709,16 +698,6 @@ def main0():
         r"$\rho = \log(\sigma)$",
     )
 
-    prior_specs = {
-        "default": {
-            "mu": (0.0, 10.0),
-            "beta": (5.0, 1.5),
-        },
-        "finance": {
-            "mu": (-9.0, 1.0),
-            "beta": (20.0, 1.5),
-        },
-    }
     qq_colors = {
     "default": (
         "#9ecae1",  # n = 0
@@ -733,54 +712,36 @@ def main0():
     }
 
 
-    rng = np.random.default_rng(seed=2)
+    rng = np.random.default_rng(seed=4)
     chains = {}
 
-    def sample_transformed_prior(prior):
-        spec = prior_specs[prior]
+    def select_transformed_parameters(param_chains):
+        param_chains = param_chains.copy()
 
-        mu = rng.normal(
-            loc=spec["mu"][0],
-            scale=spec["mu"][1],
-            size=draws,
-        )
-
-        u = rng.beta(
-            *spec["beta"],
-            size=draws,
-        )
-
-        phi = 2.0 * u - 1.0
-        psi = 2.0 * np.arctanh(phi)
-
-        sigma2 = rng.chisquare(
-            df=1,
-            size=draws,
-        )
-        rho = np.log(sigma2)/2.0
-
-        return pd.DataFrame(
-            {
-                "mu": mu,
-                "psi": psi,
-                "rho": rho,
-            }
-        )
-
-    def add_transformed_parameters(param_chains):
         for parameter, parameter_transforms in DEFAULT_TRANSFORMS.items():
             for transformed_name, transform_fn in parameter_transforms.items():
-                if transformed_name not in param_chains.columns:
-                    param_chains[transformed_name] = transform_fn(
-                        param_chains[parameter]
-                    )
+                param_chains[transformed_name] = transform_fn(
+                    param_chains[parameter]
+                )
 
-        return param_chains
+        return param_chains.loc[:, parameter_names]
 
     for prior in priors:
-        chains[prior] = {
-            0: sample_transformed_prior(prior)
-        }
+        prior_mu, prior_phi, prior_sigma, _, _ = sim.sample_stochvol_prior(
+            draws,
+            prior=prior,
+            fixed_r=0.0,
+            fixed_nu=np.inf,
+            rng=rng,
+        )
+        prior_chains = pd.DataFrame(
+            {
+                "mu": prior_mu,
+                "phi": prior_phi,
+                "sigma": prior_sigma,
+            }
+        )
+        chains[prior] = {0: select_transformed_parameters(prior_chains)}
 
         sv_params = sim.sample_stochvol_prior(
             1,
@@ -803,20 +764,13 @@ def main0():
                 draws=draws,
                 burnin=burnin,
                 thinpara=1,
-                alpha=alpha,
                 estimate_ess=False,
                 max_cores=-2,
                 return_draws=True,
                 prior=prior,
             )
 
-            param_chains = add_transformed_parameters(
-                param_chains
-            )
-
-            chains[prior][n] = param_chains[
-                list(parameter_names)
-            ]
+            chains[prior][n] = select_transformed_parameters(param_chains)
 
     # Common plotting probabilities ensure vertically aligned QQ points.
     qq_points = 500
@@ -840,8 +794,6 @@ def main0():
     )
 
     for column, prior in enumerate(priors):
-        color = colors[column]
-
         for row, (parameter, parameter_label) in enumerate(
             zip(parameter_names, parameter_labels)
         ):
@@ -915,7 +867,6 @@ def main0():
 
 
 def main1():
-
 
 
     plt.rcParams.update(
@@ -1090,4 +1041,4 @@ def main1():
 
 
 if __name__ == "__main__":
-    main1()
+    main0()
