@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from time import perf_counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -261,6 +262,7 @@ def summarize_parameter_draws(
     alpha=0.05,
     estimate_ess=False,
     transforms=DEFAULT_TRANSFORMS,
+    runtime_by_series=None,
 ):
     """
     Summarize raw and transformed draws separately for every series.
@@ -287,6 +289,7 @@ def summarize_parameter_draws(
     grouped = parameter_draws.groupby("series_index", sort=True)
 
     for series_index, group in grouped:
+        summary_started_at = perf_counter()
         row = {
             "index": int(series_index),
             "alpha": float(alpha),
@@ -318,6 +321,13 @@ def summarize_parameter_draws(
                     alpha,
                     estimate_ess=estimate_ess
                 )
+
+        if runtime_by_series is not None:
+            row["runtime_seconds"] = (
+                runtime_by_series[int(series_index)]
+                + perf_counter()
+                - summary_started_at
+            )
 
         rows.append(row)
 
@@ -352,6 +362,7 @@ def prepare_chunk_workspace(tmpdir, chunk_id, chunk_start, y_chunk):
         "chunk_dir": chunk_dir,
         "input_path": input_dir / "y_matrix.csv",
         "draws_path": output_dir / "parameter_draws.csv",
+        "runtime_path": output_dir / "series_runtimes.csv",
         "series_dir": series_dir,
     }
 
@@ -375,6 +386,7 @@ def run_stochvol_chunk(
     )
     input_path = workspace["input_path"]
     draws_path = workspace["draws_path"]
+    runtime_path = workspace["runtime_path"]
     np.savetxt(input_path, y_chunk, delimiter=",")
 
     command = [
@@ -382,6 +394,7 @@ def run_stochvol_chunk(
         str(R_SCRIPT),
         str(input_path),
         str(draws_path),
+        str(runtime_path),
         str(int(draws)),
         str(int(burnin)),
         str(int(thinpara)),
@@ -395,11 +408,15 @@ def run_stochvol_chunk(
     subprocess.run(command, check=True)
 
     parameter_draws = pd.read_csv(draws_path)
+    series_runtimes = pd.read_csv(runtime_path)
     parameter_draws["series_index"] = (
         parameter_draws["series_index"].astype(int) + int(chunk_start)
     )
+    series_runtimes["series_index"] = (
+        series_runtimes["series_index"].astype(int) + int(chunk_start)
+    )
 
-    return parameter_draws
+    return parameter_draws, series_runtimes
 
 
 def run_and_summarize_chunk(
@@ -417,7 +434,7 @@ def run_and_summarize_chunk(
     transforms,
     return_draws,
 ):
-    parameter_draws = run_stochvol_chunk(
+    parameter_draws, series_runtimes = run_stochvol_chunk(
         y_chunk=y_chunk,
         chunk_start=chunk_start,
         chunk_id=chunk_id,
@@ -433,6 +450,9 @@ def run_and_summarize_chunk(
         alpha=alpha,
         estimate_ess=estimate_ess,
         transforms=transforms,
+        runtime_by_series=series_runtimes.set_index("series_index")[
+            "runtime_seconds"
+        ].to_dict(),
     )
 
     if return_draws:
