@@ -1,14 +1,21 @@
-"""Compare three-parameter SV posterior credible intervals.
+"""Compare three-parameter SV posterior estimators with stochvol.
 
-The comparison uses the same simulated Gaussian-SV series for all estimators:
+Two intentionally separate tasks are available:
 
-* summary-statistic NN trained with the default or finance prior;
-* TCN trained with the default or finance prior; and
-* stochvol MCMC run with the default or finance prior.
+``ci``
+    Plot credible intervals for mu, phi, and sigma squared on shared
+    parameter sweeps.  The 3-by-2 layout separates the default and finance
+    priors while comparing the Summary NN, TCN, and stochvol in each panel.
 
-Thus the plot contains six method/prior combinations while varying only the
-three standard-SV parameters (mu, phi, sigma).  The GH skew-t checkpoints are
-intentionally incompatible with, and excluded from, this test.
+``metrics``
+    On prior-predictive benchmark pairs, compare each neural posterior with
+    its matching-prior MCMC reference using the paired marginal Gaussian-loss
+    difference, posterior-mean RMSE, and average log variance ratio.  These
+    metrics are evaluated on the training scale (mu, psi, rho), where
+    psi = 2*atanh(phi) and rho = log(sigma).
+
+The GH skew-t checkpoints are intentionally incompatible with, and excluded
+from, both tasks.
 """
 
 from __future__ import annotations
@@ -36,32 +43,43 @@ import torch
 import torch.nn as nn
 
 import sim_5_param_data as sim
-from R_to_py_interface import run_stochvol_mcmc, validate_series_matrix
+from R_to_py_interface import (
+    centered_square_transform,
+    log_positive_sq_transform,
+    log_positive_transform,
+    psi_sq_transform,
+    psi_transform,
+    run_stochvol_mcmc,
+    validate_series_matrix,
+)
 from train_live_CNN import SVPosteriorTCN
 from train_live_summary_nn import SVPosteriorNN
 
 
 DEFAULT_ALPHA = 0.05
 DEFAULT_SEQUENCE_LENGTH = 253
-DEFAULT_MCMC_DRAWS = 2000
+DEFAULT_MCMC_DRAWS = 20_000
 DEFAULT_MCMC_BURNIN = 500
 DEFAULT_MCMC_THINPARA = 1
 DEFAULT_MCMC_MAX_CORES = -2
+DEFAULT_BENCHMARK_SIZE = 2_000
 
-PARAMETER_NAMES = ("mu", "phi", "sigma")
+PARAMETER_NAMES = ("mu", "phi", "sigma2")
+TRANSFORMED_PARAMETER_NAMES = ("mu", "psi", "rho")
 PRIOR_NAMES = ("default", "finance")
 SUMMARY_TARGET_NAMES = ("mu", "psi", "log_sigma")
 TCN_TARGET_NAMES = ("mu", "psi", "log_s")
+METHOD_NAMES = ("stochvol", "TCN", "Summary NN")
 
 DEFAULT_BASELINE = {
     "mu": -9.0,
     "phi": 0.95,
-    "sigma": 0.25,
+    "sigma2": 0.25**2,
 }
-DEFAULT_SWEEP_DELTAS = {
-    "mu": 3.0,
-    "phi": 0.045,
-    "sigma": 0.20,
+DEFAULT_SWEEP_BOUNDS = {
+    "mu": (-12.0, -6.0),
+    "phi": (0.905, 0.995),
+    "sigma2": (0.05**2, 0.45**2),
 }
 
 DEFAULT_CHECKPOINTS = {
@@ -71,15 +89,6 @@ DEFAULT_CHECKPOINTS = {
     ("TCN", "finance"): "sv_posterior_tcn_live_finance_n253_multiscale_topk.pt",
 }
 
-# Plot order also fixes the requested six-color assignment.
-COMBINATION_ORDER = (
-    ("Summary NN", "default"),
-    ("Summary NN", "finance"),
-    ("TCN", "default"),
-    ("TCN", "finance"),
-    ("stochvol", "default"),
-    ("stochvol", "finance"),
-)
 PLOT_COLORS = (
     "#0000ff",
     "#008000",
@@ -88,15 +97,30 @@ PLOT_COLORS = (
     "#bf00bf",
     "#bfbf00",
 )
+PRIOR_METHOD_COLORS = {
+    "default": {
+        "stochvol": PLOT_COLORS[0], #blue
+        "TCN": PLOT_COLORS[4], # purple
+        "Summary NN": PLOT_COLORS[5], #yellow
+        
+    },
+    "finance": {
+        "stochvol": PLOT_COLORS[1], #green
+        "TCN": PLOT_COLORS[2], # red
+        "Summary NN": PLOT_COLORS[3], # teal
+    },
+}
 METHOD_MARKERS = {
-    "Summary NN": "s",
-    "TCN": "^",
     "stochvol": "o",
+    "TCN": "^",
+    "Summary NN": "s",
+    
+    
 }
 PARAMETER_LABELS = {
     "mu": r"$\mu$",
     "phi": r"$\phi$",
-    "sigma": r"$\sigma$",
+    "sigma2": r"$\sigma^2$",
 }
 
 
@@ -437,7 +461,7 @@ def common_sequence_length(models: dict[tuple[str, str], LoadedModel]) -> int:
 def make_single_parameter_sweep_datasets(
     baseline=None,
     sweeps=None,
-    sweep_deltas=None,
+    sweep_bounds=None,
     sweep_size=10,
     n=DEFAULT_SEQUENCE_LENGTH,
     rng=None,
@@ -445,15 +469,15 @@ def make_single_parameter_sweep_datasets(
 ):
     """Simulate standard SV by fixing the five-parameter simulator at r=0, nu=inf."""
     baseline = DEFAULT_BASELINE | (baseline or {})
-    sweep_deltas = DEFAULT_SWEEP_DELTAS | (sweep_deltas or {})
+    sweep_bounds = DEFAULT_SWEEP_BOUNDS | (sweep_bounds or {})
     if rng is None:
         rng = np.random.default_rng()
 
     if sweeps is None:
         sweeps = {
             parameter: np.linspace(
-                baseline[parameter] - sweep_deltas[parameter],
-                baseline[parameter] + sweep_deltas[parameter],
+                sweep_bounds[parameter][0],
+                sweep_bounds[parameter][1],
                 sweep_size,
                 dtype=np.float64,
             )
@@ -469,8 +493,8 @@ def make_single_parameter_sweep_datasets(
         raise ValueError("Each parameter sweep must be a non-empty one-dimensional array.")
     if np.any(np.abs(sweeps["phi"]) >= 1.0):
         raise ValueError("All phi sweep values must satisfy |phi| < 1.")
-    if np.any(sweeps["sigma"] <= 0.0):
-        raise ValueError("All sigma sweep values must be positive.")
+    if np.any(sweeps["sigma2"] <= 0.0):
+        raise ValueError("All sigma-squared sweep values must be positive.")
 
     datasets = {}
     for swept_parameter in PARAMETER_NAMES:
@@ -485,7 +509,7 @@ def make_single_parameter_sweep_datasets(
         datasets[swept_parameter] = sim.simulate_sv_chunk(
             mu=parameters["mu"],
             phi=parameters["phi"],
-            s=parameters["sigma"],
+            s=np.sqrt(parameters["sigma2"]),
             r=np.zeros(n_series, dtype=np.float64),
             nu=np.full(n_series, np.inf, dtype=np.float64),
             n=n,
@@ -614,11 +638,47 @@ def transformed_gaussian_to_ci_frame(
             "phi_median": np.tanh(mean[:, 1] / 2.0),
             "phi_ci_lower": np.tanh(lower[:, 1] / 2.0),
             "phi_ci_upper": np.tanh(upper[:, 1] / 2.0),
-            "sigma_median": np.exp(mean[:, 2]),
-            "sigma_ci_lower": np.exp(lower[:, 2]),
-            "sigma_ci_upper": np.exp(upper[:, 2]),
+            # The networks model rho = log(sigma).  Since sigma^2 = exp(2*rho)
+            # is strictly increasing, transforming the fixed-alpha Gaussian
+            # quantiles gives the exact equal-tailed sigma-squared interval.
+            "sigma2_median": np.exp(2.0 * mean[:, 2]),
+            "sigma2_ci_lower": np.exp(2.0 * lower[:, 2]),
+            "sigma2_ci_upper": np.exp(2.0 * upper[:, 2]),
         }
     )
+
+
+def sigma_squared_transform(sigma) -> np.ndarray:
+    sigma = np.asarray(sigma, dtype=np.float64)
+    return sigma**2
+
+
+CI_MCMC_TRANSFORMS = {
+    "sigma": {"sigma2": sigma_squared_transform},
+}
+
+
+def validate_stochvol_sigma_squared_ci(ci_frame: pd.DataFrame) -> pd.DataFrame:
+    """Validate draw-level sigma-squared summaries returned by the bridge.
+
+    ``para(svsample(...))[, "sigma"]`` contains sigma, not sigma squared.
+    The CI call supplies ``CI_MCMC_TRANSFORMS`` so the bridge squares every
+    posterior draw *before* calculating the median and alpha-level quantiles.
+    This avoids the small interpolation discrepancy caused by squaring
+    already-computed empirical quantiles.
+    """
+    ci_frame = ci_frame.copy()
+    required = ("sigma2_median", "sigma2_ci_lower", "sigma2_ci_upper")
+    missing = [column for column in required if column not in ci_frame]
+    if missing:
+        raise KeyError(
+            "stochvol summary is missing draw-level sigma-squared CI column(s): "
+            + ", ".join(missing)
+        )
+    values = ci_frame.loc[:, required].to_numpy(dtype=np.float64)
+    if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError("stochvol returned an invalid sigma-squared summary.")
+    return ci_frame
 
 
 def predict_model_ci(
@@ -665,7 +725,7 @@ def add_ci_rows(
 def run_parameter_sweep_test(
     models: dict[tuple[str, str], LoadedModel],
     baseline=None,
-    sweep_deltas=None,
+    sweep_bounds=None,
     sweeps=None,
     n=DEFAULT_SEQUENCE_LENGTH,
     sweep_size=10,
@@ -681,7 +741,7 @@ def run_parameter_sweep_test(
     datasets, sweeps, baseline = make_single_parameter_sweep_datasets(
         baseline=baseline,
         sweeps=sweeps,
-        sweep_deltas=sweep_deltas,
+        sweep_bounds=sweep_bounds,
         sweep_size=sweep_size,
         n=n,
         rng=rng,
@@ -705,8 +765,10 @@ def run_parameter_sweep_test(
                 burnin=mcmc_burnin,
                 thinpara=mcmc_thinpara,
                 alpha=alpha,
+                transforms=CI_MCMC_TRANSFORMS,
                 max_cores=mcmc_max_cores,
             )
+            mcmc_ci = validate_stochvol_sigma_squared_ci(mcmc_ci)
             add_ci_rows(
                 rows, swept_parameter, true_values, "stochvol", prior, mcmc_ci
             )
@@ -729,6 +791,337 @@ def run_parameter_sweep_test(
     return pd.DataFrame(rows), sweeps, baseline
 
 
+METRIC_MCMC_TRANSFORMS = {
+    "mu": {
+        "mu_centered_sq": centered_square_transform,
+    },
+    "phi": {
+        "psi": psi_transform,
+        "psi_centered_sq": psi_sq_transform,
+    },
+    "sigma": {
+        "rho": log_positive_transform,
+        "rho_centered_sq": log_positive_sq_transform,
+    },
+}
+
+
+def transform_sv_parameters(theta) -> np.ndarray:
+    """Map (mu, phi, sigma) to the networks' (mu, psi, rho) scale."""
+    theta = np.asarray(theta, dtype=np.float64)
+    if theta.ndim != 2 or theta.shape[1] != 3:
+        raise ValueError("theta must have shape (n, 3) for (mu, phi, sigma).")
+
+    mu = theta[:, 0]
+    return np.column_stack(
+        [
+            mu,
+            psi_transform(theta[:, 1]),
+            log_positive_transform(theta[:, 2]),
+        ]
+    )
+
+
+def simulate_benchmark_dataset(
+    prior,
+    benchmark_size,
+    n,
+    seed,
+    random_init=True,
+):
+    """Draw prior-predictive standard-SV benchmark pairs for one prior."""
+    rng = np.random.default_rng(seed)
+    mu, phi, sigma, r, nu = sim.sample_stochvol_prior(
+        benchmark_size,
+        rng=rng,
+        prior=prior,
+        fixed_r=0.0,
+        fixed_nu=np.inf,
+        return_s2=False,
+        dtype=np.float64,
+    )
+    y = sim.simulate_sv_chunk(
+        mu=mu,
+        phi=phi,
+        s=sigma,
+        r=r,
+        nu=nu,
+        n=n,
+        rng=rng,
+        random_init=random_init,
+    )
+    theta = np.column_stack([mu, phi, sigma])
+    targets = transform_sv_parameters(theta)
+    return y, theta, targets
+
+
+def transformed_mcmc_moments(summary):
+    """Extract moment-matched (mu, psi, rho) Gaussians from MCMC summaries.
+
+    ``METRIC_MCMC_TRANSFORMS`` first maps the chains to mu, psi, and rho and
+    then applies (z - mean(z))**2.  Taking the mean of those centered-square
+    draws gives the thesis variance with denominator M directly, without
+    retaining all 20,000 raw draws in Python.
+    """
+    summary = summary.sort_values("index").reset_index(drop=True)
+    prefixes = TRANSFORMED_PARAMETER_NAMES
+    required = ["index", "n_draws"]
+    required.extend(f"{name}_mean" for name in prefixes)
+    required.extend(f"{name}_centered_sq_mean" for name in prefixes)
+    missing = [column for column in required if column not in summary]
+    if missing:
+        raise KeyError(
+            "stochvol summary is missing transformed moment column(s): "
+            + ", ".join(missing)
+        )
+
+    n_draws = summary["n_draws"].to_numpy(dtype=np.int64)
+    if np.any(n_draws < 2):
+        raise ValueError("At least two retained MCMC draws are needed for variance.")
+
+    means = np.column_stack(
+        [summary[f"{name}_mean"].to_numpy(dtype=np.float64) for name in prefixes]
+    )
+    population_variances = np.column_stack(
+        [
+            summary[f"{name}_centered_sq_mean"].to_numpy(dtype=np.float64)
+            for name in prefixes
+        ]
+    )
+
+    if not np.all(np.isfinite(means)) or not np.all(np.isfinite(population_variances)):
+        raise FloatingPointError("MCMC transformed moments contain NaN or Inf values.")
+    if np.any(population_variances <= 0.0):
+        raise FloatingPointError("MCMC transformed variances must be positive.")
+
+    return (
+        summary["index"].to_numpy(dtype=np.int64),
+        means,
+        population_variances,
+        n_draws,
+    )
+
+
+def marginal_gaussian_loss(target, mean, variance) -> np.ndarray:
+    """Thesis Gaussian loss, excluding the additive constant that cancels."""
+    target = np.asarray(target, dtype=np.float64)
+    mean = np.asarray(mean, dtype=np.float64)
+    variance = np.asarray(variance, dtype=np.float64)
+    if target.shape != mean.shape or target.shape != variance.shape:
+        raise ValueError(
+            "target, mean, and variance must have identical (n, 3) shapes."
+        )
+    if target.ndim != 2 or target.shape[1] != len(TRANSFORMED_PARAMETER_NAMES):
+        raise ValueError("Gaussian-loss arrays must have shape (n, 3).")
+    if not np.all(np.isfinite(target)) or not np.all(np.isfinite(mean)):
+        raise FloatingPointError("Gaussian-loss targets and means must be finite.")
+    if not np.all(np.isfinite(variance)) or np.any(variance <= 0.0):
+        raise FloatingPointError("Gaussian-loss variances must be finite and positive.")
+
+    return 0.5 * (
+        np.log(variance)
+        + (target - mean) ** 2 / variance
+    )
+
+
+def calculate_paired_metrics(
+    targets,
+    npe_mean,
+    npe_variance,
+    mcmc_mean,
+    mcmc_variance,
+    series_indices,
+    retained_draws,
+    architecture,
+    prior,
+):
+    """Calculate summary and per-sequence metrics from one paired benchmark."""
+    targets = np.asarray(targets, dtype=np.float64)
+    npe_mean = np.asarray(npe_mean, dtype=np.float64)
+    npe_variance = np.asarray(npe_variance, dtype=np.float64)
+    mcmc_mean = np.asarray(mcmc_mean, dtype=np.float64)
+    mcmc_variance = np.asarray(mcmc_variance, dtype=np.float64)
+    series_indices = np.asarray(series_indices, dtype=np.int64)
+    retained_draws = np.asarray(retained_draws, dtype=np.int64)
+    benchmark_size = len(targets)
+    if len(series_indices) != benchmark_size or len(retained_draws) != benchmark_size:
+        raise ValueError("MCMC series indices and draw counts must match target rows.")
+    if np.unique(retained_draws).size != 1:
+        raise ValueError("All benchmark sequences must have the same retained draw count.")
+
+    npe_loss = marginal_gaussian_loss(targets, npe_mean, npe_variance)
+    mcmc_loss = marginal_gaussian_loss(targets, mcmc_mean, mcmc_variance)
+    npe_squared_error = (targets - npe_mean) ** 2
+    mcmc_squared_error = (targets - mcmc_mean) ** 2
+    log_variance_ratio = np.log(npe_variance / mcmc_variance)
+
+    summary_rows = []
+    detail_frames = []
+    for column, parameter in enumerate(TRANSFORMED_PARAMETER_NAMES):
+        loss_difference = npe_loss[:, column] - mcmc_loss[:, column]
+        summary_rows.append(
+            {
+                "architecture": architecture,
+                "prior": prior,
+                "parameter": parameter,
+                "benchmark_size": benchmark_size,
+                "mcmc_retained_draws": int(retained_draws[0]),
+                "mean_npe_gaussian_loss": float(np.mean(npe_loss[:, column])),
+                "mean_mcmc_gaussian_loss": float(np.mean(mcmc_loss[:, column])),
+                "gaussian_loss_difference": float(np.mean(loss_difference)),
+                "npe_posterior_mean_rmse": float(
+                    np.sqrt(np.mean(npe_squared_error[:, column]))
+                ),
+                "mcmc_posterior_mean_rmse": float(
+                    np.sqrt(np.mean(mcmc_squared_error[:, column]))
+                ),
+                "average_log_variance_ratio": float(
+                    np.mean(log_variance_ratio[:, column])
+                ),
+            }
+        )
+        detail_frames.append(
+            pd.DataFrame(
+                {
+                    "architecture": architecture,
+                    "prior": prior,
+                    "series_index": series_indices,
+                    "parameter": parameter,
+                    "target": targets[:, column],
+                    "npe_mean": npe_mean[:, column],
+                    "npe_variance": npe_variance[:, column],
+                    "mcmc_mean": mcmc_mean[:, column],
+                    "mcmc_variance": mcmc_variance[:, column],
+                    "npe_gaussian_loss": npe_loss[:, column],
+                    "mcmc_gaussian_loss": mcmc_loss[:, column],
+                    "gaussian_loss_difference": loss_difference,
+                    "npe_squared_error": npe_squared_error[:, column],
+                    "mcmc_squared_error": mcmc_squared_error[:, column],
+                    "log_variance_ratio": log_variance_ratio[:, column],
+                    "mcmc_retained_draws": retained_draws,
+                }
+            )
+        )
+
+    return pd.DataFrame(summary_rows), pd.concat(detail_frames, ignore_index=True)
+
+
+def run_metric_benchmark(
+    models: dict[tuple[str, str], LoadedModel],
+    priors=PRIOR_NAMES,
+    benchmark_size=DEFAULT_BENCHMARK_SIZE,
+    n=DEFAULT_SEQUENCE_LENGTH,
+    seed=3,
+    alpha=DEFAULT_ALPHA,
+    mcmc_draws=DEFAULT_MCMC_DRAWS,
+    mcmc_burnin=DEFAULT_MCMC_BURNIN,
+    mcmc_thinpara=DEFAULT_MCMC_THINPARA,
+    mcmc_max_cores=DEFAULT_MCMC_MAX_CORES,
+    batch_size=1024,
+):
+    """Run the thesis metrics for both neural architectures and selected priors."""
+    priors = tuple(priors)
+    unknown_priors = set(priors).difference(PRIOR_NAMES)
+    if unknown_priors:
+        raise ValueError(f"Unknown benchmark prior(s): {sorted(unknown_priors)}.")
+
+    summary_frames = []
+    detail_frames = []
+
+    for prior in priors:
+        prior_index = PRIOR_NAMES.index(prior)
+        child_seed = np.random.SeedSequence([int(seed), prior_index])
+        print(
+            f"\nGenerating {benchmark_size} benchmark pairs under the {prior} prior."
+        )
+        y, _theta, targets = simulate_benchmark_dataset(
+            prior=prior,
+            benchmark_size=benchmark_size,
+            n=n,
+            seed=child_seed,
+        )
+
+        print(
+            f"Running stochvol ({prior}) with {mcmc_draws:,} requested draws "
+            f"per sequence."
+        )
+        mcmc_summary = run_stochvol_mcmc(
+            y,
+            prior=prior,
+            draws=mcmc_draws,
+            burnin=mcmc_burnin,
+            thinpara=mcmc_thinpara,
+            alpha=alpha,
+            transforms=METRIC_MCMC_TRANSFORMS,
+            max_cores=mcmc_max_cores,
+            return_draws=False,
+        )
+        series_indices, mcmc_mean, mcmc_variance, retained_draws = (
+            transformed_mcmc_moments(mcmc_summary)
+        )
+        if len(series_indices) != benchmark_size:
+            raise RuntimeError(
+                f"stochvol returned {len(series_indices)} series for "
+                f"benchmark_size={benchmark_size}."
+            )
+        expected_indices = np.arange(1, benchmark_size + 1, dtype=np.int64)
+        if not np.array_equal(series_indices, expected_indices):
+            raise RuntimeError(
+                "stochvol series indices do not match the simulated benchmark order."
+            )
+
+        for architecture in ("Summary NN", "TCN"):
+            loaded_model = models[(architecture, prior)]
+            print(f"Predicting benchmark moments with {loaded_model.label}.")
+            npe_mean, npe_variance = predict_transformed_gaussian(
+                loaded_model,
+                y,
+                batch_size=batch_size,
+            )
+            metric_summary, metric_details = calculate_paired_metrics(
+                targets=targets,
+                npe_mean=npe_mean,
+                npe_variance=npe_variance,
+                mcmc_mean=mcmc_mean,
+                mcmc_variance=mcmc_variance,
+                series_indices=series_indices,
+                retained_draws=retained_draws,
+                architecture=architecture,
+                prior=prior,
+            )
+            summary_frames.append(metric_summary)
+            detail_frames.append(metric_details)
+
+    return (
+        pd.concat(summary_frames, ignore_index=True),
+        pd.concat(detail_frames, ignore_index=True),
+    )
+
+
+def print_metric_table(metrics: pd.DataFrame) -> None:
+    columns = [
+        "architecture",
+        "prior",
+        "parameter",
+        "gaussian_loss_difference",
+        "npe_posterior_mean_rmse",
+        "mcmc_posterior_mean_rmse",
+        "average_log_variance_ratio",
+    ]
+    print("\nPaired transformed-scale benchmark metrics:")
+    print(
+        "  gaussian_loss_difference = mean(NPE loss - MCMC loss); "
+        "average_log_variance_ratio = mean(log(v_NPE / v_MCMC))."
+    )
+    with pd.option_context("display.width", 180):
+        print(
+            metrics.loc[:, columns].to_string(
+                index=False,
+                float_format=lambda value: f"{value:.6g}",
+            )
+        )
+
+
 def apply_plot_style() -> None:
     plt.rcParams.update(
         {
@@ -747,104 +1140,144 @@ def apply_plot_style() -> None:
 
 def plot_parameter_sweep_ci(comparison, output_path, alpha=DEFAULT_ALPHA) -> Path:
     apply_plot_style()
-    colors = PLOT_COLORS
-    color_by_combination = dict(zip(COMBINATION_ORDER, colors))
+    fig, axes = plt.subplots(
+        len(PARAMETER_NAMES),
+        len(PRIOR_NAMES),
+        figsize=(12.5, 13.0),
+        sharex="row",
+        sharey="row",
+    )
+    legend_entries = {}
 
-    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.7))
-    legend_handles = None
-    legend_labels = None
+    for row, swept_parameter in enumerate(PARAMETER_NAMES):
+        parameter_label = PARAMETER_LABELS[swept_parameter]
+        row_y_min = np.inf
+        row_y_max = -np.inf
 
-    for ax, swept_parameter in zip(axes, PARAMETER_NAMES):
-        subset = comparison[comparison["swept_parameter"] == swept_parameter]
-        true_values = (
-            subset[["value_index", "true_value"]]
-            .drop_duplicates()
-            .sort_values("value_index")["true_value"]
-            .to_numpy(dtype=np.float64)
-        )
-        if len(true_values) == 0:
-            raise ValueError(f"Comparison has no rows for {swept_parameter}.")
-
-        spacing = (
-            float(np.min(np.abs(np.diff(true_values))))
-            if len(true_values) > 1
-            else 1.0
-        )
-        offsets = dict(
-            zip(COMBINATION_ORDER, np.linspace(-0.25, 0.25, 6) * spacing)
-        )
-        ax.plot(
-            true_values,
-            true_values,
-            color="0.35",
-            linestyle="--",
-            linewidth=1.0,
-            label="_nolegend_",
-            zorder=1,
-        )
-
-        y_min = float(np.min(true_values))
-        y_max = float(np.max(true_values))
-        for method, prior in COMBINATION_ORDER:
-            method_data = (
-                subset[
-                    (subset["method"] == method) & (subset["prior"] == prior)
-                ]
-                .sort_values("value_index")
-                .reset_index(drop=True)
+        for column, prior in enumerate(PRIOR_NAMES):
+            ax = axes[row, column]
+            subset = comparison[
+                (comparison["swept_parameter"] == swept_parameter)
+                & (comparison["prior"] == prior)
+            ]
+            true_values = (
+                subset[["value_index", "true_value"]]
+                .drop_duplicates()
+                .sort_values("value_index")["true_value"]
+                .to_numpy(dtype=np.float64)
             )
-            if len(method_data) != len(true_values):
+            if len(true_values) == 0:
                 raise ValueError(
-                    f"Missing {method} ({prior}) rows for {swept_parameter}."
+                    f"Comparison has no rows for {swept_parameter} under {prior}."
                 )
 
-            x = method_data["true_value"].to_numpy() + offsets[(method, prior)]
-            median = method_data["median"].to_numpy()
-            lower = method_data["ci_lower"].to_numpy()
-            upper = method_data["ci_upper"].to_numpy()
-            y_min = min(y_min, float(np.min(lower)))
-            y_max = max(y_max, float(np.max(upper)))
-
-            ax.errorbar(
-                x,
-                median,
-                yerr=np.vstack(
-                    [np.maximum(median - lower, 0.0), np.maximum(upper - median, 0.0)]
-                ),
-                fmt=METHOD_MARKERS[method],
-                color=color_by_combination[(method, prior)],
-                elinewidth=1.4,
-                capsize=3,
-                markersize=4.5,
-                label=f"{method} ({prior})",
-                zorder=2,
+            spacing = (
+                float(np.min(np.abs(np.diff(true_values))))
+                if len(true_values) > 1
+                else 1.0
+            )
+            maximum_offset = 0.18 * spacing
+            if swept_parameter == "sigma2":
+                maximum_offset = min(
+                    maximum_offset,
+                    0.4 * float(np.min(true_values)),
+                )
+            offsets = dict(
+                zip(
+                    METHOD_NAMES,
+                    np.linspace(-maximum_offset, maximum_offset, len(METHOD_NAMES)),
+                )
+            )
+            ax.plot(
+                true_values,
+                true_values,
+                color="0.35",
+                linestyle="--",
+                linewidth=1.0,
+                label="_nolegend_",
+                zorder=1,
             )
 
-        x_margin = max(0.65 * spacing, 1e-8)
-        y_margin = max(0.08 * (y_max - y_min), 1e-8)
-        ax.set_xlim(true_values.min() - x_margin, true_values.max() + x_margin)
-        ax.set_ylim(y_min - y_margin, y_max + y_margin)
-        parameter_label = PARAMETER_LABELS[swept_parameter]
-        ax.set_title(f"{parameter_label} sweep")
-        ax.set_xlabel(f"True {parameter_label}")
-        ax.set_ylabel(f"Posterior {parameter_label}")
-        ax.grid(alpha=0.25)
+            y_min = float(np.min(true_values))
+            y_max = float(np.max(true_values))
+            for method in METHOD_NAMES:
+                method_data = (
+                    subset[subset["method"] == method]
+                    .sort_values("value_index")
+                    .reset_index(drop=True)
+                )
+                if len(method_data) != len(true_values):
+                    raise ValueError(
+                        f"Missing {method} ({prior}) rows for {swept_parameter}."
+                    )
 
-        if legend_handles is None:
-            legend_handles, legend_labels = ax.get_legend_handles_labels()
+                x = method_data["true_value"].to_numpy() + offsets[method]
+                median = method_data["median"].to_numpy()
+                lower = method_data["ci_lower"].to_numpy()
+                upper = method_data["ci_upper"].to_numpy()
+                y_min = min(y_min, float(np.min(lower)))
+                y_max = max(y_max, float(np.max(upper)))
+
+                label = f"{method} ({prior})"
+                handle = ax.errorbar(
+                    x,
+                    median,
+                    yerr=np.vstack(
+                        [
+                            np.maximum(median - lower, 0.0),
+                            np.maximum(upper - median, 0.0),
+                        ]
+                    ),
+                    fmt=METHOD_MARKERS[method],
+                    color=PRIOR_METHOD_COLORS[prior][method],
+                    elinewidth=1.4,
+                    capsize=3,
+                    markersize=4.5,
+                    label=label,
+                    zorder=2,
+                )
+                legend_entries[label] = handle
+
+            x_margin = max(0.55 * spacing, 1e-8)
+            x_lower = true_values.min() - x_margin
+            if swept_parameter == "sigma2":
+                x_lower = max(0.0, x_lower)
+            ax.set_xlim(x_lower, true_values.max() + x_margin)
+            row_y_min = min(row_y_min, y_min)
+            row_y_max = max(row_y_max, y_max)
+            ax.set_title(
+                f"{parameter_label} sweep — {prior.capitalize()} prior"
+            )
+            ax.set_xlabel(f"True {parameter_label}")
+            ax.set_ylabel(f"Posterior {parameter_label}")
+            ax.grid(alpha=0.25)
+
+        row_y_margin = max(0.08 * (row_y_max - row_y_min), 1e-8)
+        row_y_lower = row_y_min - row_y_margin
+        if swept_parameter == "sigma2":
+            row_y_lower = max(0.0, row_y_lower)
+        axes[row, 0].set_ylim(
+            row_y_lower,
+            row_y_max + row_y_margin,
+        )
 
     fig.suptitle(
         f"{100.0 * (1.0 - alpha):.0f}% credible intervals for the three-parameter SV model"
     )
+    legend_labels = [
+        f"{method} ({prior})"
+        for method in METHOD_NAMES
+        for prior in PRIOR_NAMES
+    ]
     fig.legend(
-        legend_handles,
+        [legend_entries[label] for label in legend_labels],
         legend_labels,
         loc="lower center",
         ncol=3,
         frameon=False,
-        bbox_to_anchor=(0.5, -0.01),
+        bbox_to_anchor=(0.5, 0.005),
     )
-    fig.tight_layout(rect=(0.0, 0.12, 1.0, 0.94))
+    fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.96))
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -862,7 +1295,7 @@ def validate_lightweight_inference(
     y = sim.simulate_sv_chunk(
         mu=np.array([DEFAULT_BASELINE["mu"]]),
         phi=np.array([DEFAULT_BASELINE["phi"]]),
-        s=np.array([DEFAULT_BASELINE["sigma"]]),
+        s=np.sqrt(np.array([DEFAULT_BASELINE["sigma2"]])),
         r=np.array([0.0]),
         nu=np.array([np.inf]),
         n=n,
@@ -879,6 +1312,13 @@ def validate_lightweight_inference(
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "task",
+        nargs="?",
+        choices=("ci", "metrics", "validate"),
+        default="ci",
+        help="Run CI sweeps, the intensive metric benchmark, or lightweight validation.",
+    )
+    parser.add_argument(
         "--summary-default-checkpoint",
         default=DEFAULT_CHECKPOINTS[("Summary NN", "default")],
     )
@@ -894,9 +1334,22 @@ def parse_args(argv=None):
         "--tcn-finance-checkpoint",
         default=DEFAULT_CHECKPOINTS[("TCN", "finance")],
     )
-    parser.add_argument("--output-dir", default="nn_model_ci_test")
+    parser.add_argument("--output-dir", default="nn_model_tests")
     parser.add_argument("--sweep-size", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--metric-seed", type=int, default=3)
+    parser.add_argument(
+        "--benchmark-size",
+        type=int,
+        default=DEFAULT_BENCHMARK_SIZE,
+        help="Number K of prior-predictive pairs per selected prior.",
+    )
+    parser.add_argument(
+        "--benchmark-prior",
+        choices=("both", *PRIOR_NAMES),
+        default="both",
+        help="Prior(s) used by the metric task (default: both).",
+    )
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
     parser.add_argument("--mcmc-draws", type=int, default=DEFAULT_MCMC_DRAWS)
     parser.add_argument("--mcmc-burnin", type=int, default=DEFAULT_MCMC_BURNIN)
@@ -917,40 +1370,37 @@ def parse_args(argv=None):
 
     if args.sweep_size < 1:
         parser.error("--sweep-size must be at least 1")
+    if args.benchmark_size < 1:
+        parser.error("--benchmark-size must be at least 1")
     if not 0.0 < args.alpha < 1.0:
         parser.error("--alpha must lie in (0, 1)")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.mcmc_draws < 2:
+        parser.error("--mcmc-draws must be at least 2")
+    if args.mcmc_burnin < 0:
+        parser.error("--mcmc-burnin must be non-negative")
+    if args.mcmc_thinpara < 1:
+        parser.error("--mcmc-thinpara must be at least 1")
+    if args.mcmc_max_cores == 0:
+        parser.error("--mcmc-max-cores must be non-zero")
     return args
 
 
-def main(argv=None) -> None:
-    args = parse_args(argv)
-    device = torch.device(
-        "cuda" if args.device == "auto" and torch.cuda.is_available()
-        else "cpu" if args.device == "auto"
-        else args.device
-    )
+def main0(args=None, models=None, counts=None, sequence_length=None) -> None:
+    """Run and save the credible-interval sweep only.
 
-    checkpoint_paths = {
-        ("Summary NN", "default"): args.summary_default_checkpoint,
-        ("Summary NN", "finance"): args.summary_finance_checkpoint,
-        ("TCN", "default"): args.tcn_default_checkpoint,
-        ("TCN", "finance"): args.tcn_finance_checkpoint,
-    }
-    models = load_all_models(checkpoint_paths, device)
-    print(f"Loaded four neural checkpoints on {device}.")
-    counts = print_parameter_counts(models)
-    sequence_length = common_sequence_length(models)
-
-    if args.validate_only:
-        validate_lightweight_inference(models, sequence_length, args.seed)
-        return
+    Calling ``main0()`` directly uses the normal command-line defaults.  The
+    dispatcher also calls it with already-loaded objects to avoid loading the
+    four checkpoints twice.
+    """
+    if args is None:
+        return main(["ci"])
 
     comparison, sweeps, baseline = run_parameter_sweep_test(
         models=models,
         baseline=DEFAULT_BASELINE,
-        sweep_deltas=DEFAULT_SWEEP_DELTAS,
+        sweep_bounds=DEFAULT_SWEEP_BOUNDS,
         n=sequence_length,
         sweep_size=args.sweep_size,
         seed=args.seed,
@@ -964,8 +1414,8 @@ def main(argv=None) -> None:
 
     output_dir = resolve_output_dir(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    comparison_path = output_dir / "three_parameter_credible_intervals.csv"
-    plot_path = output_dir / "three_parameter_credible_intervals.png"
+    comparison_path = output_dir / "three_parameter_sigma2_credible_intervals.csv"
+    plot_path = output_dir / "three_parameter_credible_intervals.pdf"
     counts_path = output_dir / "neural_network_parameter_counts.csv"
 
     comparison.to_csv(comparison_path, index=False)
@@ -979,5 +1429,85 @@ def main(argv=None) -> None:
     print(f"Saved parameter counts to {counts_path}")
 
 
+def main1(args=None, models=None, counts=None, sequence_length=None) -> None:
+    """Run and save the computationally intensive metric benchmark only.
+
+    Calling ``main1()`` directly uses the normal command-line defaults.
+    """
+    if args is None:
+        return main(["metrics"])
+
+    priors = (
+        PRIOR_NAMES
+        if args.benchmark_prior == "both"
+        else (args.benchmark_prior,)
+    )
+    metrics, per_sequence_metrics = run_metric_benchmark(
+        models=models,
+        priors=priors,
+        benchmark_size=args.benchmark_size,
+        n=sequence_length,
+        seed=args.metric_seed,
+        alpha=args.alpha,
+        mcmc_draws=args.mcmc_draws,
+        mcmc_burnin=args.mcmc_burnin,
+        mcmc_thinpara=args.mcmc_thinpara,
+        mcmc_max_cores=args.mcmc_max_cores,
+        batch_size=args.batch_size,
+    )
+
+    output_dir = resolve_output_dir(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prior_label = "both_priors" if len(priors) == 2 else f"{priors[0]}_prior"
+    metrics_path = output_dir / (
+        f"transformed_posterior_benchmark_metrics_{prior_label}.csv"
+    )
+    details_path = output_dir / (
+        f"transformed_posterior_benchmark_per_sequence_{prior_label}.csv"
+    )
+    counts_path = output_dir / "neural_network_parameter_counts.csv"
+
+    metrics.to_csv(metrics_path, index=False)
+    per_sequence_metrics.to_csv(details_path, index=False)
+    counts.to_csv(counts_path, index=False)
+
+    print_metric_table(metrics)
+    print(f"Saved benchmark metrics to {metrics_path}")
+    print(f"Saved per-sequence benchmark details to {details_path}")
+    print(f"Saved parameter counts to {counts_path}")
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    if args.validate_only:
+        args.task = "validate"
+
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto"
+        else args.device
+    )
+    checkpoint_paths = {
+        ("Summary NN", "default"): args.summary_default_checkpoint,
+        ("Summary NN", "finance"): args.summary_finance_checkpoint,
+        ("TCN", "default"): args.tcn_default_checkpoint,
+        ("TCN", "finance"): args.tcn_finance_checkpoint,
+    }
+    models = load_all_models(checkpoint_paths, device)
+    print(f"Loaded four neural checkpoints on {device}.")
+    counts = print_parameter_counts(models)
+    sequence_length = common_sequence_length(models)
+
+    if args.task == "validate":
+        validate_lightweight_inference(models, sequence_length, args.seed)
+    elif args.task == "ci":
+        main0(args, models, counts, sequence_length)
+    elif args.task == "metrics":
+        main1(args, models, counts, sequence_length)
+    else:
+        raise RuntimeError(f"Unhandled task: {args.task}")
+
+
 if __name__ == "__main__":
-    main()
+    main1()
+
