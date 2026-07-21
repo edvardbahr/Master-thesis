@@ -57,7 +57,7 @@ CI_SEED = 2
 METRIC_SEED = 3
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-WEIGHTS_DIR = HERE.parents[2] / "weights"
+WEIGHTS_DIR = HERE.parents[2] / "weights" #Needs to be generalized.
 OUTPUT_DIR = HERE / "nn_model_tests"
 
 PRIORS = ("default", "finance")
@@ -85,16 +85,9 @@ SWEEPS = {
 }
 
 COLORS = {
-    "default": {
-        "stochvol": "#0000ff",  # blue
-        "TCN": "#bf00bf",  # purple
-        "Summary NN": "#bfbf00",  # yellow
-    },
-    "finance": {
-        "stochvol": "#008000",  # green
-        "TCN": "#ff0000",  # red
-        "Summary NN": "#00bfbf",  # teal
-    },
+    "stochvol": "#0000ff",
+    "TCN": "#ff0000",
+    "Summary NN": "#008000",
 }
 
 MARKERS = {
@@ -416,34 +409,33 @@ def plot_credible_intervals(comparison, output_path) -> None:
                 median = data["median"].to_numpy()
                 lower = data["ci_lower"].to_numpy()
                 upper = data["ci_upper"].to_numpy()
-                label = f"{method} ({prior})"
-                legend_handles[label] = ax.errorbar(
+                legend_handles[method] = ax.errorbar(
                     true_values + offsets[method],
                     median,
                     yerr=np.vstack((median - lower, upper - median)),
                     fmt=MARKERS[method],
-                    color=COLORS[prior][method],
+                    color=COLORS[method],
                     capsize=3,
                     markersize=4.5,
-                    label=label,
+                    label=method,
                 )
 
             parameter_label = PARAMETER_LABELS[parameter]
-            ax.set_title(f"{parameter_label} — {prior.capitalize()} prior")
+            if row == 0:
+                ax.set_title(f"{prior.capitalize()} prior")
             ax.set_xlabel(f"True {parameter_label}")
-            ax.set_ylabel(f"Posterior {parameter_label}")
+            if column == 0:
+                ax.set_ylabel(f"Estimated {parameter_label}")
             ax.grid(alpha=0.25)
 
-    labels = [f"{method} ({prior})" for prior in PRIORS for method in METHODS]
-    fig.suptitle("95% credible intervals for the three-parameter SV model")
     fig.legend(
-        [legend_handles[label] for label in labels],
-        labels,
+        [legend_handles[method] for method in METHODS],
+        METHODS,
         loc="lower center",
         ncol=3,
         frameon=False,
     )
-    fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.96))
+    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
