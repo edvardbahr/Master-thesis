@@ -56,6 +56,7 @@ CI_SWEEP_SIZE = 10
 CI_SEED = 2
 METRIC_SEED = 3
 COVERAGE_ALPHAS = np.arange(5, 51, 5) / 100.0
+MCMC_DATA_PERCENTAGES = (100, 95, 90)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WEIGHTS_DIR = HERE.parent / "weights"
@@ -592,66 +593,67 @@ def empirical_coverage_rows(method, prior, targets, means, variances):
 def metric_row(
     method,
     prior,
+    data_percentage,
+    n_observations,
     targets,
     means,
     variances,
     runtimes,
-    mcmc_loss,
-    mcmc_variances,
+    reference_variances,
 ):
-    loss_difference = np.mean(
-        gaussian_loss(targets, means, variances) - mcmc_loss,
-        axis=0,
-    )
+    marginal_loss = np.mean(gaussian_loss(targets, means, variances), axis=0)
     rmse = np.sqrt(np.mean((targets - means) ** 2, axis=0))
-    log_variance_ratio = np.mean(np.log(variances / mcmc_variances), axis=0)
+    log_variance_ratio = np.mean(
+        np.log(variances / reference_variances), axis=0
+    )
 
-    row = {"model": f"{method} ({prior})"}
+    row = {
+        "method": method,
+        "prior": prior,
+        "data_percentage": data_percentage,
+        "n_observations": n_observations,
+    }
     for index, parameter in enumerate(TRANSFORMED_PARAMETERS):
-        row[f"delta_loss_{parameter}"] = loss_difference[index]
+        row[f"marginal_loss_{parameter}"] = marginal_loss[index]
         row[f"rmse_{parameter}"] = rmse[index]
-        row[f"log_var_{parameter}"] = log_variance_ratio[index]
+        row[f"log_var_ratio_{parameter}"] = log_variance_ratio[index]
     row["mean_runtime_seconds"] = np.mean(runtimes)
     row["sd_runtime_seconds"] = np.std(runtimes, ddof=1)
     return row
 
 
 def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rows = []
+    npe_rows = []
+    mcmc_rows = []
     coverage_rows = []
 
     for prior_index, prior in enumerate(PRIORS):
         print(f"\nGenerating {BENCHMARK_SIZE} benchmark series for the {prior} prior.")
         y, targets = simulate_benchmark(prior, METRIC_SEED + prior_index)
 
-        print(
-            f"Running stochvol ({prior}) with {MCMC_DRAWS:,} draws per sequence."
-        )
-        mcmc_summary = run_stochvol_mcmc(
-            y,
-            prior=prior,
-            draws=MCMC_DRAWS,
-            burnin=MCMC_BURNIN,
-            thinpara=MCMC_THINPARA,
-            alpha=ALPHA,
-            transforms=METRIC_MCMC_TRANSFORMS,
-            max_cores=MCMC_MAX_CORES,
-        )
-        mcmc_mean, mcmc_variance, mcmc_runtimes = mcmc_moments(mcmc_summary)
-        mcmc_loss = gaussian_loss(targets, mcmc_mean, mcmc_variance)
-
-        rows.append(
-            metric_row(
-                "stochvol",
-                prior,
-                targets,
-                mcmc_mean,
-                mcmc_variance,
-                mcmc_runtimes,
-                mcmc_loss,
-                mcmc_variance,
+        mcmc_results = {}
+        for data_percentage in MCMC_DATA_PERCENTAGES:
+            n_observations = y.shape[1] * data_percentage // 100
+            print(
+                f"Running stochvol ({prior}, {data_percentage}% data, "
+                f"n={n_observations}) with {MCMC_DRAWS:,} draws per sequence."
             )
-        )
+            summary = run_stochvol_mcmc(
+                y[:, :n_observations],
+                prior=prior,
+                draws=MCMC_DRAWS,
+                burnin=MCMC_BURNIN,
+                thinpara=MCMC_THINPARA,
+                alpha=ALPHA,
+                transforms=METRIC_MCMC_TRANSFORMS,
+                max_cores=MCMC_MAX_CORES,
+            )
+            mcmc_results[data_percentage] = (
+                n_observations,
+                *mcmc_moments(summary),
+            )
+
+        n_full, mcmc_mean, mcmc_variance, mcmc_runtimes = mcmc_results[100]
         coverage_rows.extend(
             empirical_coverage_rows(
                 "stochvol",
@@ -667,16 +669,16 @@ def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
             mean, variance, runtimes = predict_with_runtimes(
                 models[(architecture, prior)], y
             )
-            display_name = "summary NN" if architecture == "Summary NN" else "TCN"
-            rows.append(
+            npe_rows.append(
                 metric_row(
-                    display_name,
+                    architecture,
                     prior,
+                    100,
+                    y.shape[1],
                     targets,
                     mean,
                     variance,
                     runtimes,
-                    mcmc_loss,
                     mcmc_variance,
                 )
             )
@@ -690,12 +692,30 @@ def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
                 )
             )
 
-    columns = ["model"]
-    columns += [f"delta_loss_{name}" for name in TRANSFORMED_PARAMETERS]
+        for data_percentage in MCMC_DATA_PERCENTAGES:
+            n_observations, mean, variance, runtimes = mcmc_results[
+                data_percentage
+            ]
+            mcmc_rows.append(
+                metric_row(
+                    "stochvol",
+                    prior,
+                    data_percentage,
+                    n_observations,
+                    targets,
+                    mean,
+                    variance,
+                    runtimes,
+                    mcmc_variance,
+                )
+            )
+
+    columns = ["method", "prior", "data_percentage", "n_observations"]
+    columns += [f"marginal_loss_{name}" for name in TRANSFORMED_PARAMETERS]
     columns += [f"rmse_{name}" for name in TRANSFORMED_PARAMETERS]
-    columns += [f"log_var_{name}" for name in TRANSFORMED_PARAMETERS]
+    columns += [f"log_var_ratio_{name}" for name in TRANSFORMED_PARAMETERS]
     columns += ["mean_runtime_seconds", "sd_runtime_seconds"]
-    metrics = pd.DataFrame(rows)[columns]
+    metrics = pd.DataFrame(npe_rows + mcmc_rows)[columns]
     coverage = pd.DataFrame(coverage_rows)
     return metrics, coverage
 
