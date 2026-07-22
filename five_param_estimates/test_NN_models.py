@@ -2,8 +2,8 @@
 
 There are deliberately only two entry points:
 
-``main0()`` creates the fixed 3-by-2 credible-interval figure.
-``main1()`` runs the fixed 2,000-sequence metric and runtime benchmark.
+``main0()`` creates the credible-interval and loss-history figures.
+``main1()`` runs the fixed 2,000-sequence metric, coverage and runtime benchmark.
 
 Both functions always load the same four neural checkpoints and compare them
 with stochvol under the default and finance priors.
@@ -55,6 +55,7 @@ BENCHMARK_SIZE = 2_000
 CI_SWEEP_SIZE = 10
 CI_SEED = 2
 METRIC_SEED = 3
+COVERAGE_ALPHAS = np.arange(5, 51, 5) / 100.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WEIGHTS_DIR = HERE.parent / "weights"
@@ -100,6 +101,12 @@ PARAMETER_LABELS = {
     "mu": r"$\mu$",
     "phi": r"$\phi$",
     "sigma2": r"$\sigma^2$",
+}
+
+TRANSFORMED_PARAMETER_LABELS = {
+    "mu": r"$\mu$",
+    "psi": r"$\psi$",
+    "rho": r"$\rho$",
 }
 
 
@@ -169,16 +176,19 @@ def print_parameter_counts(models) -> pd.DataFrame:
     for architecture in ("Summary NN", "TCN"):
         for prior in PRIORS:
             model = models[(architecture, prior)].model
-            rows.append(
-                {
-                    "architecture": architecture,
-                    "prior": prior,
-                    "trainable_parameters": sum(
-                        p.numel() for p in model.parameters() if p.requires_grad
-                    ),
-                    "total_parameters": sum(p.numel() for p in model.parameters()),
-                }
-            )
+            row = {
+                "architecture": architecture,
+                "prior": prior,
+                "trainable_parameters": sum(
+                    p.numel() for p in model.parameters() if p.requires_grad
+                ),
+                "total_parameters": sum(p.numel() for p in model.parameters()),
+            }
+            for parameter, head in zip(TRANSFORMED_PARAMETERS, model.heads.values()):
+                row[f"{parameter}_head_parameters"] = sum(
+                    p.numel() for p in head.parameters() if p.requires_grad
+                )
+            rows.append(row)
 
     counts = pd.DataFrame(rows)
     print("\nNeural-network parameter counts:")
@@ -440,6 +450,58 @@ def plot_credible_intervals(comparison, output_path) -> None:
     plt.close(fig)
 
 
+def plot_loss_histories(models, output_path) -> None:
+    apply_plot_style()
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.2), sharey=True)
+    legend_handles = {}
+
+    for column, prior in enumerate(PRIORS):
+        ax = axes[column]
+
+        for architecture in ("TCN", "Summary NN"):
+            checkpoint = models[(architecture, prior)].checkpoint
+            marginal_losses = np.asarray(
+                checkpoint["val_marginal_loss_history"], dtype=np.float64
+            )
+            losses = np.mean(marginal_losses, axis=1)
+            epochs = np.arange(1, len(losses) + 1)
+
+            legend_handles[architecture] = ax.plot(
+                epochs,
+                losses,
+                color=COLORS[architecture],
+                label=architecture,
+            )[0]
+            legend_handles["Final epoch"] = ax.plot(
+                epochs[-1],
+                losses[-1],
+                color="black",
+                marker="x",
+                markersize=8,
+                markeredgewidth=1.8,
+                linestyle="none",
+                label="Final epoch",
+            )[0]
+
+        ax.set_title(f"{prior.capitalize()} prior")
+        ax.set_xlabel("Epoch")
+        ax.set_yscale("log")
+        ax.grid(alpha=0.25)
+
+    axes[0].set_ylabel("Mean marginal Gaussian loss")
+    legend_order = ("TCN", "Summary NN", "Final epoch")
+    fig.legend(
+        [legend_handles[name] for name in legend_order],
+        legend_order,
+        loc="lower center",
+        ncol=3,
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 METRIC_MCMC_TRANSFORMS = {
     "mu": {
         "mu_centered_sq": centered_square_transform,
@@ -500,6 +562,33 @@ def gaussian_loss(targets, means, variances):
     return 0.5 * (np.log(variances) + (targets - means) ** 2 / variances)
 
 
+def empirical_coverage_rows(method, prior, targets, means, variances):
+    standardized_errors = np.abs(targets - means) / np.sqrt(variances)
+    rows = []
+
+    for alpha in COVERAGE_ALPHAS:
+        nominal_coverage = 1.0 - alpha
+        critical_value = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+        empirical_coverage = np.mean(
+            standardized_errors <= critical_value,
+            axis=0,
+        )
+
+        for index, parameter in enumerate(TRANSFORMED_PARAMETERS):
+            rows.append(
+                {
+                    "method": method,
+                    "prior": prior,
+                    "parameter": parameter,
+                    "alpha": alpha,
+                    "nominal_coverage": nominal_coverage,
+                    "empirical_coverage": empirical_coverage[index],
+                }
+            )
+
+    return rows
+
+
 def metric_row(
     method,
     prior,
@@ -527,8 +616,9 @@ def metric_row(
     return row
 
 
-def calculate_metrics(models) -> pd.DataFrame:
+def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    coverage_rows = []
 
     for prior_index, prior in enumerate(PRIORS):
         print(f"\nGenerating {BENCHMARK_SIZE} benchmark series for the {prior} prior.")
@@ -562,6 +652,15 @@ def calculate_metrics(models) -> pd.DataFrame:
                 mcmc_variance,
             )
         )
+        coverage_rows.extend(
+            empirical_coverage_rows(
+                "stochvol",
+                prior,
+                targets,
+                mcmc_mean,
+                mcmc_variance,
+            )
+        )
 
         for architecture in ("TCN", "Summary NN"):
             print(f"Timing {architecture} ({prior}) one sequence at a time.")
@@ -581,17 +680,78 @@ def calculate_metrics(models) -> pd.DataFrame:
                     mcmc_variance,
                 )
             )
+            coverage_rows.extend(
+                empirical_coverage_rows(
+                    architecture,
+                    prior,
+                    targets,
+                    mean,
+                    variance,
+                )
+            )
 
     columns = ["model"]
     columns += [f"delta_loss_{name}" for name in TRANSFORMED_PARAMETERS]
     columns += [f"rmse_{name}" for name in TRANSFORMED_PARAMETERS]
     columns += [f"log_var_{name}" for name in TRANSFORMED_PARAMETERS]
     columns += ["mean_runtime_seconds", "sd_runtime_seconds"]
-    return pd.DataFrame(rows)[columns]
+    metrics = pd.DataFrame(rows)[columns]
+    coverage = pd.DataFrame(coverage_rows)
+    return metrics, coverage
+
+
+def plot_empirical_coverage(coverage, output_path) -> None:
+    apply_plot_style()
+    fig, axes = plt.subplots(3, 2, figsize=(12.5, 13.0), sharex=True, sharey="row")
+    legend_handles = {}
+
+    nominal_limits = (
+        1.0 - np.max(COVERAGE_ALPHAS),
+        1.0 - np.min(COVERAGE_ALPHAS),
+    )
+
+    for row, parameter in enumerate(TRANSFORMED_PARAMETERS):
+        for column, prior in enumerate(PRIORS):
+            ax = axes[row, column]
+            ax.plot(nominal_limits, nominal_limits, color="0.35", linestyle="--")
+
+            for method in METHODS:
+                data = coverage[
+                    (coverage["parameter"] == parameter)
+                    & (coverage["prior"] == prior)
+                    & (coverage["method"] == method)
+                ].sort_values("nominal_coverage")
+                legend_handles[method] = ax.plot(
+                    data["nominal_coverage"],
+                    data["empirical_coverage"],
+                    color=COLORS[method],
+                    marker=MARKERS[method],
+                    markersize=4.5,
+                    label=method,
+                )[0]
+
+            parameter_label = TRANSFORMED_PARAMETER_LABELS[parameter]
+            if row == 0:
+                ax.set_title(f"{prior.capitalize()} prior")
+            ax.set_xlabel("Nominal coverage level")
+            if column == 0:
+                ax.set_ylabel(f"Empirical {parameter_label} coverage")
+            ax.grid(alpha=0.25)
+
+    fig.legend(
+        [legend_handles[method] for method in METHODS],
+        METHODS,
+        loc="lower center",
+        ncol=3,
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main0() -> None:
-    """Create the fixed 3-by-2 credible-interval plot."""
+    """Create the credible-interval and Gaussian-loss-history plots."""
     models = load_models()
     counts = print_parameter_counts(models)
     comparison = calculate_credible_intervals(models)
@@ -599,34 +759,43 @@ def main0() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     comparison_path = OUTPUT_DIR / "three_parameter_sigma2_credible_intervals.csv"
     plot_path = OUTPUT_DIR / "three_parameter_credible_intervals.pdf"
+    loss_plot_path = OUTPUT_DIR / "gaussian_loss_history.pdf"
     counts_path = OUTPUT_DIR / "neural_network_parameter_counts.csv"
 
     comparison.to_csv(comparison_path, index=False)
     counts.to_csv(counts_path, index=False)
     plot_credible_intervals(comparison, plot_path)
+    plot_loss_histories(models, loss_plot_path)
 
     print(f"\nSaved credible intervals to {comparison_path}")
     print(f"Saved the 3-by-2 plot to {plot_path}")
+    print(f"Saved the Gaussian loss histories to {loss_plot_path}")
 
 
 def main1() -> None:
-    """Run the fixed 2,000-sequence metrics and runtime benchmark."""
+    """Run the fixed 2,000-sequence metrics, coverage and runtime benchmark."""
     models = load_models()
     counts = print_parameter_counts(models)
-    metrics = calculate_metrics(models)
+    metrics, coverage = calculate_metrics(models)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     metrics_path = OUTPUT_DIR / "transformed_posterior_benchmark_metrics.csv"
+    coverage_path = OUTPUT_DIR / "transformed_posterior_empirical_coverage.csv"
+    coverage_plot_path = OUTPUT_DIR / "transformed_posterior_empirical_coverage.pdf"
     counts_path = OUTPUT_DIR / "neural_network_parameter_counts.csv"
 
     metrics.to_csv(metrics_path, index=False)
+    coverage.to_csv(coverage_path, index=False)
     counts.to_csv(counts_path, index=False)
+    plot_empirical_coverage(coverage, coverage_plot_path)
 
     print("\nMetric and runtime comparison:")
     with pd.option_context("display.max_columns", None, "display.width", 240):
         print(metrics.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
     print(f"\nSaved metrics to {metrics_path}")
+    print(f"Saved empirical coverage to {coverage_path}")
+    print(f"Saved the 3-by-2 coverage plot to {coverage_plot_path}")
 
 
 if __name__ == "__main__":
-    main0()
+    main1()
