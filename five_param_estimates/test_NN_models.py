@@ -57,7 +57,7 @@ CI_SEED = 2
 METRIC_SEED = 3
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-WEIGHTS_DIR = HERE.parents[2] / "weights" #Needs to be generalized.
+WEIGHTS_DIR = HERE.parent / "weights"
 OUTPUT_DIR = HERE / "nn_model_tests"
 
 PRIORS = ("default", "finance")
@@ -425,7 +425,7 @@ def plot_credible_intervals(comparison, output_path) -> None:
                 ax.set_title(f"{prior.capitalize()} prior")
             ax.set_xlabel(f"True {parameter_label}")
             if column == 0:
-                ax.set_ylabel(f"Estimated {parameter_label}")
+                ax.set_ylabel(f"{parameter_label} posterior mean")
             ax.grid(alpha=0.25)
 
     fig.legend(
@@ -629,4 +629,4 @@ def main1() -> None:
 
 
 if __name__ == "__main__":
-    main1()
+    main0()
