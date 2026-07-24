@@ -1,6 +1,0 @@
-\hline
-Method & \(\overline{\Delta}_{\mathrm{loss},\mu}\mathbin{\pm}\widehat{\mathrm{SD}}\) & \(\overline{\Delta}_{\mathrm{loss},\psi}\mathbin{\pm}\widehat{\mathrm{SD}}\) & \(\overline{\Delta}_{\mathrm{loss},\rho}\mathbin{\pm}\widehat{\mathrm{SD}}\) & \(\overline{\Delta}_{\mathrm{loss}}\mathbin{\pm}\widehat{\mathrm{SD}}\) \\
-\hline
-TCN \(-\) MCMC & \(0.0154\mathbin{\pm}0.0043\) & \(0.0281\mathbin{\pm}0.0049\) & \(0.0899\mathbin{\pm}0.0081\) & \(0.0445\mathbin{\pm}0.0039\) \\
-Summary NN \(-\) MCMC & \(0.0684\mathbin{\pm}0.0130\) & \(0.1625\mathbin{\pm}0.0138\) & \(0.3530\mathbin{\pm}0.0172\) & \(0.1946\mathbin{\pm}0.0101\) \\
-\hline

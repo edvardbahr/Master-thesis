@@ -1,13 +1,8 @@
 """Test the three standard-SV posterior estimators.
 
-There are deliberately only three entry points:
-
 ``main0()`` creates the credible-interval and loss-history figures.
-``main1()`` runs the fixed 2,000-sequence metric, coverage and runtime benchmark.
-``main2()`` formats the saved metrics and estimates mean-loss uncertainty.
-
-The comparisons use the same four neural checkpoints and stochvol under the
-default and finance priors.
+``main1()`` runs and formats the 5,000-sequence benchmark.
+``main2()`` adds the paired Summary-NN-minus-TCN loss uncertainty.
 """
 
 from __future__ import annotations
@@ -52,12 +47,13 @@ MCMC_DRAWS = 20_000
 MCMC_BURNIN = 500
 MCMC_THINPARA = 1
 MCMC_MAX_CORES = -2
-BENCHMARK_SIZE = 2_000
+BENCHMARK_SIZE = 5_000
 CI_SWEEP_SIZE = 10
 CI_SEED = 2
 METRIC_SEED = 3
 COVERAGE_ALPHAS = np.arange(5, 51, 5) / 100.0
 MCMC_DATA_PERCENTAGES = (100, 95, 90, 85, 80)
+ROUNDING_ZERO_TOLERANCE = 0.00005
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WEIGHTS_DIR = HERE.parent / "weights"
@@ -65,7 +61,7 @@ OUTPUT_DIR = HERE / "nn_model_tests"
 LATEX_TABLES_DIR = OUTPUT_DIR / "latex_tables"
 
 PRIORS = ("default", "finance")
-PARAMETERS = ("mu", "phi", "sigma2")
+PARAMETERS = ("mu", "phi", "sigma")
 TRANSFORMED_PARAMETERS = ("mu", "psi", "rho")
 METHODS = ("stochvol", "TCN", "Summary NN")
 
@@ -79,13 +75,13 @@ CHECKPOINT_NAMES = {
 BASELINE = {
     "mu": -9.0,
     "phi": 0.95,
-    "sigma2": 0.25**2,
+    "sigma": 0.25,
 }
 
 SWEEPS = {
     "mu": np.linspace(-12.0, -6.0, CI_SWEEP_SIZE),
     "phi": np.linspace(0.905, 0.995, CI_SWEEP_SIZE),
-    "sigma2": np.linspace(0.05**2, 0.45**2, CI_SWEEP_SIZE),
+    "sigma": np.linspace(0.05, 0.45, CI_SWEEP_SIZE),
 }
 
 COLORS = {
@@ -103,7 +99,7 @@ MARKERS = {
 PARAMETER_LABELS = {
     "mu": r"$\mu$",
     "phi": r"$\phi$",
-    "sigma2": r"$\sigma^2$",
+    "sigma": r"$\sigma$",
 }
 
 TRANSFORMED_PARAMETER_LABELS = {
@@ -294,7 +290,7 @@ def simulate_ci_series():
         datasets[swept_parameter] = sim.simulate_sv_chunk(
             mu=parameters["mu"],
             phi=parameters["phi"],
-            s=np.sqrt(parameters["sigma2"]),
+            s=parameters["sigma"],
             r=np.zeros(CI_SWEEP_SIZE),
             nu=np.full(CI_SWEEP_SIZE, np.inf),
             n=SEQUENCE_LENGTH,
@@ -319,20 +315,11 @@ def transformed_gaussian_ci(mean, variance) -> pd.DataFrame:
             "phi_median": np.tanh(mean[:, 1] / 2.0),
             "phi_ci_lower": np.tanh(lower[:, 1] / 2.0),
             "phi_ci_upper": np.tanh(upper[:, 1] / 2.0),
-            "sigma2_median": np.exp(2.0 * mean[:, 2]),
-            "sigma2_ci_lower": np.exp(2.0 * lower[:, 2]),
-            "sigma2_ci_upper": np.exp(2.0 * upper[:, 2]),
+            "sigma_median": np.exp(mean[:, 2]),
+            "sigma_ci_lower": np.exp(lower[:, 2]),
+            "sigma_ci_upper": np.exp(upper[:, 2]),
         }
     )
-
-
-def sigma_squared_transform(sigma):
-    return np.asarray(sigma) ** 2
-
-
-CI_MCMC_TRANSFORMS = {
-    "sigma": {"sigma2": sigma_squared_transform},
-}
 
 
 def add_ci_rows(rows, parameter, method, prior, ci):
@@ -370,7 +357,7 @@ def calculate_credible_intervals(models) -> pd.DataFrame:
                 burnin=MCMC_BURNIN,
                 thinpara=MCMC_THINPARA,
                 alpha=ALPHA,
-                transforms=CI_MCMC_TRANSFORMS,
+                transforms=None,
                 max_cores=MCMC_MAX_CORES,
             )
             add_ci_rows(rows, parameter, "stochvol", prior, mcmc_ci)
@@ -387,12 +374,12 @@ def apply_plot_style() -> None:
     plt.rcParams.update(
         {
             "font.family": "serif",
-            "font.size": 14,
-            "axes.titlesize": 16,
-            "axes.labelsize": 14,
-            "legend.fontsize": 13,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
+            "font.size": 15,
+            "axes.titlesize": 17,
+            "axes.labelsize": 15,
+            "legend.fontsize": 14,
+            "xtick.labelsize": 13,
+            "ytick.labelsize": 13,
             "axes.linewidth": 0.8,
             "lines.linewidth": 1.4,
         }
@@ -401,7 +388,7 @@ def apply_plot_style() -> None:
 
 def plot_credible_intervals(comparison, output_path) -> None:
     apply_plot_style()
-    fig, axes = plt.subplots(3, 2, figsize=(12.5, 13.0), sharex="row", sharey="row")
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 13.0), sharex="row", sharey="row")
     legend_handles = {}
 
     for row, parameter in enumerate(PARAMETERS):
@@ -438,7 +425,7 @@ def plot_credible_intervals(comparison, output_path) -> None:
                 ax.set_title(f"{prior.capitalize()} prior")
             ax.set_xlabel(f"True {parameter_label}")
             if column == 0:
-                ax.set_ylabel(f"{parameter_label} posterior mean")
+                ax.set_ylabel(f"{parameter_label} posterior median")
             ax.grid(alpha=0.25)
 
     fig.legend(
@@ -455,7 +442,7 @@ def plot_credible_intervals(comparison, output_path) -> None:
 
 def plot_loss_histories(models, output_path) -> None:
     apply_plot_style()
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.2), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2), sharey=True)
     legend_handles = {}
 
     for column, prior in enumerate(PRIORS):
@@ -565,7 +552,7 @@ def gaussian_loss(targets, means, variances):
     return 0.5 * (np.log(variances) + (targets - means) ** 2 / variances)
 
 
-def mean_loss_samples(method, prior, targets, means, variances):
+def loss_sample_frame(method, prior, targets, means, variances):
     losses = gaussian_loss(targets, means, variances)
     return pd.DataFrame(
         {
@@ -676,10 +663,11 @@ def metric_columns():
     return columns
 
 
-def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
+def calculate_metrics(models):
     npe_rows = []
     mcmc_rows = []
     coverage_rows = []
+    loss_frames = []
 
     for prior_index, prior in enumerate(PRIORS):
         print(f"\nGenerating {BENCHMARK_SIZE} benchmark series for the {prior} prior.")
@@ -688,6 +676,15 @@ def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
         mcmc_results = run_mcmc_benchmarks(y, prior, MCMC_DATA_PERCENTAGES)
 
         _, mcmc_mean, mcmc_variance, _ = mcmc_results[100]
+        loss_frames.append(
+            loss_sample_frame(
+                "stochvol",
+                prior,
+                targets,
+                mcmc_mean,
+                mcmc_variance,
+            )
+        )
         coverage_rows.extend(
             empirical_coverage_rows(
                 "stochvol",
@@ -714,6 +711,15 @@ def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
                     variance,
                     runtimes,
                     mcmc_variance,
+                )
+            )
+            loss_frames.append(
+                loss_sample_frame(
+                    architecture,
+                    prior,
+                    targets,
+                    mean,
+                    variance,
                 )
             )
             coverage_rows.extend(
@@ -746,26 +752,22 @@ def calculate_metrics(models) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     metrics = pd.DataFrame(npe_rows + mcmc_rows)[metric_columns()]
     coverage = pd.DataFrame(coverage_rows)
-    return metrics, coverage
+    loss_samples = pd.concat(loss_frames, ignore_index=True)
+    return metrics, coverage, loss_samples
 
 
-def calculate_full_data_loss_samples(models) -> pd.DataFrame:
+def calculate_npe_loss_samples(models):
     frames = []
 
     for prior_index, prior in enumerate(PRIORS):
         print(f"\nRegenerating {BENCHMARK_SIZE} series for the {prior} prior.")
         y, targets = simulate_benchmark(prior, METRIC_SEED + prior_index)
-        mcmc_results = run_mcmc_benchmarks(y, prior, (100,))
-        _, mean, variance, _ = mcmc_results[100]
-        frames.append(
-            mean_loss_samples("stochvol", prior, targets, mean, variance)
-        )
 
         for architecture in ("TCN", "Summary NN"):
-            print(f"Predicting {architecture} ({prior}) for the loss diagnostic.")
+            print(f"Predicting {architecture} ({prior}).")
             mean, variance = predict(models[(architecture, prior)], y)
             frames.append(
-                mean_loss_samples(
+                loss_sample_frame(
                     architecture,
                     prior,
                     targets,
@@ -796,8 +798,15 @@ def uncertainty_row(
     values,
 ):
     values = np.asarray(values, dtype=np.float64)
+    estimate = np.mean(values)
     sample_variance = np.var(values, ddof=1)
     variance_of_mean = sample_variance / len(values)
+    sd_of_mean = np.sqrt(variance_of_mean)
+    relative_sd = (
+        np.nan
+        if estimate == 0.0
+        else sd_of_mean / abs(estimate)
+    )
     return {
         "estimate_type": estimate_type,
         "method": method,
@@ -805,11 +814,53 @@ def uncertainty_row(
         "prior": prior,
         "component": component,
         "benchmark_size": len(values),
-        "estimate": np.mean(values),
+        "estimate": estimate,
         "sample_sd": np.sqrt(sample_variance),
         "estimated_variance_of_mean": variance_of_mean,
-        "estimated_sd_of_mean": np.sqrt(variance_of_mean),
+        "estimated_sd_of_mean": sd_of_mean,
+        "relative_sd": relative_sd,
     }
+
+
+def select_loss_samples(loss_samples, method, prior):
+    selected = loss_samples[
+        (loss_samples["method"] == method)
+        & (loss_samples["prior"] == prior)
+    ].sort_values("benchmark_index")
+    if (
+        len(selected) != BENCHMARK_SIZE
+        or selected["benchmark_index"].nunique() != BENCHMARK_SIZE
+    ):
+        raise ValueError(
+            f"Expected {BENCHMARK_SIZE} loss samples for {method} "
+            f"({prior}), found {len(selected)}."
+        )
+    if not np.array_equal(
+        selected["benchmark_index"].to_numpy(),
+        np.arange(BENCHMARK_SIZE),
+    ):
+        raise ValueError(f"Unexpected benchmark indices for {method} ({prior}).")
+    return selected
+
+
+def paired_loss_uncertainty_rows(method_samples, method, reference, prior):
+    rows = []
+    for component, column in loss_component_columns().items():
+        differences = (
+            method_samples[method][column].to_numpy(dtype=np.float64)
+            - method_samples[reference][column].to_numpy(dtype=np.float64)
+        )
+        rows.append(
+            uncertainty_row(
+                "paired_loss_difference",
+                method,
+                reference,
+                prior,
+                component,
+                differences,
+            )
+        )
+    return rows
 
 
 def summarize_loss_sampling_uncertainty(loss_samples) -> pd.DataFrame:
@@ -817,29 +868,11 @@ def summarize_loss_sampling_uncertainty(loss_samples) -> pd.DataFrame:
     components = loss_component_columns()
 
     for prior in PRIORS:
-        method_samples = {}
-        for method in METHODS:
-            selected = loss_samples[
-                (loss_samples["method"] == method)
-                & (loss_samples["prior"] == prior)
-            ].sort_values("benchmark_index")
-            if (
-                len(selected) != BENCHMARK_SIZE
-                or selected["benchmark_index"].nunique() != BENCHMARK_SIZE
-            ):
-                raise ValueError(
-                    f"Expected {BENCHMARK_SIZE} loss samples for {method} "
-                    f"({prior}), found {len(selected)}."
-                )
-            if not np.array_equal(
-                selected["benchmark_index"].to_numpy(),
-                np.arange(BENCHMARK_SIZE),
-            ):
-                raise ValueError(
-                    f"Unexpected benchmark indices for {method} ({prior})."
-                )
-
-            method_samples[method] = selected
+        method_samples = {
+            method: select_loss_samples(loss_samples, method, prior)
+            for method in METHODS
+        }
+        for method, selected in method_samples.items():
             for component, column in components.items():
                 values = selected[column].to_numpy(dtype=np.float64)
                 if not np.all(np.isfinite(values)):
@@ -857,53 +890,44 @@ def summarize_loss_sampling_uncertainty(loss_samples) -> pd.DataFrame:
                     )
                 )
 
-        reference = method_samples["stochvol"]
-        for method in ("TCN", "Summary NN"):
-            for component, column in components.items():
-                differences = (
-                    method_samples[method][column].to_numpy(dtype=np.float64)
-                    - reference[column].to_numpy(dtype=np.float64)
+        for method, reference in (
+            ("TCN", "stochvol"),
+            ("Summary NN", "stochvol"),
+            ("Summary NN", "TCN"),
+        ):
+            rows.extend(
+                paired_loss_uncertainty_rows(
+                    method_samples,
+                    method,
+                    reference,
+                    prior,
                 )
-                rows.append(
-                    uncertainty_row(
-                        "paired_loss_difference",
-                        method,
-                        "stochvol",
-                        prior,
-                        component,
-                        differences,
-                    )
-                )
+            )
 
     return pd.DataFrame(rows)
 
 
-def mean_loss_uncertainty_summary(uncertainty) -> pd.DataFrame:
-    selected = uncertainty[
-        (uncertainty["estimate_type"] == "raw_loss")
-        & (uncertainty["component"] == "mean")
-    ].copy()
-    return selected[
-        [
-            "method",
-            "prior",
-            "benchmark_size",
-            "estimate",
-            "estimated_variance_of_mean",
-            "estimated_sd_of_mean",
-        ]
-    ].rename(
-        columns={
-            "estimate": "mean_loss",
-            "estimated_variance_of_mean": "estimated_variance_of_mean_loss",
-            "estimated_sd_of_mean": "estimated_sd_of_mean_loss",
+def summarize_npe_loss_difference(loss_samples) -> pd.DataFrame:
+    rows = []
+    for prior in PRIORS:
+        method_samples = {
+            method: select_loss_samples(loss_samples, method, prior)
+            for method in ("TCN", "Summary NN")
         }
-    )
+        rows.extend(
+            paired_loss_uncertainty_rows(
+                method_samples,
+                "Summary NN",
+                "TCN",
+                prior,
+            )
+        )
+    return pd.DataFrame(rows)
 
 
 def plot_empirical_coverage(coverage, output_path) -> None:
     apply_plot_style()
-    fig, axes = plt.subplots(3, 2, figsize=(12.5, 13.0), sharex=True, sharey="row")
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 13.0), sharex=True, sharey="row")
     legend_handles = {}
 
     nominal_limits = (
@@ -953,28 +977,9 @@ def plot_empirical_coverage(coverage, output_path) -> None:
 
 def latex_number(value) -> str:
     value = float(value)
-    if abs(value) < 0.00005:
+    if abs(value) < ROUNDING_ZERO_TOLERANCE:
         value = 0.0
     return rf"\({value:.4f}\)"
-
-
-def latex_scientific_number(value) -> str:
-    value = float(value)
-    if value == 0.0:
-        return r"\(0\)"
-    exponent = int(np.floor(np.log10(abs(value))))
-    coefficient = value / 10.0**exponent
-    return rf"\({coefficient:.3f}\times 10^{{{exponent}}}\)"
-
-
-def latex_estimate_sd(estimate, sd) -> str:
-    estimate = float(estimate)
-    sd = float(sd)
-    if abs(estimate) < 0.00005:
-        estimate = 0.0
-    if abs(sd) < 0.00005:
-        sd = 0.0
-    return rf"\({estimate:.4f}\mathbin{{\pm}}{sd:.4f}\)"
 
 
 def latex_row(values) -> str:
@@ -983,6 +988,21 @@ def latex_row(values) -> str:
 
 def latex_metric_row(label, values) -> str:
     return latex_row([label, *(latex_number(value) for value in values)])
+
+
+def latex_table_body(header, row_groups) -> str:
+    rows = [r"\toprule", latex_row(header), r"\midrule"]
+    for group_index, group in enumerate(row_groups):
+        if group_index:
+            rows.append(r"\midrule")
+        rows.extend(group)
+    rows.append(r"\bottomrule")
+    return "\n".join(rows) + "\n"
+
+
+def method_label(method, prior) -> str:
+    name = "MCMC" if method == "stochvol" else method
+    return f"{name} ({prior})"
 
 
 def select_metric_row(metrics, method, prior, data_percentage=100):
@@ -999,181 +1019,13 @@ def select_metric_row(metrics, method, prior, data_percentage=100):
     return selected.iloc[0]
 
 
-def loss_table_body(metrics, prior) -> str:
-    loss_columns = [
-        f"marginal_loss_{parameter}" for parameter in TRANSFORMED_PARAMETERS
-    ]
-    reference = select_metric_row(metrics, "stochvol", prior)
-    reference_loss = reference[loss_columns].to_numpy(dtype=np.float64)
-
-    npe_rows = [
-        select_metric_row(metrics, method, prior)
-        for method in ("TCN", "Summary NN")
-    ]
-    npe_losses = np.vstack(
-        [row[loss_columns].to_numpy(dtype=np.float64) for row in npe_rows]
-    )
-    loss_differences = npe_losses - reference_loss
-    best_index = int(np.argmin(np.mean(loss_differences, axis=1)))
-    best_npe = npe_rows[best_index]
-    best_npe_loss = npe_losses[best_index]
-
-    mcmc_candidates = metrics[
-        (metrics["method"] == "stochvol")
-        & (metrics["prior"] == prior)
-        & (metrics["data_percentage"] < 100)
-    ]
-    if mcmc_candidates.empty:
-        raise ValueError(f"No reduced-data MCMC rows found for the {prior} prior.")
-
-    candidate_mean_losses = mcmc_candidates[loss_columns].mean(axis=1)
-    closest_index = (candidate_mean_losses - np.mean(best_npe_loss)).abs().idxmin()
-    closest_mcmc = mcmc_candidates.loc[closest_index]
-    closest_mcmc_loss = closest_mcmc[loss_columns].to_numpy(dtype=np.float64)
-    closest_percentage = int(closest_mcmc["data_percentage"])
-
-    rows = [
-        r"\hline",
-        latex_row(
-            [
-                "Method",
-                r"\(\Delta_{\mathrm{loss},\mu}\)",
-                r"\(\Delta_{\mathrm{loss},\psi}\)",
-                r"\(\Delta_{\mathrm{loss},\rho}\)",
-                r"\(\overline{\Delta}_{\mathrm{loss}}\)",
-            ]
-        ),
-        r"\hline",
-        latex_metric_row(
-            r"MCMC (\(100\%\), raw loss)",
-            [*reference_loss, np.mean(reference_loss)],
-        ),
-        r"\hline",
-    ]
-    for row, differences in zip(npe_rows, loss_differences):
-        rows.append(
-            latex_metric_row(
-                f"{row['method']} (loss difference)",
-                [*differences, np.mean(differences)],
-            )
-        )
-    rows += [
-        r"\hline",
-        latex_metric_row(
-            f"MCMC (\\({closest_percentage}\\%\\), raw loss)",
-            [*closest_mcmc_loss, np.mean(closest_mcmc_loss)],
-        ),
-        latex_metric_row(
-            f"{best_npe['method']} (raw loss)",
-            [*best_npe_loss, np.mean(best_npe_loss)],
-        ),
-        r"\hline",
-    ]
-    return "\n".join(rows) + "\n"
-
-
-def rmse_log_ratio_table_body(metrics, prior) -> str:
-    columns = [
-        *(f"rmse_{parameter}" for parameter in TRANSFORMED_PARAMETERS),
-        *(f"log_var_ratio_{parameter}" for parameter in TRANSFORMED_PARAMETERS),
-    ]
-    rows = [
-        r"\hline",
-        latex_row(
-            [
-                "Method",
-                r"\(\mathrm{RMSE}_{\mu}\)",
-                r"\(\mathrm{RMSE}_{\psi}\)",
-                r"\(\mathrm{RMSE}_{\rho}\)",
-                r"\(\overline{r}_{\mathrm{var},\mu}\)",
-                r"\(\overline{r}_{\mathrm{var},\psi}\)",
-                r"\(\overline{r}_{\mathrm{var},\rho}\)",
-            ]
-        ),
-        r"\hline",
-    ]
-    for method in ("stochvol", "TCN", "Summary NN"):
-        row = select_metric_row(metrics, method, prior)
-        label = r"MCMC (\(100\%\))" if method == "stochvol" else method
-        rows.append(latex_metric_row(label, row[columns]))
-    rows.append(r"\hline")
-    return "\n".join(rows) + "\n"
-
-
-def runtime_table_body(metrics) -> str:
-    rows = [
-        r"\hline",
-        latex_row(
-            ["Method", "Mean runtime (seconds)", "SD runtime (seconds)"]
-        ),
-        r"\hline",
-    ]
-    for prior in PRIORS:
-        for method in ("stochvol", "TCN", "Summary NN"):
-            row = select_metric_row(metrics, method, prior)
-            method_name = "MCMC" if method == "stochvol" else method
-            label = f"{method_name} ({prior})"
-            rows.append(
-                latex_metric_row(
-                    label,
-                    [row["mean_runtime_seconds"], row["sd_runtime_seconds"]],
-                )
-            )
-        if prior != PRIORS[-1]:
-            rows.append(r"\hline")
-    rows.append(r"\hline")
-    return "\n".join(rows) + "\n"
-
-
-def mean_loss_uncertainty_table_body(uncertainty) -> str:
-    rows = [
-        r"\hline",
-        latex_row(
-            [
-                "Method",
-                r"\(\overline{\ell}\)",
-                r"\(\widehat{\mathrm{Var}}(\overline{\ell})\)",
-                r"\(\widehat{\mathrm{SD}}(\overline{\ell})\)",
-            ]
-        ),
-        r"\hline",
-    ]
-    for prior in PRIORS:
-        for method in METHODS:
-            selected = uncertainty[
-                (uncertainty["method"] == method)
-                & (uncertainty["prior"] == prior)
-            ]
-            if len(selected) != 1:
-                raise ValueError(
-                    f"Expected one mean-loss summary for {method} ({prior})."
-                )
-            selected = selected.iloc[0]
-            method_name = "MCMC" if method == "stochvol" else method
-            rows.append(
-                latex_row(
-                    [
-                        f"{method_name} ({prior})",
-                        latex_number(selected["mean_loss"]),
-                        latex_scientific_number(
-                            selected["estimated_variance_of_mean_loss"]
-                        ),
-                        latex_number(selected["estimated_sd_of_mean_loss"]),
-                    ]
-                )
-            )
-        if prior != PRIORS[-1]:
-            rows.append(r"\hline")
-    rows.append(r"\hline")
-    return "\n".join(rows) + "\n"
-
-
 def select_uncertainty_row(
     uncertainty,
     estimate_type,
     method,
     prior,
     component,
+    reference_method=None,
 ):
     selected = uncertainty[
         (uncertainty["estimate_type"] == estimate_type)
@@ -1181,6 +1033,10 @@ def select_uncertainty_row(
         & (uncertainty["prior"] == prior)
         & (uncertainty["component"] == component)
     ]
+    if reference_method is not None:
+        selected = selected[
+            selected["reference_method"].fillna("") == reference_method
+        ]
     if len(selected) != 1:
         raise ValueError(
             f"Expected one {estimate_type} uncertainty row for {method}, "
@@ -1189,70 +1045,212 @@ def select_uncertainty_row(
     return selected.iloc[0]
 
 
-def loss_uncertainty_table_body(uncertainty, prior, differences=False) -> str:
-    estimate_type = "paired_loss_difference" if differences else "raw_loss"
+def metric_loss_values(row):
+    values = row[
+        [f"marginal_loss_{parameter}" for parameter in TRANSFORMED_PARAMETERS]
+    ].to_numpy(dtype=np.float64)
+    return np.append(values, np.mean(values))
+
+
+def loss_uncertainty_table_body(uncertainty) -> str:
     components = (*TRANSFORMED_PARAMETERS, "mean")
-    parameter_labels = {
-        "mu": r"\mu",
-        "psi": r"\psi",
-        "rho": r"\rho",
-    }
-    if differences:
-        column_labels = [
-            rf"\overline{{\Delta}}_{{\mathrm{{loss}},{parameter_labels[component]}}}"
-            for component in TRANSFORMED_PARAMETERS
-        ]
-        column_labels.append(r"\overline{\Delta}_{\mathrm{loss}}")
-    else:
-        column_labels = [
-            rf"\overline{{\ell}}_{{{parameter_labels[component]}}}"
-            for component in TRANSFORMED_PARAMETERS
-        ]
-        column_labels.append(r"\overline{\ell}")
-
-    rows = [
-        r"\hline",
-        latex_row(
-            [
-                "Method",
-                *(
-                    rf"\({column_label}"
-                    rf"\mathbin{{\pm}}\widehat{{\mathrm{{SD}}}}\)"
-                    for column_label in column_labels
-                ),
-            ]
-        ),
-        r"\hline",
+    header = [
+        "Method",
+        r"\(\operatorname{RSD}_{\mu}\)",
+        r"\(\operatorname{RSD}_{\psi}\)",
+        r"\(\operatorname{RSD}_{\rho}\)",
+        r"\(\operatorname{RSD}_{L_K}\)",
     ]
+    row_groups = []
 
-    methods = ("TCN", "Summary NN") if differences else METHODS
-    for method in methods:
-        values = []
-        for component in components:
-            selected = select_uncertainty_row(
-                uncertainty,
-                estimate_type,
-                method,
-                prior,
-                component,
-            )
-            values.append(
-                latex_estimate_sd(
-                    selected["estimate"],
-                    selected["estimated_sd_of_mean"],
+    for prior in PRIORS:
+        rows = []
+        for method in METHODS:
+            values = [
+                select_uncertainty_row(
+                    uncertainty,
+                    "raw_loss",
+                    method,
+                    prior,
+                    component,
+                )["relative_sd"]
+                for component in components
+            ]
+            rows.append(latex_metric_row(method_label(method, prior), values))
+
+        for method, reference in (
+            ("TCN", "stochvol"),
+            ("Summary NN", "stochvol"),
+            ("Summary NN", "TCN"),
+        ):
+            values = [
+                select_uncertainty_row(
+                    uncertainty,
+                    "paired_loss_difference",
+                    method,
+                    prior,
+                    component,
+                    reference,
+                )["relative_sd"]
+                for component in components
+            ]
+            reference_name = "MCMC" if reference == "stochvol" else reference
+            label = f"{method} \\(-\\) {reference_name} ({prior})"
+            rows.append(latex_metric_row(label, values))
+        row_groups.append(rows)
+
+    return latex_table_body(header, row_groups)
+
+
+def rmse_table_body(metrics) -> str:
+    columns = [f"rmse_{parameter}" for parameter in TRANSFORMED_PARAMETERS]
+    header = [
+        "Method",
+        r"\(\operatorname{RMSE}_{\mu}\)",
+        r"\(\operatorname{RMSE}_{\psi}\)",
+        r"\(\operatorname{RMSE}_{\rho}\)",
+    ]
+    row_groups = []
+
+    for prior in PRIORS:
+        rows = []
+        for method in METHODS:
+            row = select_metric_row(metrics, method, prior)
+            rows.append(latex_metric_row(method_label(method, prior), row[columns]))
+        row_groups.append(rows)
+
+    return latex_table_body(header, row_groups)
+
+
+def log_var_ratio_table_body(metrics) -> str:
+    columns = [
+        f"log_var_ratio_{parameter}"
+        for parameter in TRANSFORMED_PARAMETERS
+    ]
+    header = [
+        "Method",
+        r"\(\exp(\overline{r}_{\mathrm{var},\mu})\)",
+        r"\(\exp(\overline{r}_{\mathrm{var},\psi})\)",
+        r"\(\exp(\overline{r}_{\mathrm{var},\rho})\)",
+    ]
+    row_groups = []
+
+    for prior in PRIORS:
+        rows = []
+        for method in ("TCN", "Summary NN"):
+            row = select_metric_row(metrics, method, prior)
+            rows.append(
+                latex_metric_row(
+                    method_label(method, prior),
+                    np.exp(row[columns].to_numpy(dtype=np.float64)),
                 )
             )
+        row_groups.append(rows)
 
-        if differences:
-            label = f"{method} \\(-\\) MCMC"
-        elif method == "stochvol":
-            label = r"MCMC (\(100\%\))"
-        else:
-            label = method
-        rows.append(latex_row([label, *values]))
+    return latex_table_body(header, row_groups)
 
-    rows.append(r"\hline")
-    return "\n".join(rows) + "\n"
+
+def loss_difference_table_body(metrics) -> str:
+    header = [
+        "Method",
+        r"\(\widehat{\Delta}_{\mathrm{loss},\mu}\)",
+        r"\(\widehat{\Delta}_{\mathrm{loss},\psi}\)",
+        r"\(\widehat{\Delta}_{\mathrm{loss},\rho}\)",
+        r"\(\overline{\Delta}_{\mathrm{loss}}\)",
+    ]
+    row_groups = []
+
+    for prior in PRIORS:
+        reference = metric_loss_values(
+            select_metric_row(metrics, "stochvol", prior)
+        )
+        rows = []
+        for method in ("TCN", "Summary NN"):
+            differences = (
+                metric_loss_values(select_metric_row(metrics, method, prior))
+                - reference
+            )
+            rows.append(
+                latex_metric_row(method_label(method, prior), differences)
+            )
+        row_groups.append(rows)
+
+    return latex_table_body(header, row_groups)
+
+
+def closest_mcmc_row(metrics, prior):
+    tcn_loss = metric_loss_values(
+        select_metric_row(metrics, "TCN", prior)
+    )[-1]
+    candidates = metrics[
+        (metrics["method"] == "stochvol")
+        & (metrics["prior"] == prior)
+        & (metrics["data_percentage"].isin(MCMC_DATA_PERCENTAGES))
+    ]
+    if len(candidates) != len(MCMC_DATA_PERCENTAGES):
+        raise ValueError(
+            f"Expected {len(MCMC_DATA_PERCENTAGES)} MCMC rows for {prior}."
+        )
+
+    candidate_losses = candidates[
+        [
+            f"marginal_loss_{parameter}"
+            for parameter in TRANSFORMED_PARAMETERS
+        ]
+    ].mean(axis=1)
+    return candidates.loc[(candidate_losses - tcn_loss).abs().idxmin()]
+
+
+def tcn_mcmc_loss_table_body(metrics) -> str:
+    header = [
+        "Method",
+        r"\(\overline{\ell}_{\mu}\)",
+        r"\(\overline{\ell}_{\psi}\)",
+        r"\(\overline{\ell}_{\rho}\)",
+        r"\(L_K\)",
+    ]
+    row_groups = []
+
+    for prior in PRIORS:
+        mcmc = closest_mcmc_row(metrics, prior)
+        tcn = select_metric_row(metrics, "TCN", prior)
+        beta = float(mcmc["data_percentage"]) / 100.0
+        row_groups.append(
+            [
+                latex_metric_row(
+                    f"MCMC ({prior}, \\(\\beta={beta:.2f}\\))",
+                    metric_loss_values(mcmc),
+                ),
+                latex_metric_row(
+                    f"TCN ({prior}, full sequence)",
+                    metric_loss_values(tcn),
+                ),
+            ]
+        )
+
+    return latex_table_body(header, row_groups)
+
+
+def runtime_table_body(metrics) -> str:
+    header = ["Method", "Mean runtime (s)", "Runtime SD (s)"]
+    row_groups = []
+
+    for prior in PRIORS:
+        rows = []
+        for method in METHODS:
+            row = select_metric_row(metrics, method, prior)
+            rows.append(
+                latex_metric_row(
+                    method_label(method, prior),
+                    [
+                        row["mean_runtime_seconds"],
+                        row["sd_runtime_seconds"],
+                    ],
+                )
+            )
+        row_groups.append(rows)
+
+    return latex_table_body(header, row_groups)
 
 
 def main0() -> None:
@@ -1262,7 +1260,7 @@ def main0() -> None:
     comparison = calculate_credible_intervals(models)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    comparison_path = OUTPUT_DIR / "three_parameter_sigma2_credible_intervals.csv"
+    comparison_path = OUTPUT_DIR / "three_parameter_sigma_credible_intervals.csv"
     plot_path = OUTPUT_DIR / "three_parameter_credible_intervals.pdf"
     loss_plot_path = OUTPUT_DIR / "gaussian_loss_history.pdf"
     counts_path = OUTPUT_DIR / "neural_network_parameter_counts.csv"
@@ -1271,6 +1269,9 @@ def main0() -> None:
     counts.to_csv(counts_path, index=False)
     plot_credible_intervals(comparison, plot_path)
     plot_loss_histories(models, loss_plot_path)
+    (OUTPUT_DIR / "three_parameter_sigma2_credible_intervals.csv").unlink(
+        missing_ok=True
+    )
 
     print(f"\nSaved credible intervals to {comparison_path}")
     print(f"Saved the 3-by-2 plot to {plot_path}")
@@ -1278,106 +1279,64 @@ def main0() -> None:
 
 
 def main1() -> None:
-    """Run the fixed 2,000-sequence metrics, coverage and runtime benchmark."""
+    """Run and format the fixed 5,000-sequence posterior benchmark."""
     models = load_models()
-    counts = print_parameter_counts(models)
-    metrics, coverage = calculate_metrics(models)
+    metrics, coverage, loss_samples = calculate_metrics(models)
+    uncertainty = summarize_loss_sampling_uncertainty(loss_samples)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     metrics_path = OUTPUT_DIR / "transformed_posterior_benchmark_metrics.csv"
-    coverage_path = OUTPUT_DIR / "transformed_posterior_empirical_coverage.csv"
+    uncertainty_path = OUTPUT_DIR / "loss_sampling_uncertainty.csv"
     coverage_plot_path = OUTPUT_DIR / "transformed_posterior_empirical_coverage.pdf"
-    counts_path = OUTPUT_DIR / "neural_network_parameter_counts.csv"
 
     metrics.to_csv(metrics_path, index=False)
-    coverage.to_csv(coverage_path, index=False)
-    counts.to_csv(counts_path, index=False)
+    uncertainty.to_csv(uncertainty_path, index=False)
     plot_empirical_coverage(coverage, coverage_plot_path)
 
-    print("\nMetric and runtime comparison:")
-    with pd.option_context("display.max_columns", None, "display.width", 240):
-        print(metrics.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
-    print(f"\nSaved metrics to {metrics_path}")
-    print(f"Saved empirical coverage to {coverage_path}")
-    print(f"Saved the 3-by-2 coverage plot to {coverage_plot_path}")
-
-
-def main2() -> None:
-    """Format metrics and estimate uncertainty in full-data marginal losses."""
-    metrics_path = OUTPUT_DIR / "transformed_posterior_benchmark_metrics.csv"
-    loss_samples_path = OUTPUT_DIR / "full_data_mean_loss_samples.csv"
-    mean_uncertainty_path = OUTPUT_DIR / "mean_loss_sampling_uncertainty.csv"
-    uncertainty_path = OUTPUT_DIR / "loss_sampling_uncertainty.csv"
-    metrics = pd.read_csv(metrics_path)
-    missing_columns = sorted(set(metric_columns()).difference(metrics.columns))
-    if missing_columns:
-        raise ValueError(
-            "Metric CSV is missing column(s): " + ", ".join(missing_columns)
-        )
-
-    loss_sample_columns = {
-        "method",
-        "prior",
-        "benchmark_index",
-        *loss_component_columns().values(),
-    }
-    if loss_samples_path.exists():
-        loss_samples = pd.read_csv(loss_samples_path)
-    else:
-        loss_samples = pd.DataFrame()
-
-    missing_loss_columns = sorted(
-        loss_sample_columns.difference(loss_samples.columns)
-    )
-    if missing_loss_columns:
-        if not loss_samples.empty:
-            print(
-                "The saved loss samples predate the parameter-specific "
-                "diagnostic and will be regenerated."
-            )
-        models = load_models()
-        loss_samples = calculate_full_data_loss_samples(models)
-        loss_samples.to_csv(loss_samples_path, index=False)
-        print(f"Saved per-sequence marginal losses to {loss_samples_path}")
-
-    uncertainty = summarize_loss_sampling_uncertainty(loss_samples)
-    mean_uncertainty = mean_loss_uncertainty_summary(uncertainty)
-    uncertainty.to_csv(uncertainty_path, index=False)
-    mean_uncertainty.to_csv(mean_uncertainty_path, index=False)
-
     tables = {
-        "loss_default_tabular.txt": loss_table_body(metrics, "default"),
-        "loss_finance_tabular.txt": loss_table_body(metrics, "finance"),
-        "rmse_log_ratio_default_tabular.txt": rmse_log_ratio_table_body(
-            metrics, "default"
-        ),
-        "rmse_log_ratio_finance_tabular.txt": rmse_log_ratio_table_body(
-            metrics, "finance"
-        ),
+        "loss_uncertainty_tabular.txt": loss_uncertainty_table_body(uncertainty),
+        "rmse_tabular.txt": rmse_table_body(metrics),
+        "log_var_ratio_tabular.txt": log_var_ratio_table_body(metrics),
+        "loss_difference_tabular.txt": loss_difference_table_body(metrics),
+        "tcn_mcmc_loss_comparison_tabular.txt": tcn_mcmc_loss_table_body(metrics),
         "runtime_tabular.txt": runtime_table_body(metrics),
-        "mean_loss_uncertainty_tabular.txt": mean_loss_uncertainty_table_body(
-            mean_uncertainty
-        ),
-        "raw_loss_uncertainty_default_tabular.txt": loss_uncertainty_table_body(
-            uncertainty, "default"
-        ),
-        "raw_loss_uncertainty_finance_tabular.txt": loss_uncertainty_table_body(
-            uncertainty, "finance"
-        ),
-        "loss_difference_uncertainty_default_tabular.txt": (
-            loss_uncertainty_table_body(uncertainty, "default", differences=True)
-        ),
-        "loss_difference_uncertainty_finance_tabular.txt": (
-            loss_uncertainty_table_body(uncertainty, "finance", differences=True)
-        ),
     }
 
     LATEX_TABLES_DIR.mkdir(exist_ok=True)
+    obsolete_tables = {
+        "loss_default_tabular.txt",
+        "loss_finance_tabular.txt",
+        "mean_loss_uncertainty_tabular.txt",
+        "raw_loss_uncertainty_default_tabular.txt",
+        "raw_loss_uncertainty_finance_tabular.txt",
+        "loss_difference_uncertainty_default_tabular.txt",
+        "loss_difference_uncertainty_finance_tabular.txt",
+        "rmse_log_ratio_default_tabular.txt",
+        "rmse_log_ratio_finance_tabular.txt",
+    }
+    for filename in obsolete_tables:
+        (LATEX_TABLES_DIR / filename).unlink(missing_ok=True)
+
     for filename, table in tables.items():
         output_path = LATEX_TABLES_DIR / filename
         output_path.write_text(table, encoding="utf-8")
         print(f"Saved LaTeX tabular body to {output_path}")
 
+    for filename in (
+        "full_data_mean_loss_samples.csv",
+        "mean_loss_sampling_uncertainty.csv",
+        "transformed_posterior_empirical_coverage.csv",
+    ):
+        (OUTPUT_DIR / filename).unlink(missing_ok=True)
+
+    print("\nMetric and runtime comparison:")
+    with pd.option_context("display.max_columns", None, "display.width", 240):
+        print(
+            metrics.to_string(
+                index=False,
+                float_format=lambda value: f"{value:.6g}",
+            )
+        )
     print("\nLoss sampling uncertainty:")
     with pd.option_context("display.max_columns", None, "display.width", 240):
         print(
@@ -1386,8 +1345,82 @@ def main2() -> None:
                 float_format=lambda value: f"{value:.6g}",
             )
         )
-    print(f"\nSaved detailed loss uncertainty to {uncertainty_path}")
-    print(f"Saved mean-loss uncertainty to {mean_uncertainty_path}")
+    print(f"\nSaved metrics to {metrics_path}")
+    print(f"Saved loss uncertainty to {uncertainty_path}")
+    print(f"Saved the 3-by-2 coverage plot to {coverage_plot_path}")
+
+
+def main2() -> None:
+    """Add the paired Summary-NN-minus-TCN loss uncertainty."""
+    uncertainty_path = OUTPUT_DIR / "loss_sampling_uncertainty.csv"
+    if not uncertainty_path.exists():
+        raise FileNotFoundError(f"Run main1() before main2(): {uncertainty_path}")
+
+    uncertainty = pd.read_csv(uncertainty_path)
+    if "relative_sd" not in uncertainty:
+        if "relative_sd_percent" not in uncertainty:
+            raise ValueError("The uncertainty CSV has no relative-SD column.")
+        uncertainty["relative_sd"] = (
+            uncertainty.pop("relative_sd_percent") / 100.0
+        )
+
+    required_columns = {
+        "estimate_type",
+        "method",
+        "reference_method",
+        "prior",
+        "component",
+        "benchmark_size",
+        "estimate",
+        "sample_sd",
+        "estimated_variance_of_mean",
+        "estimated_sd_of_mean",
+        "relative_sd",
+    }
+    missing_columns = sorted(required_columns.difference(uncertainty.columns))
+    if missing_columns:
+        raise ValueError(
+            "The uncertainty CSV is missing column(s): "
+            + ", ".join(missing_columns)
+        )
+    if set(uncertainty["benchmark_size"]) != {BENCHMARK_SIZE}:
+        raise ValueError(
+            f"The uncertainty CSV was not computed with K={BENCHMARK_SIZE}."
+        )
+
+    models = load_models()
+    npe_loss_samples = calculate_npe_loss_samples(models)
+    direct_uncertainty = summarize_npe_loss_difference(npe_loss_samples)
+
+    reference = uncertainty["reference_method"].fillna("")
+    direct_rows = (
+        (uncertainty["estimate_type"] == "paired_loss_difference")
+        & (uncertainty["method"] == "Summary NN")
+        & (reference == "TCN")
+    )
+    uncertainty = pd.concat(
+        [uncertainty.loc[~direct_rows], direct_uncertainty],
+        ignore_index=True,
+    )
+
+    uncertainty.to_csv(uncertainty_path, index=False)
+    LATEX_TABLES_DIR.mkdir(exist_ok=True)
+    table_path = LATEX_TABLES_DIR / "loss_uncertainty_tabular.txt"
+    table_path.write_text(
+        loss_uncertainty_table_body(uncertainty),
+        encoding="utf-8",
+    )
+
+    print("\nSummary NN minus TCN loss uncertainty:")
+    with pd.option_context("display.max_columns", None, "display.width", 240):
+        print(
+            direct_uncertainty.to_string(
+                index=False,
+                float_format=lambda value: f"{value:.6g}",
+            )
+        )
+    print(f"\nUpdated loss uncertainty at {uncertainty_path}")
+    print(f"Updated the RSD table at {table_path}")
 
 
 if __name__ == "__main__":

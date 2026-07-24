@@ -1,0 +1,9 @@
+\toprule
+Method & \(\exp(\overline{r}_{\mathrm{var},\mu})\) & \(\exp(\overline{r}_{\mathrm{var},\psi})\) & \(\exp(\overline{r}_{\mathrm{var},\rho})\) \\
+\midrule
+TCN (default) & \(1.1430\) & \(1.1856\) & \(1.1864\) \\
+Summary NN (default) & \(1.4706\) & \(1.5956\) & \(1.8765\) \\
+\midrule
+TCN (finance) & \(1.0095\) & \(1.0849\) & \(1.1643\) \\
+Summary NN (finance) & \(1.1660\) & \(1.4411\) & \(1.9656\) \\
+\bottomrule

@@ -1,0 +1,9 @@
+\toprule
+Method & \(\widehat{\Delta}_{\mathrm{loss},\mu}\) & \(\widehat{\Delta}_{\mathrm{loss},\psi}\) & \(\widehat{\Delta}_{\mathrm{loss},\rho}\) & \(\overline{\Delta}_{\mathrm{loss}}\) \\
+\midrule
+TCN (default) & \(0.0592\) & \(0.0584\) & \(0.0937\) & \(0.0704\) \\
+Summary NN (default) & \(0.1871\) & \(0.2160\) & \(0.2889\) & \(0.2306\) \\
+\midrule
+TCN (finance) & \(0.0149\) & \(0.0233\) & \(0.0779\) & \(0.0387\) \\
+Summary NN (finance) & \(0.0783\) & \(0.1995\) & \(0.3488\) & \(0.2089\) \\
+\bottomrule
