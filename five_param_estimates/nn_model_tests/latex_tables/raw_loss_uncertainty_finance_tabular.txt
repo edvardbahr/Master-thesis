@@ -1,0 +1,7 @@
+\hline
+Method & \(\overline{\ell}_{\mu}\mathbin{\pm}\widehat{\mathrm{SD}}\) & \(\overline{\ell}_{\psi}\mathbin{\pm}\widehat{\mathrm{SD}}\) & \(\overline{\ell}_{\rho}\mathbin{\pm}\widehat{\mathrm{SD}}\) & \(\overline{\ell}\mathbin{\pm}\widehat{\mathrm{SD}}\) \\
+\hline
+MCMC (\(100\%\)) & \(-0.5458\mathbin{\pm}0.0259\) & \(-0.1663\mathbin{\pm}0.0189\) & \(-1.0189\mathbin{\pm}0.0233\) & \(-0.5770\mathbin{\pm}0.0127\) \\
+TCN & \(-0.5304\mathbin{\pm}0.0264\) & \(-0.1383\mathbin{\pm}0.0183\) & \(-0.9289\mathbin{\pm}0.0229\) & \(-0.5325\mathbin{\pm}0.0129\) \\
+Summary NN & \(-0.4774\mathbin{\pm}0.0297\) & \(-0.0038\mathbin{\pm}0.0192\) & \(-0.6659\mathbin{\pm}0.0240\) & \(-0.3824\mathbin{\pm}0.0151\) \\
+\hline

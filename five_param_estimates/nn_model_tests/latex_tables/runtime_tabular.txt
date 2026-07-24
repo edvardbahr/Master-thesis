@@ -1,0 +1,11 @@
+\hline
+Method & Mean runtime (seconds) & SD runtime (seconds) \\
+\hline
+MCMC (default) & \(3.6052\) & \(0.6163\) \\
+TCN (default) & \(0.0028\) & \(0.0001\) \\
+Summary NN (default) & \(0.0820\) & \(0.0537\) \\
+\hline
+MCMC (finance) & \(3.5059\) & \(0.6073\) \\
+TCN (finance) & \(0.0028\) & \(0.0001\) \\
+Summary NN (finance) & \(0.0779\) & \(0.0495\) \\
+\hline
