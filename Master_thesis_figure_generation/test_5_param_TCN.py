@@ -16,11 +16,14 @@ FIVE_PARAM_DIR = PROJECT_DIR / "five_param_estimates"
 sys.path.insert(0, str(FIVE_PARAM_DIR))
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
+os.environ["MPLBACKEND"] = "Agg"
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from matplotlib.axes import Axes
 from scipy.integrate import quad
 from scipy.special import digamma, expit, polygamma
 from scipy.stats import kstest, norm
@@ -53,11 +56,8 @@ PREDICTION_BATCH_SIZE = 128
 POSTERIOR_VAR_EPS = 1e-12
 DEVICE_NAME: str | None = None
 
-RUN_CI = True
-RUN_SBC = True
-RUN_METRIC_BENCHMARK = True
-RUN_MCMC_CI = True
-RUN_MCMC_BENCHMARK = True
+RUN_PLOTS = False
+RUN_METRICS = True
 
 # CI configuration
 CI_SWEEP_SIZE = 10
@@ -65,7 +65,7 @@ CI_SEED = 2
 MCMC_DRAWS = 20_000
 MCMC_BURNIN = 500
 MCMC_THINPARA = 1
-MCMC_MAX_CORES = -2
+MCMC_MAX_CORES = 3
 
 BASELINE: dict[str, float] = {
     "mu": -9.0,
@@ -89,7 +89,6 @@ SBC_BINS = 50
 
 # Names and plotting
 PARAMETERS = ("mu", "phi", "s", "r", "nu")
-PLOT_PARAMETERS = ("phi", "s", "r", "nu")
 TRANSFORMED_PARAMETERS = tuple(SVGHST_TARGET_NAMES)
 METRIC_PARAMETERS = (
     "mu",
@@ -353,57 +352,112 @@ def apply_plot_style() -> None:
     )
 
 
-def plot_credible_intervals(
+def plot_ci_axis(
+    axis: Axes,
     comparison: pd.DataFrame,
+    parameter: str,
+) -> dict[str, object]:
+    true_values = SWEEPS[parameter]
+    spacing = np.min(np.diff(true_values))
+    methods = tuple(
+        method
+        for method in METHODS
+        if method
+        in comparison.loc[
+            comparison["parameter"] == parameter,
+            "method",
+        ].values
+    )
+    offsets = (
+        dict(zip(methods, np.linspace(-0.12, 0.12, len(methods)) * spacing))
+        if len(methods) > 1
+        else {method: 0.0 for method in methods}
+    )
+
+    axis.plot(true_values, true_values, color="0.35", linestyle="--")
+    handles: dict[str, object] = {}
+    for method in methods:
+        data = comparison[
+            (comparison["parameter"] == parameter)
+            & (comparison["method"] == method)
+        ].sort_values("value_index")
+        median = data["median"].to_numpy()
+        lower = data["ci_lower"].to_numpy()
+        upper = data["ci_upper"].to_numpy()
+        handles[method] = axis.errorbar(
+            true_values + offsets[method],
+            median,
+            yerr=np.vstack((median - lower, upper - median)),
+            fmt=MARKERS[method],
+            color=COLORS[method],
+            capsize=3,
+            markersize=4.5,
+            label=method,
+        )
+
+    label = PARAMETER_LABELS[parameter]
+    axis.set_xlabel(f"True {label}")
+    axis.set_ylabel(f"{label} posterior median")
+    axis.grid(alpha=0.25)
+    return handles
+
+
+def plot_sbc_axis(
+    axis: Axes,
+    cdf_values: np.ndarray,
+    metrics: pd.DataFrame,
+    parameter: str,
+) -> None:
+    parameter_index = PARAMETERS.index(parameter)
+    ks_distance = metrics.set_index("parameter").loc[parameter, "ks_distance"]
+    axis.hist(
+        cdf_values[:, parameter_index],
+        bins=np.linspace(0.0, 1.0, SBC_BINS + 1),
+        density=True,
+        color=SBC_COLOR,
+        edgecolor="white",
+        linewidth=0.6,
+    )
+    axis.axhline(1.0, color="0.35", linestyle="--")
+    axis.text(
+        0.97,
+        0.93,
+        f"{PARAMETER_LABELS[parameter]}, KS = {ks_distance:.3f}",
+        transform=axis.transAxes,
+        horizontalalignment="right",
+        verticalalignment="top",
+    )
+    axis.set_xlim(0.0, 1.0)
+    axis.set_xlabel("Posterior CDF at the true parameter")
+    axis.set_ylabel("Density")
+    axis.grid(axis="y", alpha=0.25)
+
+
+def plot_ci_and_sbc(
+    comparison: pd.DataFrame,
+    cdf_values: np.ndarray,
+    metrics: pd.DataFrame,
+    parameters: tuple[str, ...],
     output_path: Path,
 ) -> None:
     apply_plot_style()
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 9.0))
+    figure_height = 13.0 if len(parameters) == 3 else 8.6
+    fig, axes = plt.subplots(
+        len(parameters),
+        2,
+        figsize=(11.5, figure_height),
+        squeeze=False,
+    )
     legend_handles: dict[str, object] = {}
 
-    for axis, parameter in zip(axes.flat, PLOT_PARAMETERS):
-        true_values = SWEEPS[parameter]
-        spacing = np.min(np.diff(true_values))
-        methods = tuple(
-            method
-            for method in METHODS
-            if method
-            in comparison.loc[
-                comparison["parameter"] == parameter,
-                "method",
-            ].values
+    for row, parameter in enumerate(parameters):
+        legend_handles.update(
+            plot_ci_axis(axes[row, 0], comparison, parameter)
         )
-        offsets = (
-            dict(zip(methods, np.linspace(-0.12, 0.12, len(methods)) * spacing))
-            if len(methods) > 1
-            else {method: 0.0 for method in methods}
-        )
+        plot_sbc_axis(axes[row, 1], cdf_values, metrics, parameter)
 
-        axis.plot(true_values, true_values, color="0.35", linestyle="--")
-        for method in methods:
-            data = comparison[
-                (comparison["parameter"] == parameter)
-                & (comparison["method"] == method)
-            ].sort_values("value_index")
-            median = data["median"].to_numpy()
-            lower = data["ci_lower"].to_numpy()
-            upper = data["ci_upper"].to_numpy()
-            legend_handles[method] = axis.errorbar(
-                true_values + offsets[method],
-                median,
-                yerr=np.vstack((median - lower, upper - median)),
-                fmt=MARKERS[method],
-                color=COLORS[method],
-                capsize=3,
-                markersize=4.5,
-                label=method,
-            )
-
-        label = PARAMETER_LABELS[parameter]
-        axis.set_xlabel(f"True {label}")
-        axis.set_ylabel(f"{label} posterior median")
-        axis.grid(alpha=0.25)
-
+    axes[0, 0].set_title("Credible intervals")
+    axes[0, 1].set_title("Simulation-based calibration")
     legend_order = tuple(method for method in METHODS if method in legend_handles)
     fig.legend(
         [legend_handles[method] for method in legend_order],
@@ -412,7 +466,7 @@ def plot_credible_intervals(
         ncol=len(legend_order),
         frameon=False,
     )
-    fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0))
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -564,47 +618,6 @@ def build_sbc_prediction_frame(result: BenchmarkResult) -> pd.DataFrame:
     return frame
 
 
-def plot_sbc_histograms(
-    cdf_values: np.ndarray,
-    metrics: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    apply_plot_style()
-    fig, axes = plt.subplots(
-        2,
-        2,
-        figsize=(11.5, 9.0),
-        sharex=True,
-        sharey=True,
-    )
-    bin_edges = np.linspace(0.0, 1.0, SBC_BINS + 1)
-    metrics = metrics.set_index("parameter")
-
-    for axis, parameter in zip(axes.flat, PLOT_PARAMETERS):
-        index = PARAMETERS.index(parameter)
-        axis.hist(
-            cdf_values[:, index],
-            bins=bin_edges,
-            density=True,
-            color=SBC_COLOR,
-            edgecolor="white",
-            linewidth=0.6,
-        )
-        axis.axhline(1.0, color="0.35", linestyle="--")
-        axis.set_xlim(0.0, 1.0)
-        axis.set_xlabel("Posterior CDF at the true parameter")
-        axis.set_ylabel("Density")
-        axis.set_title(
-            f"{PARAMETER_LABELS[parameter]}: "
-            f"KS = {metrics.loc[parameter, 'ks_distance']:.3f}"
-        )
-        axis.grid(axis="y", alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
 def print_sbc_metrics(metrics: pd.DataFrame) -> None:
     columns = (
         "parameter",
@@ -629,7 +642,7 @@ def save_sbc_results(
     result: BenchmarkResult,
     output_dir: Path,
     n_simulations: int,
-) -> None:
+) -> pd.DataFrame:
     suffix = f"n{n_simulations}"
     metrics = sbc_uniformity_metrics(result.cdf_values)
     build_sbc_prediction_frame(result).to_csv(
@@ -644,12 +657,8 @@ def save_sbc_results(
         output_dir / f"five_parameter_sbc_metrics_{suffix}.csv",
         index=False,
     )
-    plot_sbc_histograms(
-        result.cdf_values,
-        metrics,
-        output_dir / f"five_parameter_sbc_histograms_{suffix}.pdf",
-    )
     print_sbc_metrics(metrics)
+    return metrics
 
 
 # Marginal Gaussian loss benchmark ------------------------------------------
@@ -984,7 +993,7 @@ def save_metric_results(
 ) -> None:
     metrics, samples, estimates = calculate_metric_comparison(
         benchmark,
-        include_mcmc=RUN_MCMC_BENCHMARK,
+        include_mcmc=True,
     )
     metrics.to_csv(
         output_dir / "marginal_gaussian_loss_metrics.csv",
@@ -1028,6 +1037,9 @@ def save_metric_results(
 
 
 def main() -> None:
+    if not RUN_PLOTS and not RUN_METRICS:
+        return
+
     device = torch.device(
         DEVICE_NAME or ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -1035,37 +1047,49 @@ def main() -> None:
     loaded_model = load_tcn_model(CHECKPOINT_PATH, device)
     DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    loss_path = DEFAULT_OUTPUT_DIR / "five_parameter_validation_loss_history.pdf"
-    plot_validation_loss(loaded_model.checkpoint, loss_path)
-    print(f"Saved validation loss history to {loss_path}")
-
-    if RUN_CI:
+    comparison = None
+    if RUN_PLOTS:
+        loss_path = DEFAULT_OUTPUT_DIR / "five_parameter_validation_loss_history.pdf"
+        plot_validation_loss(loaded_model.checkpoint, loss_path)
+        print(f"Saved validation loss history to {loss_path}")
         comparison = calculate_credible_intervals(
             loaded_model,
-            include_mcmc=RUN_MCMC_CI,
+            include_mcmc=True,
             batch_size=PREDICTION_BATCH_SIZE,
         )
         comparison.to_csv(
             DEFAULT_OUTPUT_DIR / "five_parameter_ci_sweeps.csv",
             index=False,
         )
-        plot_credible_intervals(
-            comparison,
-            DEFAULT_OUTPUT_DIR / "five_parameter_ci_sweeps.pdf",
-        )
 
-    benchmark = None
-    if RUN_SBC or RUN_METRIC_BENCHMARK:
-        benchmark = run_benchmark(
-            loaded_model,
-            n_simulations=BENCHMARK_SIZE,
-            batch_size=PREDICTION_BATCH_SIZE,
+    benchmark = run_benchmark(
+        loaded_model,
+        n_simulations=BENCHMARK_SIZE,
+        batch_size=PREDICTION_BATCH_SIZE,
+    )
+    if RUN_PLOTS:
+        if comparison is None:
+            raise RuntimeError("CI results are unavailable.")
+        sbc_metrics = save_sbc_results(
+            benchmark,
+            DEFAULT_OUTPUT_DIR,
+            BENCHMARK_SIZE,
         )
-    if benchmark is None:
-        return
-    if RUN_SBC:
-        save_sbc_results(benchmark, DEFAULT_OUTPUT_DIR, BENCHMARK_SIZE)
-    if RUN_METRIC_BENCHMARK:
+        plot_ci_and_sbc(
+            comparison,
+            benchmark.cdf_values,
+            sbc_metrics,
+            PARAMETERS[:3],
+            DEFAULT_OUTPUT_DIR / "standard_sv_ci_sbc.pdf",
+        )
+        plot_ci_and_sbc(
+            comparison,
+            benchmark.cdf_values,
+            sbc_metrics,
+            PARAMETERS[3:],
+            DEFAULT_OUTPUT_DIR / "ghst_sv_ci_sbc.pdf",
+        )
+    if RUN_METRICS:
         save_metric_results(benchmark, DEFAULT_OUTPUT_DIR)
 
 
