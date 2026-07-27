@@ -1,20 +1,7 @@
-"""Credible-interval sweeps and SBC for the five-parameter SV-GHST TCN.
-
-The default settings mirror the standardized configurations in
-``five_param_estimates/test_NN_models.py``:
-
-* 95% credible intervals over ten values per parameter;
-* 20,000 stochvol draws, 500 burn-in draws, and no thinning;
-* 5,000 simulations for the calibration experiment.
-
-The stochvol comparison is available only for ``mu``, ``phi``, and ``s``.
-The TCN estimates all five parameters, including GHST skewness ``r`` and
-degrees of freedom ``nu``.
-"""
+"""CI, SBC, validation loss, and scoring for the five-parameter SV-GHST TCN."""
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 import tempfile
@@ -25,23 +12,26 @@ from statistics import NormalDist
 
 HERE = Path(__file__).resolve().parent
 PROJECT_DIR = HERE.parent
-FIVE_PARAMETER_DIR = PROJECT_DIR / "five_param_estimates"
-if str(FIVE_PARAMETER_DIR) not in sys.path:
-    sys.path.insert(0, str(FIVE_PARAMETER_DIR))
-
-os.environ.setdefault(
-    "MPLCONFIGDIR",
-    str(Path(tempfile.gettempdir()) / "matplotlib"),
-)
+FIVE_PARAM_DIR = PROJECT_DIR / "five_param_estimates"
+sys.path.insert(0, str(FIVE_PARAM_DIR))
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from scipy.integrate import quad
+from scipy.special import digamma, expit, polygamma
+from scipy.stats import kstest, norm
 
 import sim_5_param_data as sim
-from R_to_py_interface import run_stochvol_mcmc, validate_series_matrix
+from R_to_py_interface import (
+    log_positive_transform,
+    psi_transform,
+    run_stochvol_mcmc,
+    validate_series_matrix,
+)
 from train_live_CNN import (
     SVGHST_TARGET_NAMES,
     SVPosteriorTCN,
@@ -49,20 +39,7 @@ from train_live_CNN import (
 )
 
 
-ALPHA = 0.05
-SEQUENCE_LENGTH = 253 * 10
-MCMC_DRAWS = 20_000
-MCMC_BURNIN = 500
-MCMC_THINPARA = 1
-MCMC_MAX_CORES = -2
-CI_SWEEP_SIZE = 10
-CI_SEED = 2
-SBC_SIMULATIONS = 5_000
-SBC_SEED = 3
-SBC_BINS = 50
-PREDICTION_BATCH_SIZE = 128
-POSTERIOR_VAR_EPS = 1e-12
-
+# Core configuration ---------------------------------------------------------
 CHECKPOINT_PATH = (
     PROJECT_DIR
     / "weights"
@@ -70,23 +47,34 @@ CHECKPOINT_PATH = (
 )
 DEFAULT_OUTPUT_DIR = HERE / "five_param_tcn_results"
 
-PARAMETERS = ("mu", "phi", "s", "r", "nu")
-PLOT_PARAMETERS = ("phi", "s", "r", "nu")
-TRANSFORMED_PARAMETERS = tuple(SVGHST_TARGET_NAMES)
-MCMC_PARAMETERS = ("mu", "phi", "s")
-METHODS = ("stochvol", "TCN")
+SEQUENCE_LENGTH = 253 * 10
+ALPHA = 0.05
+PREDICTION_BATCH_SIZE = 128
+POSTERIOR_VAR_EPS = 1e-12
+DEVICE_NAME: str | None = None
 
-BASELINE = {
+RUN_CI = True
+RUN_SBC = True
+RUN_METRIC_BENCHMARK = True
+RUN_MCMC_CI = True
+RUN_MCMC_BENCHMARK = True
+
+# CI configuration
+CI_SWEEP_SIZE = 10
+CI_SEED = 2
+MCMC_DRAWS = 20_000
+MCMC_BURNIN = 500
+MCMC_THINPARA = 1
+MCMC_MAX_CORES = -2
+
+BASELINE: dict[str, float] = {
     "mu": -9.0,
     "phi": 0.95,
     "s": 0.25,
     "r": 0.50,
     "nu": 15.0,
 }
-
-# These are the same ranges used by test.TCN.py. The leading three also match
-# the standardized ranges in test_NN_models.py.
-SWEEPS = {
+SWEEPS: dict[str, np.ndarray] = {
     "mu": np.linspace(-12.0, -6.0, CI_SWEEP_SIZE),
     "phi": np.linspace(0.905, 0.995, CI_SWEEP_SIZE),
     "s": np.linspace(0.05, 0.45, CI_SWEEP_SIZE),
@@ -94,17 +82,29 @@ SWEEPS = {
     "nu": np.linspace(8.0, 22.0, CI_SWEEP_SIZE),
 }
 
-COLORS = {
-    "stochvol": "#0000ff",
-    "TCN": "#ff0000",
-}
+# Shared SBC and metric-benchmark configuration
+BENCHMARK_SIZE = 5_000
+BENCHMARK_SEED = 3
+SBC_BINS = 50
+
+# Names and plotting
+PARAMETERS = ("mu", "phi", "s", "r", "nu")
+PLOT_PARAMETERS = ("phi", "s", "r", "nu")
+TRANSFORMED_PARAMETERS = tuple(SVGHST_TARGET_NAMES)
+METRIC_PARAMETERS = (
+    "mu",
+    "psi",
+    "rho",
+    "logit_r",
+    "log_nu_shifted",
+)
+MCMC_PARAMETERS = ("mu", "phi", "s")
+METHODS = ("stochvol", "TCN")
+NU_MIN = sim.get_gh_skew_t_prior_constants("default").nu_min
+
+COLORS = {"stochvol": "#0000ff", "TCN": "#ff0000", "prior": "#008000"}
+MARKERS = {"stochvol": "o", "TCN": "^", "prior": "s"}
 SBC_COLOR = "#4C78A8"
-
-MARKERS = {
-    "stochvol": "o",
-    "TCN": "^",
-}
-
 PARAMETER_LABELS = {
     "mu": r"$\mu$",
     "phi": r"$\phi$",
@@ -112,100 +112,65 @@ PARAMETER_LABELS = {
     "r": r"$r$",
     "nu": r"$\nu$",
 }
-
-TRANSFORMED_PARAMETER_LABELS = {
+LOSS_LABELS = {
     "mu": r"$\mu$",
     "psi": r"$\psi$",
-    "log_s": r"$\log s$",
+    "rho": r"$\rho$",
     "logit_r": r"$\operatorname{logit}(r)$",
-    "log_nu": r"$\log(\nu-\nu_{\min})$",
+    "log_nu_shifted": r"$\log(\nu-\nu_{\min})$",
+    "mean_standard": "Mean",
+    "mean_ghst": "Mean",
+    "mean_all": "Mean",
+}
+METHOD_LABELS = {
+    "stochvol": "stochvol",
+    "TCN": "TCN",
+    "prior": "Prior baseline",
+}
+MCMC_TRANSFORMS = {
+    "phi": {"psi": psi_transform},
+    "sigma": {"rho": log_positive_transform},
 }
 
 
 @dataclass
 class LoadedTCN:
-    """A reconstructed TCN and the metadata needed for preprocessing."""
-
     model: nn.Module
     checkpoint: dict
     device: torch.device
 
 
-def torch_load_checkpoint(path: Path, device: torch.device) -> dict:
-    """Load checkpoints under both new and older PyTorch versions."""
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
+@dataclass
+class BenchmarkResult:
+    y: np.ndarray
+    theta: np.ndarray
+    transformed_theta: np.ndarray
+    posterior_means: np.ndarray
+    posterior_variances: np.ndarray
+    cdf_values: np.ndarray
 
 
+# Model loading and prediction ----------------------------------------------
 def load_tcn_model(
-    checkpoint_path: Path = CHECKPOINT_PATH,
-    device: torch.device | None = None,
+    checkpoint_path: Path,
+    device: torch.device,
 ) -> LoadedTCN:
-    """Load and validate the full five-parameter TCN checkpoint."""
-    checkpoint_path = Path(checkpoint_path).resolve()
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"TCN checkpoint not found: {checkpoint_path}")
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    checkpoint = torch_load_checkpoint(checkpoint_path, device)
-    required_keys = (
-        "model_class",
-        "model_state_dict",
-        "sequence_length",
-        "tcn_channels",
-        "dilations",
-        "hidden_dims_head",
-        "activation",
-        "min_var",
-        "input_mean",
-        "input_std",
-        "target_names",
-        "k",
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
     )
-    missing_keys = [key for key in required_keys if key not in checkpoint]
-    if missing_keys:
-        raise KeyError(
-            f"{checkpoint_path} is missing checkpoint keys: "
-            + ", ".join(missing_keys)
-        )
 
-    if checkpoint["model_class"] != "SVPosteriorTCN":
+    if int(checkpoint["sequence_length"]) != SEQUENCE_LENGTH:
         raise ValueError(
-            f"Expected an SVPosteriorTCN checkpoint, got "
-            f"{checkpoint['model_class']!r}."
+            f"Checkpoint length is {checkpoint['sequence_length']}, "
+            f"expected {SEQUENCE_LENGTH}."
         )
+    if tuple(checkpoint["target_names"]) != TRANSFORMED_PARAMETERS:
+        raise ValueError("Checkpoint does not contain all five parameter heads.")
 
-    checkpoint_length = int(checkpoint["sequence_length"])
-    if checkpoint_length != SEQUENCE_LENGTH:
-        raise ValueError(
-            f"The analysis uses sequence length {SEQUENCE_LENGTH}, but the "
-            f"checkpoint expects {checkpoint_length}."
-        )
-
-    target_names = tuple(checkpoint["target_names"])
-    if target_names != TRANSFORMED_PARAMETERS:
-        raise ValueError(
-            f"The checkpoint targets {target_names}; expected all five targets "
-            f"{TRANSFORMED_PARAMETERS}."
-        )
-
-    activation = getattr(nn, checkpoint["activation"], None)
-    if activation is None:
-        raise ValueError(
-            f"Unknown activation in checkpoint: {checkpoint['activation']!r}"
-        )
-
-    kernel_sizes = checkpoint.get(
-        "kernel_sizes",
-        checkpoint.get("kernel_size"),
-    )
-    if kernel_sizes is None:
-        raise KeyError("Checkpoint is missing kernel_size/kernel_sizes.")
-
+    activation = getattr(nn, checkpoint["activation"])
+    kernel_sizes = checkpoint.get("kernel_sizes") or checkpoint["kernel_size"]
     model = SVPosteriorTCN(
         tcn_channels=tuple(checkpoint["tcn_channels"]),
         kernel_size=kernel_sizes,
@@ -213,49 +178,34 @@ def load_tcn_model(
         hidden_dims_head=tuple(checkpoint["hidden_dims_head"]),
         topk_pool_fraction=checkpoint.get("topk_pool_fraction"),
         activation=activation,
-        param_names=target_names,
+        param_names=tuple(checkpoint["target_names"]),
         min_var=float(checkpoint["min_var"]),
         input_mean=float(checkpoint["input_mean"]),
         input_std=float(checkpoint["input_std"]),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-
-    return LoadedTCN(model=model, checkpoint=checkpoint, device=device)
+    return LoadedTCN(model, checkpoint, device)
 
 
 def prepare_tcn_input(y: np.ndarray, checkpoint: dict) -> np.ndarray:
-    """Apply the same centering and log-square transform used in training."""
     y = validate_series_matrix(y)
-    expected_length = int(checkpoint["sequence_length"])
-    if y.shape[1] != expected_length:
-        raise ValueError(
-            f"Checkpoint expects sequences of length {expected_length}, "
-            f"but received length {y.shape[1]}."
-        )
-
+    if y.shape[1] != int(checkpoint["sequence_length"]):
+        raise ValueError(f"Expected sequences of length {SEQUENCE_LENGTH}.")
     centered_y = y - np.mean(y, axis=1, keepdims=True)
-    return np.log(
-        centered_y**2 + float(checkpoint["k"])
-    ).astype(np.float32, copy=False)
+    return np.log(centered_y**2 + checkpoint["k"]).astype(np.float32)
 
 
 @torch.inference_mode()
 def predict_transformed_gaussian(
     loaded_model: LoadedTCN,
     y: np.ndarray,
-    batch_size: int = PREDICTION_BATCH_SIZE,
+    batch_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Predict transformed posterior means and marginal variances."""
-    if batch_size < 1:
-        raise ValueError("batch_size must be at least 1.")
-
     x = prepare_tcn_input(y, loaded_model.checkpoint)
-    means = np.empty(
-        (len(x), len(TRANSFORMED_PARAMETERS)),
-        dtype=np.float64,
-    )
-    variances = np.empty_like(means)
+    output_shape = (len(x), len(PARAMETERS))
+    means = np.empty(output_shape, dtype=np.float64)
+    variances = np.empty(output_shape, dtype=np.float64)
 
     for start in range(0, len(x), batch_size):
         stop = min(start + batch_size, len(x))
@@ -267,83 +217,54 @@ def predict_transformed_gaussian(
     return means, variances
 
 
-def inverse_logit(x: np.ndarray) -> np.ndarray:
-    """Numerically stable inverse-logit transform."""
-    x = np.asarray(x, dtype=np.float64)
-    result = np.empty_like(x)
-    positive = x >= 0.0
-    result[positive] = 1.0 / (1.0 + np.exp(-x[positive]))
-    exp_x = np.exp(x[~positive])
-    result[~positive] = exp_x / (1.0 + exp_x)
-    return result
+def inverse_transform(values: np.ndarray) -> np.ndarray:
+    """Map (mu, psi, log_s, logit_r, log_nu) to model parameters."""
+    values = np.asarray(values, dtype=np.float64)
+    parameters = np.empty_like(values)
+    parameters[:, 0] = values[:, 0]
+    parameters[:, 1] = np.tanh(values[:, 1] / 2.0)
+    parameters[:, 2] = np.exp(values[:, 2])
+    parameters[:, 3] = expit(values[:, 3])
+    parameters[:, 4] = NU_MIN + np.exp(values[:, 4])
+    return parameters
 
 
+# Credible-interval sweeps ---------------------------------------------------
 def transformed_gaussian_ci(
     means: np.ndarray,
     variances: np.ndarray,
-    alpha: float = ALPHA,
 ) -> pd.DataFrame:
-    """Transform marginal Gaussian credible intervals to model parameters."""
-    means = np.asarray(means, dtype=np.float64)
-    variances = np.asarray(variances, dtype=np.float64)
-    expected_shape = (len(means), len(TRANSFORMED_PARAMETERS))
-    if means.shape != expected_shape or variances.shape != expected_shape:
-        raise ValueError(
-            f"means and variances must both have shape {expected_shape}."
-        )
-    if not 0.0 < alpha < 1.0:
-        raise ValueError("alpha must lie strictly between 0 and 1.")
+    z = NormalDist().inv_cdf(1.0 - ALPHA / 2.0)
+    sd = np.sqrt(np.clip(variances, POSTERIOR_VAR_EPS, None))
+    median = inverse_transform(means)
+    lower = inverse_transform(means - z * sd)
+    upper = inverse_transform(means + z * sd)
 
-    critical_value = NormalDist().inv_cdf(1.0 - alpha / 2.0)
-    standard_deviations = np.sqrt(
-        np.clip(variances, POSTERIOR_VAR_EPS, None)
-    )
-    lower = means - critical_value * standard_deviations
-    upper = means + critical_value * standard_deviations
-    nu_min = sim.get_gh_skew_t_prior_constants("default").nu_min
-
-    return pd.DataFrame(
-        {
-            "mu_median": means[:, 0],
-            "mu_ci_lower": lower[:, 0],
-            "mu_ci_upper": upper[:, 0],
-            "phi_median": np.tanh(means[:, 1] / 2.0),
-            "phi_ci_lower": np.tanh(lower[:, 1] / 2.0),
-            "phi_ci_upper": np.tanh(upper[:, 1] / 2.0),
-            "s_median": np.exp(means[:, 2]),
-            "s_ci_lower": np.exp(lower[:, 2]),
-            "s_ci_upper": np.exp(upper[:, 2]),
-            "r_median": inverse_logit(means[:, 3]),
-            "r_ci_lower": inverse_logit(lower[:, 3]),
-            "r_ci_upper": inverse_logit(upper[:, 3]),
-            "nu_median": nu_min + np.exp(means[:, 4]),
-            "nu_ci_lower": nu_min + np.exp(lower[:, 4]),
-            "nu_ci_upper": nu_min + np.exp(upper[:, 4]),
-        }
-    )
+    columns: dict[str, np.ndarray] = {}
+    for index, parameter in enumerate(PARAMETERS):
+        columns[f"{parameter}_median"] = median[:, index]
+        columns[f"{parameter}_ci_lower"] = lower[:, index]
+        columns[f"{parameter}_ci_upper"] = upper[:, index]
+    return pd.DataFrame(columns)
 
 
-def simulate_ci_series(
-    n: int = SEQUENCE_LENGTH,
-    seed: int = CI_SEED,
-) -> dict[str, np.ndarray]:
-    """Simulate the five one-at-a-time parameter sweeps."""
-    rng = np.random.default_rng(seed)
-    datasets = {}
+def simulate_ci_series() -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(CI_SEED)
+    datasets: dict[str, np.ndarray] = {}
 
     for swept_parameter, true_values in SWEEPS.items():
-        parameters = {
-            name: np.full(CI_SWEEP_SIZE, value, dtype=np.float64)
-            for name, value in BASELINE.items()
+        values = {
+            name: np.full(CI_SWEEP_SIZE, baseline)
+            for name, baseline in BASELINE.items()
         }
-        parameters[swept_parameter] = true_values
+        values[swept_parameter] = true_values
         datasets[swept_parameter] = sim.simulate_sv_chunk(
-            mu=parameters["mu"],
-            phi=parameters["phi"],
-            s=parameters["s"],
-            r=parameters["r"],
-            nu=parameters["nu"],
-            n=n,
+            mu=values["mu"],
+            phi=values["phi"],
+            s=values["s"],
+            r=values["r"],
+            nu=values["nu"],
+            n=SEQUENCE_LENGTH,
             rng=rng,
             random_init=True,
         )
@@ -351,64 +272,41 @@ def simulate_ci_series(
     return datasets
 
 
-def add_ci_rows(
-    rows: list[dict],
+def append_ci_rows(
+    rows: list[dict[str, object]],
     parameter: str,
     method: str,
     ci: pd.DataFrame,
     ci_parameter: str | None = None,
 ) -> None:
-    """Append one method's interval estimates for a parameter sweep."""
-    if "index" in ci:
-        ci = ci.sort_values("index").reset_index(drop=True)
-    else:
-        ci = ci.reset_index(drop=True)
+    ci = ci.sort_values("index").reset_index(drop=True) if "index" in ci else ci
+    ci_parameter = ci_parameter or parameter
 
-    ci_parameter = parameter if ci_parameter is None else ci_parameter
-    if len(ci) != CI_SWEEP_SIZE:
-        raise ValueError(
-            f"Expected {CI_SWEEP_SIZE} CI rows for {parameter}, got {len(ci)}."
-        )
-
-    for value_index, true_value in enumerate(SWEEPS[parameter]):
+    for index, true_value in enumerate(SWEEPS[parameter]):
         rows.append(
             {
                 "parameter": parameter,
-                "value_index": value_index,
-                "true_value": float(true_value),
+                "value_index": index,
+                "true_value": true_value,
                 "method": method,
-                "prior": "default",
-                "median": float(
-                    ci.loc[value_index, f"{ci_parameter}_median"]
-                ),
-                "ci_lower": float(
-                    ci.loc[value_index, f"{ci_parameter}_ci_lower"]
-                ),
-                "ci_upper": float(
-                    ci.loc[value_index, f"{ci_parameter}_ci_upper"]
-                ),
+                "median": ci.loc[index, f"{ci_parameter}_median"],
+                "ci_lower": ci.loc[index, f"{ci_parameter}_ci_lower"],
+                "ci_upper": ci.loc[index, f"{ci_parameter}_ci_upper"],
             }
         )
 
 
 def calculate_credible_intervals(
     loaded_model: LoadedTCN,
-    *,
-    include_mcmc: bool = True,
-    batch_size: int = PREDICTION_BATCH_SIZE,
+    include_mcmc: bool,
+    batch_size: int,
 ) -> pd.DataFrame:
-    """Calculate TCN intervals and the available standard-SV comparisons."""
     datasets = simulate_ci_series()
-    rows: list[dict] = []
+    rows: list[dict[str, object]] = []
 
-    for parameter in PARAMETERS:
-        y = datasets[parameter]
-
+    for parameter, y in datasets.items():
         if include_mcmc and parameter in MCMC_PARAMETERS:
-            print(
-                f"Running stochvol (default) for the {parameter} sweep "
-                f"with {MCMC_DRAWS:,} draws."
-            )
+            print(f"Running stochvol for the {parameter} sweep.")
             mcmc_ci = run_stochvol_mcmc(
                 y,
                 prior="default",
@@ -419,22 +317,16 @@ def calculate_credible_intervals(
                 transforms=None,
                 max_cores=MCMC_MAX_CORES,
             )
-            mcmc_parameter = "sigma" if parameter == "s" else parameter
-            add_ci_rows(
-                rows,
-                parameter,
-                "stochvol",
-                mcmc_ci,
-                ci_parameter=mcmc_parameter,
-            )
+            mcmc_name = "sigma" if parameter == "s" else parameter
+            append_ci_rows(rows, parameter, "stochvol", mcmc_ci, mcmc_name)
 
         print(f"Predicting TCN intervals for the {parameter} sweep.")
         means, variances = predict_transformed_gaussian(
             loaded_model,
             y,
-            batch_size=batch_size,
+            batch_size,
         )
-        add_ci_rows(
+        append_ci_rows(
             rows,
             parameter,
             "TCN",
@@ -444,8 +336,8 @@ def calculate_credible_intervals(
     return pd.DataFrame(rows)
 
 
+# Plotting -------------------------------------------------------------------
 def apply_plot_style() -> None:
-    """Use the plotting convention from test_NN_models.py."""
     plt.rcParams.update(
         {
             "font.family": "serif",
@@ -465,43 +357,30 @@ def plot_credible_intervals(
     comparison: pd.DataFrame,
     output_path: Path,
 ) -> None:
-    """Plot the four most informative credible-interval sweeps."""
     apply_plot_style()
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 9.0))
-    legend_handles = {}
+    legend_handles: dict[str, object] = {}
 
     for axis, parameter in zip(axes.flat, PLOT_PARAMETERS):
         true_values = SWEEPS[parameter]
-        spacing = float(np.min(np.diff(true_values)))
-        available_methods = tuple(
+        spacing = np.min(np.diff(true_values))
+        methods = tuple(
             method
             for method in METHODS
-            if method in set(
-                comparison.loc[
-                    comparison["parameter"] == parameter,
-                    "method",
-                ]
-            )
+            if method
+            in comparison.loc[
+                comparison["parameter"] == parameter,
+                "method",
+            ].values
         )
-        if len(available_methods) > 1:
-            offsets = dict(
-                zip(
-                    available_methods,
-                    np.linspace(-0.12, 0.12, len(available_methods))
-                    * spacing,
-                )
-            )
-        else:
-            offsets = {method: 0.0 for method in available_methods}
-
-        axis.plot(
-            true_values,
-            true_values,
-            color="0.35",
-            linestyle="--",
+        offsets = (
+            dict(zip(methods, np.linspace(-0.12, 0.12, len(methods)) * spacing))
+            if len(methods) > 1
+            else {method: 0.0 for method in methods}
         )
 
-        for method in available_methods:
+        axis.plot(true_values, true_values, color="0.35", linestyle="--")
+        for method in methods:
             data = comparison[
                 (comparison["parameter"] == parameter)
                 & (comparison["method"] == method)
@@ -520,14 +399,12 @@ def plot_credible_intervals(
                 label=method,
             )
 
-        parameter_label = PARAMETER_LABELS[parameter]
-        axis.set_xlabel(f"True {parameter_label}")
-        axis.set_ylabel(f"{parameter_label} posterior median")
+        label = PARAMETER_LABELS[parameter]
+        axis.set_xlabel(f"True {label}")
+        axis.set_ylabel(f"{label} posterior median")
         axis.grid(alpha=0.25)
 
-    legend_order = tuple(
-        method for method in METHODS if method in legend_handles
-    )
+    legend_order = tuple(method for method in METHODS if method in legend_handles)
     fig.legend(
         [legend_handles[method] for method in legend_order],
         legend_order,
@@ -536,215 +413,97 @@ def plot_credible_intervals(
         frameon=False,
     )
     fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0))
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def standard_normal_cdf(z: np.ndarray) -> np.ndarray:
-    """Evaluate the standard-normal CDF without adding a SciPy dependency."""
-    z = np.asarray(z, dtype=np.float64)
-    normal = NormalDist()
-    flat_cdf = np.fromiter(
-        (normal.cdf(float(value)) for value in z.ravel()),
-        dtype=np.float64,
-        count=z.size,
-    )
-    return flat_cdf.reshape(z.shape)
-
-
-def compute_sbc_cdf_values(
-    transformed_theta: np.ndarray,
-    posterior_means: np.ndarray,
-    posterior_variances: np.ndarray,
-) -> np.ndarray:
-    """Evaluate each marginal posterior CDF at its true transformed value."""
-    transformed_theta = np.asarray(transformed_theta, dtype=np.float64)
-    posterior_means = np.asarray(posterior_means, dtype=np.float64)
-    posterior_variances = np.asarray(
-        posterior_variances,
+def plot_validation_loss(checkpoint: dict, output_path: Path) -> None:
+    """Plot mean marginal validation loss, following test_NN_models.py."""
+    apply_plot_style()
+    marginal_losses = np.asarray(
+        checkpoint["val_marginal_loss_history"],
         dtype=np.float64,
     )
-    if not (
-        transformed_theta.shape
-        == posterior_means.shape
-        == posterior_variances.shape
-    ):
-        raise ValueError(
-            "SBC targets, means, and variances must have equal shapes."
-        )
+    losses = np.mean(marginal_losses, axis=1)
+    epochs = np.arange(1, len(losses) + 1)
 
-    posterior_sd = np.sqrt(
-        np.clip(posterior_variances, POSTERIOR_VAR_EPS, None)
+    fig, axis = plt.subplots(figsize=(7.2, 4.8))
+    tcn_handle = axis.plot(
+        epochs,
+        losses,
+        color=COLORS["TCN"],
+        label="TCN",
+    )[0]
+    final_handle = axis.plot(
+        epochs[-1],
+        losses[-1],
+        color="black",
+        marker="x",
+        markersize=8,
+        markeredgewidth=1.8,
+        linestyle="none",
+        label="Final epoch",
+    )[0]
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Mean marginal Gaussian loss")
+    axis.set_yscale("log")
+    axis.grid(alpha=0.25)
+
+    fig.legend(
+        [tcn_handle, final_handle],
+        ["TCN", "Final epoch"],
+        loc="lower center",
+        ncol=2,
+        frameon=False,
     )
-    standardized_error = (
-        transformed_theta - posterior_means
-    ) / posterior_sd
-    return standard_normal_cdf(standardized_error)
+    fig.tight_layout(rect=(0.0, 0.14, 1.0, 1.0))
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
-def ks_uniform_statistic(values: np.ndarray) -> float:
-    """One-sample Kolmogorov--Smirnov distance from Uniform(0, 1)."""
-    values = np.sort(np.asarray(values, dtype=np.float64))
-    if len(values) < 1:
-        raise ValueError("values must contain at least one entry.")
-    if np.any((values < 0.0) | (values > 1.0)):
-        raise ValueError("SBC CDF values must lie in [0, 1].")
-
-    n = len(values)
-    empirical_upper = np.arange(1, n + 1, dtype=np.float64) / n
-    empirical_lower = np.arange(0, n, dtype=np.float64) / n
-    return float(
-        max(
-            np.max(empirical_upper - values),
-            np.max(values - empirical_lower),
-        )
-    )
-
-
-def asymptotic_ks_uniform_pvalue(
-    ks_distance: float,
-    n: int,
-    n_terms: int = 100,
-) -> float:
-    """Approximate the two-sided uniform KS p-value."""
-    if n < 1:
-        raise ValueError("n must be at least 1.")
-    if ks_distance <= 0.0:
-        return 1.0
-
-    scaled_distance = (
-        np.sqrt(n) + 0.12 + 0.11 / np.sqrt(n)
-    ) * ks_distance
-    terms = [
-        (-1.0) ** (index - 1)
-        * np.exp(-2.0 * (index * scaled_distance) ** 2)
-        for index in range(1, n_terms + 1)
-    ]
-    return float(np.clip(2.0 * np.sum(terms), 0.0, 1.0))
-
-
-def sbc_uniformity_metrics(
-    cdf_values: np.ndarray,
-    bins: int = SBC_BINS,
-) -> pd.DataFrame:
-    """Summarize uniformity of the five marginal SBC distributions."""
-    cdf_values = np.asarray(cdf_values, dtype=np.float64)
-    if (
-        cdf_values.ndim != 2
-        or cdf_values.shape[1] != len(PARAMETERS)
-    ):
-        raise ValueError(
-            f"cdf_values must have shape (n, {len(PARAMETERS)})."
-        )
-    if bins < 2:
-        raise ValueError("bins must be at least 2.")
-
-    bin_edges = np.linspace(0.0, 1.0, bins + 1)
-    rows = []
-
-    for index, (parameter, transformed_parameter) in enumerate(
-        zip(PARAMETERS, TRANSFORMED_PARAMETERS)
-    ):
-        values = cdf_values[:, index]
-        counts, _ = np.histogram(values, bins=bin_edges)
-        observed_bin_mass = counts.astype(np.float64) / len(values)
-        expected_bin_mass = 1.0 / bins
-        bin_deviation = observed_bin_mass - expected_bin_mass
-        ks_distance = ks_uniform_statistic(values)
-
-        rows.append(
-            {
-                "parameter": parameter,
-                "transformed_parameter": transformed_parameter,
-                "n": len(values),
-                "cdf_mean": float(np.mean(values)),
-                "cdf_variance": (
-                    float(np.var(values, ddof=1))
-                    if len(values) > 1
-                    else np.nan
-                ),
-                "ks_distance": ks_distance,
-                "ks_pvalue_asymptotic": asymptotic_ks_uniform_pvalue(
-                    ks_distance,
-                    len(values),
-                ),
-                "histogram_l1_distance": float(
-                    np.sum(np.abs(bin_deviation))
-                ),
-                "histogram_rmse": float(
-                    np.sqrt(np.mean(bin_deviation**2))
-                ),
-                "max_abs_bin_deviation": float(
-                    np.max(np.abs(bin_deviation))
-                ),
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def simulate_sbc_dataset(
-    n_simulations: int = SBC_SIMULATIONS,
-    seed: int = SBC_SEED,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Draw parameters from the default prior and simulate observations."""
-    if n_simulations < 1:
-        raise ValueError("n_simulations must be at least 1.")
-
-    rng = np.random.default_rng(seed)
-    mu, phi, s, r, nu = sim.sample_stochvol_prior(
+# Simulation-based calibration ----------------------------------------------
+def run_benchmark(
+    loaded_model: LoadedTCN,
+    n_simulations: int,
+    batch_size: int,
+) -> BenchmarkResult:
+    print(f"Simulating {n_simulations:,} benchmark datasets.")
+    rng = np.random.default_rng(BENCHMARK_SEED)
+    theta_columns = sim.sample_stochvol_prior(
         n_simulations,
         rng=rng,
         prior="default",
         return_s2=False,
         dtype=np.float64,
     )
+    theta = np.column_stack(theta_columns)
     y = sim.simulate_sv_chunk(
-        mu=mu,
-        phi=phi,
-        s=s,
-        r=r,
-        nu=nu,
+        mu=theta[:, 0],
+        phi=theta[:, 1],
+        s=theta[:, 2],
+        r=theta[:, 3],
+        nu=theta[:, 4],
         n=SEQUENCE_LENGTH,
         rng=rng,
         random_init=True,
     )
-    theta = np.column_stack((mu, phi, s, r, nu))
     transformed_theta = theta_to_target_numpy(
         theta,
         target_names=TRANSFORMED_PARAMETERS,
     ).astype(np.float64)
-    return y, theta, transformed_theta
-
-
-def run_sbc(
-    loaded_model: LoadedTCN,
-    *,
-    n_simulations: int = SBC_SIMULATIONS,
-    batch_size: int = PREDICTION_BATCH_SIZE,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Run the full joint-prior SBC experiment."""
-    print(
-        f"Simulating {n_simulations:,} default-prior SBC datasets "
-        f"of length {SEQUENCE_LENGTH:,}."
-    )
-    y, theta, transformed_theta = simulate_sbc_dataset(
-        n_simulations=n_simulations,
-    )
-    print("Predicting the five transformed posterior marginals for SBC.")
     posterior_means, posterior_variances = predict_transformed_gaussian(
         loaded_model,
         y,
-        batch_size=batch_size,
+        batch_size,
     )
-    cdf_values = compute_sbc_cdf_values(
-        transformed_theta,
-        posterior_means,
-        posterior_variances,
+    posterior_sd = np.sqrt(
+        np.clip(posterior_variances, POSTERIOR_VAR_EPS, None)
     )
-    return (
+    cdf_values = norm.cdf(
+        (transformed_theta - posterior_means) / posterior_sd
+    )
+    return BenchmarkResult(
+        y,
         theta,
         transformed_theta,
         posterior_means,
@@ -753,35 +512,55 @@ def run_sbc(
     )
 
 
-def build_sbc_prediction_frame(
-    theta: np.ndarray,
-    transformed_theta: np.ndarray,
-    posterior_means: np.ndarray,
-    posterior_variances: np.ndarray,
-    cdf_values: np.ndarray,
-) -> pd.DataFrame:
-    """Combine true parameters, predictions, and SBC values in one table."""
-    frame = pd.DataFrame(
-        theta,
-        columns=[f"theta_{name}" for name in PARAMETERS],
-    )
+def sbc_uniformity_metrics(cdf_values: np.ndarray) -> pd.DataFrame:
+    bin_edges = np.linspace(0.0, 1.0, SBC_BINS + 1)
+    rows: list[dict[str, object]] = []
 
     for index, (parameter, transformed_parameter) in enumerate(
         zip(PARAMETERS, TRANSFORMED_PARAMETERS)
     ):
-        frame[f"target_{transformed_parameter}"] = transformed_theta[:, index]
+        values = cdf_values[:, index]
+        bin_mass = np.histogram(values, bins=bin_edges)[0] / len(values)
+        bin_deviation = bin_mass - 1.0 / SBC_BINS
+        ks_result = kstest(values, "uniform", method="asymp")
+        rows.append(
+            {
+                "parameter": parameter,
+                "transformed_parameter": transformed_parameter,
+                "n": len(values),
+                "cdf_mean": np.mean(values),
+                "cdf_variance": np.var(values, ddof=1),
+                "ks_distance": ks_result.statistic,
+                "ks_pvalue_asymptotic": ks_result.pvalue,
+                "histogram_l1_distance": np.sum(np.abs(bin_deviation)),
+                "histogram_rmse": np.sqrt(np.mean(bin_deviation**2)),
+                "max_abs_bin_deviation": np.max(np.abs(bin_deviation)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_sbc_prediction_frame(result: BenchmarkResult) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        result.theta,
+        columns=[f"theta_{name}" for name in PARAMETERS],
+    )
+    for index, (parameter, transformed_parameter) in enumerate(
+        zip(PARAMETERS, TRANSFORMED_PARAMETERS)
+    ):
+        frame[f"target_{transformed_parameter}"] = result.transformed_theta[:, index]
         frame[f"posterior_mean_{transformed_parameter}"] = (
-            posterior_means[:, index]
+            result.posterior_means[:, index]
         )
         frame[f"posterior_sd_{transformed_parameter}"] = np.sqrt(
             np.clip(
-                posterior_variances[:, index],
+                result.posterior_variances[:, index],
                 POSTERIOR_VAR_EPS,
                 None,
             )
         )
-        frame[f"sbc_cdf_{parameter}"] = cdf_values[:, index]
-
+        frame[f"sbc_cdf_{parameter}"] = result.cdf_values[:, index]
     return frame
 
 
@@ -789,9 +568,7 @@ def plot_sbc_histograms(
     cdf_values: np.ndarray,
     metrics: pd.DataFrame,
     output_path: Path,
-    bins: int = SBC_BINS,
 ) -> None:
-    """Plot the four most informative SBC histograms in a 2-by-2 layout."""
     apply_plot_style()
     fig, axes = plt.subplots(
         2,
@@ -800,43 +577,35 @@ def plot_sbc_histograms(
         sharex=True,
         sharey=True,
     )
-    bin_edges = np.linspace(0.0, 1.0, bins + 1)
-    metrics_by_parameter = metrics.set_index("parameter")
+    bin_edges = np.linspace(0.0, 1.0, SBC_BINS + 1)
+    metrics = metrics.set_index("parameter")
 
     for axis, parameter in zip(axes.flat, PLOT_PARAMETERS):
-        parameter_index = PARAMETERS.index(parameter)
-        metric_row = metrics_by_parameter.loc[parameter]
+        index = PARAMETERS.index(parameter)
         axis.hist(
-            cdf_values[:, parameter_index],
+            cdf_values[:, index],
             bins=bin_edges,
             density=True,
             color=SBC_COLOR,
             edgecolor="white",
             linewidth=0.6,
         )
-        axis.axhline(
-            1.0,
-            color="0.35",
-            linestyle="--",
-        )
+        axis.axhline(1.0, color="0.35", linestyle="--")
         axis.set_xlim(0.0, 1.0)
         axis.set_xlabel("Posterior CDF at the true parameter")
         axis.set_ylabel("Density")
         axis.set_title(
             f"{PARAMETER_LABELS[parameter]}: "
-            f"KS = {metric_row['ks_distance']:.3f}"
+            f"KS = {metrics.loc[parameter, 'ks_distance']:.3f}"
         )
         axis.grid(axis="y", alpha=0.25)
 
     fig.tight_layout()
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
 def print_sbc_metrics(metrics: pd.DataFrame) -> None:
-    """Print the main SBC diagnostics in a compact table."""
     columns = (
         "parameter",
         "transformed_parameter",
@@ -848,142 +617,456 @@ def print_sbc_metrics(metrics: pd.DataFrame) -> None:
         "max_abs_bin_deviation",
     )
     print("\nSBC uniformity diagnostics:")
-    with pd.option_context("display.width", 180):
-        print(
-            metrics.loc[:, columns].to_string(
-                index=False,
-                float_format=lambda value: f"{value:.6g}",
+    print(
+        metrics.loc[:, columns].to_string(
+            index=False,
+            float_format=lambda value: f"{value:.6g}",
+        )
+    )
+
+
+def save_sbc_results(
+    result: BenchmarkResult,
+    output_dir: Path,
+    n_simulations: int,
+) -> None:
+    suffix = f"n{n_simulations}"
+    metrics = sbc_uniformity_metrics(result.cdf_values)
+    build_sbc_prediction_frame(result).to_csv(
+        output_dir / f"five_parameter_sbc_predictions_{suffix}.csv",
+        index_label="simulation",
+    )
+    pd.DataFrame(result.cdf_values, columns=PARAMETERS).to_csv(
+        output_dir / f"five_parameter_sbc_cdf_values_{suffix}.csv",
+        index_label="simulation",
+    )
+    metrics.to_csv(
+        output_dir / f"five_parameter_sbc_metrics_{suffix}.csv",
+        index=False,
+    )
+    plot_sbc_histograms(
+        result.cdf_values,
+        metrics,
+        output_dir / f"five_parameter_sbc_histograms_{suffix}.pdf",
+    )
+    print_sbc_metrics(metrics)
+
+
+# Marginal Gaussian loss benchmark ------------------------------------------
+def transformed_prior_moments() -> tuple[np.ndarray, np.ndarray]:
+    """Exact moments of the five transformed parameters under the prior."""
+    prior = sim.get_gh_skew_t_prior_constants("default")
+    if prior.r_a0 is not None or prior.r_b0 is not None:
+        raise ValueError("The r-moment calculation expects a uniform prior.")
+
+    psi_mean = digamma(prior.phi_a0) - digamma(prior.phi_b0)
+    psi_variance = polygamma(1, prior.phi_a0) + polygamma(1, prior.phi_b0)
+    rho_mean = 0.5 * (
+        np.log(prior.Bs) + digamma(0.5) + np.log(2.0)
+    )
+    rho_variance = 0.25 * polygamma(1, 0.5)
+
+    def squared_logit(r: float) -> float:
+        return float((np.log(r) - np.log1p(-r)) ** 2)
+
+    r_max = prior.r_max
+    logit_r_mean = (
+        r_max * np.log(r_max)
+        + (1.0 - r_max) * np.log1p(-r_max)
+    ) / r_max
+    logit_r_second_moment = (
+        quad(squared_logit, 0.0, r_max, limit=200)[0] / r_max
+    )
+    logit_r_variance = logit_r_second_moment - logit_r_mean**2
+
+    log_nu_mean = digamma(1.0) - np.log(prior.nu_rate)
+    log_nu_variance = polygamma(1, 1.0)
+
+    means = np.array(
+        [
+            prior.mu_mean,
+            psi_mean,
+            rho_mean,
+            logit_r_mean,
+            log_nu_mean,
+        ],
+        dtype=np.float64,
+    )
+    variances = np.array(
+        [
+            prior.mu_sd**2,
+            psi_variance,
+            rho_variance,
+            logit_r_variance,
+            log_nu_variance,
+        ],
+        dtype=np.float64,
+    )
+    return means, variances
+
+
+def gaussian_loss(
+    targets: np.ndarray,
+    means: np.ndarray,
+    variances: np.ndarray,
+) -> np.ndarray:
+    """Elementwise negative log density of a marginal Gaussian."""
+    variances = np.clip(variances, POSTERIOR_VAR_EPS, None)
+    return 0.5 * (
+        np.log(2.0 * np.pi * variances)
+        + (targets - means) ** 2 / variances
+    )
+
+
+def mcmc_posterior_moments(
+    y: np.ndarray,
+    draws: int,
+    max_cores: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    print(
+        f"Running {len(y):,} stochvol chains with {draws:,} draws each."
+    )
+    summary = run_stochvol_mcmc(
+        y,
+        prior="default",
+        draws=draws,
+        burnin=MCMC_BURNIN,
+        thinpara=MCMC_THINPARA,
+        alpha=ALPHA,
+        transforms=MCMC_TRANSFORMS,
+        max_cores=max_cores,
+    ).sort_values("index")
+    means = summary[["mu_mean", "psi_mean", "rho_mean"]].to_numpy()
+    variances = summary[["mu_var", "psi_var", "rho_var"]].to_numpy()
+    return means, variances
+
+
+def loss_components(
+    parameter_names: tuple[str, ...],
+    losses: np.ndarray,
+) -> dict[str, np.ndarray]:
+    components = {
+        parameter: losses[:, index]
+        for index, parameter in enumerate(parameter_names)
+    }
+    if all(parameter in parameter_names for parameter in METRIC_PARAMETERS[:3]):
+        indices = [parameter_names.index(name) for name in METRIC_PARAMETERS[:3]]
+        components["mean_standard"] = np.mean(losses[:, indices], axis=1)
+    if all(parameter in parameter_names for parameter in METRIC_PARAMETERS[3:]):
+        indices = [parameter_names.index(name) for name in METRIC_PARAMETERS[3:]]
+        components["mean_ghst"] = np.mean(losses[:, indices], axis=1)
+    if parameter_names == METRIC_PARAMETERS:
+        components["mean_all"] = np.mean(losses, axis=1)
+    return components
+
+
+def summarize_method_losses(
+    method: str,
+    parameter_names: tuple[str, ...],
+    losses: np.ndarray,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    metric_rows: list[dict[str, object]] = []
+    sample_frames: list[pd.DataFrame] = []
+
+    for parameter, values in loss_components(parameter_names, losses).items():
+        sample_sd = np.std(values, ddof=1) if len(values) > 1 else np.nan
+        metric_rows.append(
+            {
+                "method": method,
+                "parameter": parameter,
+                "benchmark_size": len(values),
+                "mean_loss": np.mean(values),
+                "sample_sd": sample_sd,
+                "standard_error": sample_sd / np.sqrt(len(values)),
+            }
+        )
+        sample_frames.append(
+            pd.DataFrame(
+                {
+                    "method": method,
+                    "benchmark_index": np.arange(len(values)),
+                    "parameter": parameter,
+                    "marginal_loss": values,
+                }
             )
         )
 
+    return pd.DataFrame(metric_rows), pd.concat(sample_frames, ignore_index=True)
 
-def parse_args() -> argparse.Namespace:
-    """Parse full-run and smoke-test controls."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory for figures and CSV files.",
+
+def calculate_metric_comparison(
+    benchmark: BenchmarkResult,
+    include_mcmc: bool,
+    mcmc_draws: int = MCMC_DRAWS,
+    mcmc_max_cores: int = MCMC_MAX_CORES,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    targets = benchmark.transformed_theta
+    prior_means, prior_variances = transformed_prior_moments()
+    estimates = pd.DataFrame({"benchmark_index": np.arange(len(targets))})
+    for index, parameter in enumerate(METRIC_PARAMETERS):
+        estimates[f"target_{parameter}"] = targets[:, index]
+        estimates[f"tcn_mean_{parameter}"] = benchmark.posterior_means[:, index]
+        estimates[f"tcn_var_{parameter}"] = benchmark.posterior_variances[:, index]
+        estimates[f"prior_mean_{parameter}"] = prior_means[index]
+        estimates[f"prior_var_{parameter}"] = prior_variances[index]
+
+    method_losses: list[tuple[str, tuple[str, ...], np.ndarray]] = [
+        (
+            "TCN",
+            METRIC_PARAMETERS,
+            gaussian_loss(
+                targets,
+                benchmark.posterior_means,
+                benchmark.posterior_variances,
+            ),
+        ),
+        (
+            "prior",
+            METRIC_PARAMETERS,
+            gaussian_loss(targets, prior_means, prior_variances),
+        ),
+    ]
+
+    if include_mcmc:
+        mcmc_means, mcmc_variances = mcmc_posterior_moments(
+            benchmark.y,
+            draws=mcmc_draws,
+            max_cores=mcmc_max_cores,
+        )
+        method_losses.insert(
+            0,
+            (
+                "stochvol",
+                METRIC_PARAMETERS[:3],
+                gaussian_loss(
+                    targets[:, :3],
+                    mcmc_means,
+                    mcmc_variances,
+                ),
+            ),
+        )
+        for index, parameter in enumerate(METRIC_PARAMETERS[:3]):
+            estimates[f"stochvol_mean_{parameter}"] = mcmc_means[:, index]
+            estimates[f"stochvol_var_{parameter}"] = mcmc_variances[:, index]
+
+    metric_frames = []
+    sample_frames = []
+    for method, parameter_names, losses in method_losses:
+        metrics, samples = summarize_method_losses(
+            method,
+            parameter_names,
+            losses,
+        )
+        metric_frames.append(metrics)
+        sample_frames.append(samples)
+    return (
+        pd.concat(metric_frames, ignore_index=True),
+        pd.concat(sample_frames, ignore_index=True),
+        estimates,
     )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="PyTorch device, such as cpu or cuda. Defaults to auto-detection.",
+
+
+def plot_metric_comparison(
+    metrics: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    apply_plot_style()
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2))
+    legend_handles: dict[str, object] = {}
+    panels = (
+        (
+            axes[0],
+            ("mu", "psi", "rho", "mean_standard"),
+            ("stochvol", "TCN", "prior"),
+            "Standard SV parameters",
+        ),
+        (
+            axes[1],
+            ("logit_r", "log_nu_shifted", "mean_ghst"),
+            ("TCN", "prior"),
+            "GHST parameters",
+        ),
     )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=PREDICTION_BATCH_SIZE,
-        help="TCN prediction batch size.",
+
+    for axis, parameters, methods, title in panels:
+        x = np.arange(len(parameters), dtype=np.float64)
+        available_methods = tuple(
+            method for method in methods if method in metrics["method"].values
+        )
+        offsets = dict(
+            zip(
+                available_methods,
+                np.linspace(-0.18, 0.18, len(available_methods)),
+            )
+        )
+
+        for method in available_methods:
+            data = (
+                metrics[
+                    (metrics["method"] == method)
+                    & (metrics["parameter"].isin(parameters))
+                ]
+                .set_index("parameter")
+                .loc[list(parameters)]
+            )
+            legend_handles[method] = axis.errorbar(
+                x + offsets[method],
+                data["mean_loss"],
+                yerr=data["standard_error"],
+                fmt=MARKERS[method],
+                color=COLORS[method],
+                capsize=3,
+                markersize=5,
+                linestyle="none",
+                label=METHOD_LABELS[method],
+            )
+
+        axis.set_xticks(x, [LOSS_LABELS[name] for name in parameters])
+        axis.set_title(title)
+        axis.set_ylabel("Mean marginal Gaussian loss")
+        axis.grid(axis="y", alpha=0.25)
+
+    legend_order = tuple(
+        method
+        for method in ("stochvol", "TCN", "prior")
+        if method in legend_handles
     )
-    parser.add_argument(
-        "--sbc-simulations",
-        type=int,
-        default=SBC_SIMULATIONS,
-        help="Number of joint-prior simulations used for SBC.",
+    fig.legend(
+        [legend_handles[method] for method in legend_order],
+        [METHOD_LABELS[method] for method in legend_order],
+        loc="lower center",
+        ncol=len(legend_order),
+        frameon=False,
     )
-    parser.add_argument(
-        "--skip-mcmc",
-        action="store_true",
-        help="Generate TCN-only CI sweeps without running stochvol.",
+    fig.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def paired_loss_differences(samples: pd.DataFrame) -> pd.DataFrame:
+    """Summarize paired score differences; negative means the method is better."""
+    wide = samples.pivot(
+        index=["benchmark_index", "parameter"],
+        columns="method",
+        values="marginal_loss",
     )
-    parser.add_argument(
-        "--skip-ci",
-        action="store_true",
-        help="Skip the credible-interval sweep.",
+    rows: list[dict[str, object]] = []
+
+    for method, reference in (
+        ("TCN", "stochvol"),
+        ("TCN", "prior"),
+        ("stochvol", "prior"),
+    ):
+        if method not in wide or reference not in wide:
+            continue
+        differences = (wide[method] - wide[reference]).dropna()
+        for parameter, values in differences.groupby(level="parameter"):
+            values = values.to_numpy()
+            standard_error = np.std(values, ddof=1) / np.sqrt(len(values))
+            rows.append(
+                {
+                    "method": method,
+                    "reference": reference,
+                    "parameter": parameter,
+                    "benchmark_size": len(values),
+                    "mean_loss_difference": np.mean(values),
+                    "standard_error": standard_error,
+                    "ci_lower": np.mean(values) - 1.96 * standard_error,
+                    "ci_upper": np.mean(values) + 1.96 * standard_error,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def save_metric_results(
+    benchmark: BenchmarkResult,
+    output_dir: Path,
+) -> None:
+    metrics, samples, estimates = calculate_metric_comparison(
+        benchmark,
+        include_mcmc=RUN_MCMC_BENCHMARK,
     )
-    parser.add_argument(
-        "--skip-sbc",
-        action="store_true",
-        help="Skip simulation-based calibration.",
+    metrics.to_csv(
+        output_dir / "marginal_gaussian_loss_metrics.csv",
+        index=False,
     )
-    return parser.parse_args()
+    samples.to_csv(
+        output_dir / "marginal_gaussian_loss_samples.csv",
+        index=False,
+    )
+    paired_loss_differences(samples).to_csv(
+        output_dir / "marginal_gaussian_loss_differences.csv",
+        index=False,
+    )
+    estimates.to_csv(
+        output_dir / "marginal_gaussian_moments.csv",
+        index=False,
+    )
+    prior_means, prior_variances = transformed_prior_moments()
+    pd.DataFrame(
+        {
+            "parameter": METRIC_PARAMETERS,
+            "mean": prior_means,
+            "variance": prior_variances,
+        }
+    ).to_csv(
+        output_dir / "transformed_prior_moments.csv",
+        index=False,
+    )
+    plot_metric_comparison(
+        metrics,
+        output_dir / "marginal_gaussian_loss_comparison.pdf",
+    )
+    print("\nMarginal Gaussian loss comparison:")
+    print(
+        metrics.pivot(
+            index="parameter",
+            columns="method",
+            values="mean_loss",
+        ).to_string(float_format=lambda value: f"{value:.6g}")
+    )
 
 
 def main() -> None:
-    """Run the standardized CI sweep and SBC analysis."""
-    args = parse_args()
-    if args.skip_ci and args.skip_sbc:
-        raise ValueError("At least one of CI or SBC must be enabled.")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be at least 1.")
-    if args.sbc_simulations < 1:
-        raise ValueError("--sbc-simulations must be at least 1.")
-
     device = torch.device(
-        args.device
-        if args.device is not None
-        else ("cuda" if torch.cuda.is_available() else "cpu")
+        DEVICE_NAME or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     print(f"Loading {CHECKPOINT_PATH.name} on {device}.")
     loaded_model = load_tcn_model(CHECKPOINT_PATH, device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not args.skip_ci:
+    loss_path = DEFAULT_OUTPUT_DIR / "five_parameter_validation_loss_history.pdf"
+    plot_validation_loss(loaded_model.checkpoint, loss_path)
+    print(f"Saved validation loss history to {loss_path}")
+
+    if RUN_CI:
         comparison = calculate_credible_intervals(
             loaded_model,
-            include_mcmc=not args.skip_mcmc,
-            batch_size=args.batch_size,
+            include_mcmc=RUN_MCMC_CI,
+            batch_size=PREDICTION_BATCH_SIZE,
         )
-        ci_csv_path = args.output_dir / "five_parameter_ci_sweeps.csv"
-        ci_plot_path = args.output_dir / "five_parameter_ci_sweeps.pdf"
-        comparison.to_csv(ci_csv_path, index=False)
-        plot_credible_intervals(comparison, ci_plot_path)
-        print(f"Saved CI estimates to {ci_csv_path}")
-        print(f"Saved the 5-by-1 CI plot to {ci_plot_path}")
+        comparison.to_csv(
+            DEFAULT_OUTPUT_DIR / "five_parameter_ci_sweeps.csv",
+            index=False,
+        )
+        plot_credible_intervals(
+            comparison,
+            DEFAULT_OUTPUT_DIR / "five_parameter_ci_sweeps.pdf",
+        )
 
-    if not args.skip_sbc:
-        (
-            theta,
-            transformed_theta,
-            posterior_means,
-            posterior_variances,
-            cdf_values,
-        ) = run_sbc(
+    benchmark = None
+    if RUN_SBC or RUN_METRIC_BENCHMARK:
+        benchmark = run_benchmark(
             loaded_model,
-            n_simulations=args.sbc_simulations,
-            batch_size=args.batch_size,
+            n_simulations=BENCHMARK_SIZE,
+            batch_size=PREDICTION_BATCH_SIZE,
         )
-        metrics = sbc_uniformity_metrics(cdf_values, bins=SBC_BINS)
-        predictions = build_sbc_prediction_frame(
-            theta,
-            transformed_theta,
-            posterior_means,
-            posterior_variances,
-            cdf_values,
-        )
-        suffix = f"n{args.sbc_simulations}"
-        prediction_path = (
-            args.output_dir / f"five_parameter_sbc_predictions_{suffix}.csv"
-        )
-        cdf_path = (
-            args.output_dir / f"five_parameter_sbc_cdf_values_{suffix}.csv"
-        )
-        metrics_path = (
-            args.output_dir / f"five_parameter_sbc_metrics_{suffix}.csv"
-        )
-        sbc_plot_path = (
-            args.output_dir / f"five_parameter_sbc_histograms_{suffix}.pdf"
-        )
-
-        predictions.to_csv(prediction_path, index_label="simulation")
-        pd.DataFrame(cdf_values, columns=PARAMETERS).to_csv(
-            cdf_path,
-            index_label="simulation",
-        )
-        metrics.to_csv(metrics_path, index=False)
-        plot_sbc_histograms(
-            cdf_values,
-            metrics,
-            sbc_plot_path,
-            bins=SBC_BINS,
-        )
-        print_sbc_metrics(metrics)
-        print(f"Saved SBC predictions to {prediction_path}")
-        print(f"Saved SBC CDF values to {cdf_path}")
-        print(f"Saved SBC metrics to {metrics_path}")
-        print(f"Saved the 5-by-1 SBC plot to {sbc_plot_path}")
+    if benchmark is None:
+        return
+    if RUN_SBC:
+        save_sbc_results(benchmark, DEFAULT_OUTPUT_DIR, BENCHMARK_SIZE)
+    if RUN_METRIC_BENCHMARK:
+        save_metric_results(benchmark, DEFAULT_OUTPUT_DIR)
 
 
 if __name__ == "__main__":
