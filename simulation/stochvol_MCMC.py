@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import sim_5_param_data as sim
 
-
+# Locate the R script relative to this Python file.
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvol_MCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
@@ -688,6 +688,9 @@ def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
 
 
 def main0():
+
+    ### Plot QQ plots of transformed parameters for sequences from different priors.
+
     from scipy import stats
 
     plt.rcParams.update(
@@ -888,6 +891,7 @@ def main0():
 
 def main1():
 
+    ## Plot histograms of the minimum effective sample size across MCMC runs.
 
     plt.rcParams.update(
         {

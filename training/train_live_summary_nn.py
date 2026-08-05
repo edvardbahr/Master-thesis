@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import sim_5_param_data as sim
+HERE = Path(__file__).resolve().parent
+PROJECT_DIR = HERE.parent
+sys.path.insert(0, str(PROJECT_DIR))
+
+import simulation.sim_5_param_data as sim
 
 
 def make_mlp(
