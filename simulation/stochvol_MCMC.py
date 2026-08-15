@@ -2,10 +2,10 @@ import os
 import shutil
 import subprocess
 import tempfile
-from time import perf_counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
@@ -13,43 +13,45 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sim_5_param_data as sim
+from numpy.typing import ArrayLike
 
-# Locate the R script relative to this Python file.
 HERE = Path(__file__).resolve().parent
 R_SCRIPT = HERE / "stochvol_MCMC.R"
 PARAMETER_NAMES = ("mu", "phi", "sigma")
+Transform = Callable[[ArrayLike], ArrayLike]
+TransformMap = Mapping[str, Mapping[str, Transform]]
 
 
-def psi_transform(phi, eps=1e-6):
+def psi_transform(phi: ArrayLike, eps: float = 1e-6) -> np.ndarray:
     phi = np.clip(np.asarray(phi, dtype=np.float64), -1.0 + eps, 1.0 - eps)
     return 2.0 * np.arctanh(phi)
 
 
-def log_positive_transform(x, eps=1e-12):
+def log_positive_transform(x: ArrayLike, eps: float = 1e-12) -> np.ndarray:
     x = np.clip(np.asarray(x, dtype=np.float64), eps, None)
     return np.log(x)
 
 
-def centered_square_transform(x):
+def centered_square_transform(x: ArrayLike) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     return (x - np.mean(x)) ** 2
 
 
-def psi_sq_transform(phi, eps=1e-6):
+def psi_sq_transform(phi: ArrayLike, eps: float = 1e-6) -> np.ndarray:
     return centered_square_transform(psi_transform(phi, eps=eps))
 
 
-def log_positive_sq_transform(x, eps=1e-12):
+def log_positive_sq_transform(x: ArrayLike, eps: float = 1e-12) -> np.ndarray:
     return centered_square_transform(log_positive_transform(x, eps=eps))
 
 
-DEFAULT_TRANSFORMS = {
+DEFAULT_TRANSFORMS: TransformMap = {
     "phi": {"psi": psi_transform},
     "sigma": {"rho": log_positive_transform},
 }
 
 
-def find_rscript():
+def find_rscript() -> str:
     rscript = shutil.which("Rscript")
 
     if rscript is not None:
@@ -69,7 +71,7 @@ def find_rscript():
     )
 
 
-def validate_series_matrix(y):
+def validate_series_matrix(y: ArrayLike) -> np.ndarray:
     y = np.asarray(y, dtype=np.float64)
 
     if y.ndim == 1:
@@ -86,54 +88,52 @@ def validate_series_matrix(y):
     return y
 
 
-def resolve_n_workers(max_cores, n_rows):
-    if max_cores is None:
-        max_cores = 1
+def resolve_n_workers(max_cores: int, n_rows: int) -> int:
+    """Resolve a worker count, capped by the number of input rows."""
 
-    if int(max_cores) != max_cores or max_cores == 0:
+    if type(max_cores) is not int:
         raise ValueError(
-            "max_cores must be a non-zero integer. Use negative values as "
-            "CPU offsets, e.g. -2 means all available cores except 2."
+            "max_cores must be an integer. Use a positive worker count or a "
+            "negative CPU offset, e.g. -2 means all available cores except 2."
         )
 
-    max_cores = int(max_cores)
     available_cpus = os.cpu_count() or 1
+    n_workers = max_cores
 
     if max_cores < 0:
-        max_cores = available_cpus + max_cores
-        if max_cores < 1:
+        n_workers = available_cpus + max_cores
+
+        if n_workers < 1:
             raise ValueError(
-                "max_cores leaves no worker processes available. "
-                f"With {available_cpus} CPU core(s), use max_cores >= "
-                f"{1 - available_cpus}."
+                f"max_cores={max_cores} leaves no worker processes available. "
+                f"With {available_cpus} CPU core(s), use an integer from "
+                f"{1 - available_cpus} to {available_cpus}, excluding 0."
             )
 
-    return min(max_cores, available_cpus, n_rows)
+    if n_workers == 0:
+        raise ValueError("max_cores must not be 0.")
+
+    if n_workers > available_cpus:
+        raise ValueError(
+            f"max_cores={max_cores} exceeds the available CPU count "
+            f"({available_cpus})."
+        )
+
+    return min(n_workers, n_rows)
 
 
-def make_row_chunks(n_rows, n_workers):
-    chunk_size = max(1, int(np.ceil(n_rows / n_workers)))
-    chunks = []
-    start = 0
-
-    while start < n_rows:
-        stop = min(start + chunk_size, n_rows)
-        chunks.append((start, stop))
-        start = stop
-
-    return chunks
+def make_row_chunks(n_rows: int, n_workers: int) -> list[tuple[int, int]]:
+    chunk_size = (n_rows + n_workers - 1) // n_workers
+    return [
+        (start, min(start + chunk_size, n_rows))
+        for start in range(0, n_rows, chunk_size)
+    ]
 
 
-def normalize_transforms(transforms):
-    """Validate transforms of the form raw -> {summary name: function}."""
+def normalize_transforms(transforms: TransformMap | None) -> TransformMap:
+    """Check transform parameter names before starting the expensive MCMC run."""
     if transforms is None:
         return {}
-
-    if not isinstance(transforms, Mapping):
-        raise TypeError(
-            "transforms must be a mapping from raw parameter names to mappings "
-            "of transformed summary names to functions."
-        )
 
     unknown_parameters = sorted(set(transforms).difference(PARAMETER_NAMES))
     if unknown_parameters:
@@ -142,42 +142,18 @@ def normalize_transforms(transforms):
             + ", ".join(unknown_parameters)
         )
 
-    normalized = {}
-    transformed_names = set()
-
-    for parameter, parameter_transforms in transforms.items():
-        if not isinstance(parameter_transforms, Mapping):
-            raise TypeError(
-                f"transforms[{parameter!r}] must map transformed summary names "
-                "to functions."
-            )
-
-        normalized[parameter] = {}
+    used_names = set(PARAMETER_NAMES)
+    for parameter_transforms in transforms.values():
         for transformed_name, transform_fn in parameter_transforms.items():
-            if not isinstance(transformed_name, str) or not transformed_name:
-                raise TypeError("Each transformed summary name must be a non-empty string.")
-
-            if transformed_name in PARAMETER_NAMES:
+            if transformed_name in used_names:
                 raise ValueError(
-                    f"Transformed summary name {transformed_name!r} conflicts with "
-                    "a raw parameter name."
+                    f"Transform name {transformed_name!r} is already in use."
                 )
-
-            if transformed_name in transformed_names:
-                raise ValueError(
-                    f"Transformed summary name {transformed_name!r} is used more "
-                    "than once."
-                )
-
             if not callable(transform_fn):
-                raise TypeError(
-                    f"Transform for {transformed_name!r} must be callable."
-                )
+                raise TypeError(f"Transform {transformed_name!r} must be callable.")
+            used_names.add(transformed_name)
 
-            normalized[parameter][transformed_name] = transform_fn
-            transformed_names.add(transformed_name)
-
-    return normalized
+    return transforms
 
 
 def estimate_ess_fft(values: np.ndarray) -> float:
@@ -207,23 +183,23 @@ def estimate_ess_fft(values: np.ndarray) -> float:
 
     # Geyer's initial positive sequence:
     # sum autocorrelations in adjacent pairs and stop when a pair is nonpositive.
-    paired_sums = []
+    paired_sum_total = 0.0
     for lag in range(1, n - 1, 2):
         pair_sum = autocorrelation[lag] + autocorrelation[lag + 1]
 
         if not np.isfinite(pair_sum) or pair_sum <= 0:
             break
 
-        paired_sums.append(pair_sum)
+        paired_sum_total += pair_sum
 
-    integrated_autocorrelation_time = (
-        1.0 + 2.0 * np.sum(paired_sums)
-    )
-
-    return n / integrated_autocorrelation_time
+    return n / (1.0 + 2.0 * paired_sum_total)
 
 
-def summarize_values(values, alpha, estimate_ess=False):
+def summarize_values(
+    values: ArrayLike,
+    alpha: float,
+    estimate_ess: bool = False,
+) -> dict[str, float]:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
 
@@ -238,7 +214,6 @@ def summarize_values(values, alpha, estimate_ess=False):
             "ESS": np.nan,
         }
 
-
     return {
         "mean": float(np.mean(values)),
         "var": float(np.var(values, ddof=1)) if values.size > 1 else np.nan,
@@ -250,20 +225,25 @@ def summarize_values(values, alpha, estimate_ess=False):
     }
 
 
-def add_summary_columns(row, prefix, values, alpha, estimate_ess=False):
+def add_summary_columns(
+    row: dict[str, float | int],
+    prefix: str,
+    values: ArrayLike,
+    alpha: float,
+    estimate_ess: bool = False,
+) -> None:
     summary = summarize_values(values, alpha, estimate_ess=estimate_ess)
-
-    for statistic_name, statistic_value in summary.items():
-        row[f"{prefix}_{statistic_name}"] = statistic_value
+    for statistic_name, value in summary.items():
+        row[f"{prefix}_{statistic_name}"] = value
 
 
 def summarize_parameter_draws(
-    parameter_draws,
-    alpha=0.05,
-    estimate_ess=False,
-    transforms=DEFAULT_TRANSFORMS,
-    runtime_by_series=None,
-):
+    parameter_draws: pd.DataFrame,
+    alpha: float = 0.05,
+    estimate_ess: bool = False,
+    transforms: TransformMap = DEFAULT_TRANSFORMS,
+    runtime_by_series: Mapping[int, float] | None = None,
+) -> pd.DataFrame:
     """
     Summarize raw and transformed draws separately for every series.
 
@@ -276,7 +256,6 @@ def summarize_parameter_draws(
 
     Each transformed name becomes a summary-column prefix in the returned frame.
     """
-    transforms = normalize_transforms(transforms)
     required_columns = {"series_index", "draw_index", *PARAMETER_NAMES}
     missing = sorted(required_columns.difference(parameter_draws.columns))
 
@@ -299,7 +278,13 @@ def summarize_parameter_draws(
 
         for parameter in PARAMETER_NAMES:
             values = group[parameter].to_numpy(dtype=np.float64)
-            add_summary_columns(row, parameter, values, alpha, estimate_ess=estimate_ess)
+            add_summary_columns(
+                row,
+                parameter,
+                values,
+                alpha,
+                estimate_ess=estimate_ess,
+            )
 
         for parameter, parameter_transforms in transforms.items():
             values = group[parameter].to_numpy(dtype=np.float64)
@@ -319,7 +304,7 @@ def summarize_parameter_draws(
                     transformed_name,
                     transformed_values,
                     alpha,
-                    estimate_ess=estimate_ess
+                    estimate_ess=estimate_ess,
                 )
 
         if runtime_by_series is not None:
@@ -334,117 +319,56 @@ def summarize_parameter_draws(
     return pd.DataFrame(rows).sort_values("index").reset_index(drop=True)
 
 
-def prepare_chunk_workspace(tmpdir, chunk_id, chunk_start, y_chunk):
+def run_and_summarize_chunk(
+    y_chunk: np.ndarray,
+    chunk_start: int,
+    chunk_id: int,
+    tmpdir: Path,
+    rscript: str,
+    prior_constants: sim.GHSkewTPriorConstants,
+    draws: int,
+    burnin: int,
+    thinpara: int,
+    alpha: float,
+    estimate_ess: bool,
+    transforms: TransformMap,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     chunk_dir = tmpdir / f"chunk_{chunk_id:04d}"
-    input_dir = chunk_dir / "input"
-    output_dir = chunk_dir / "output"
-    series_dir = chunk_dir / "series"
+    chunk_dir.mkdir()
 
-    input_dir.mkdir(parents=True, exist_ok=False)
-    output_dir.mkdir(parents=True, exist_ok=False)
-    series_dir.mkdir(parents=True, exist_ok=False)
-
-    for local_index in range(y_chunk.shape[0]):
-        global_index = chunk_start + local_index + 1
-        series_workspace = series_dir / f"series_{global_index:06d}"
-        series_input_dir = series_workspace / "input"
-        series_output_dir = series_workspace / "output"
-
-        series_input_dir.mkdir(parents=True, exist_ok=False)
-        series_output_dir.mkdir(parents=True, exist_ok=False)
-        np.savetxt(
-            series_input_dir / "y.csv",
-            y_chunk[local_index].reshape(1, -1),
-            delimiter=",",
-        )
-
-    return {
-        "chunk_dir": chunk_dir,
-        "input_path": input_dir / "y_matrix.csv",
-        "draws_path": output_dir / "parameter_draws.csv",
-        "runtime_path": output_dir / "series_runtimes.csv",
-        "series_dir": series_dir,
-    }
-
-
-def run_stochvol_chunk(
-    y_chunk,
-    chunk_start,
-    chunk_id,
-    tmpdir,
-    rscript,
-    prior_constants,
-    draws,
-    burnin,
-    thinpara,
-):
-    workspace = prepare_chunk_workspace(
-        tmpdir=tmpdir,
-        chunk_id=chunk_id,
-        chunk_start=chunk_start,
-        y_chunk=y_chunk,
-    )
-    input_path = workspace["input_path"]
-    draws_path = workspace["draws_path"]
-    runtime_path = workspace["runtime_path"]
+    input_path = chunk_dir / "y.csv"
+    draws_path = chunk_dir / "parameter_draws.csv"
+    runtime_path = chunk_dir / "series_runtimes.csv"
     np.savetxt(input_path, y_chunk, delimiter=",")
 
-    command = [
-        rscript,
-        str(R_SCRIPT),
-        str(input_path),
-        str(draws_path),
-        str(runtime_path),
-        str(int(draws)),
-        str(int(burnin)),
-        str(int(thinpara)),
-        str(float(prior_constants.mu_mean)),
-        str(float(prior_constants.mu_sd)),
-        str(float(prior_constants.phi_a0)),
-        str(float(prior_constants.phi_b0)),
-        str(float(prior_constants.Bs)),
-    ]
-
-    subprocess.run(command, check=True)
+    subprocess.run(
+        [
+            rscript,
+            str(R_SCRIPT),
+            str(input_path),
+            str(draws_path),
+            str(runtime_path),
+            str(draws),
+            str(burnin),
+            str(thinpara),
+            str(prior_constants.mu_mean),
+            str(prior_constants.mu_sd),
+            str(prior_constants.phi_a0),
+            str(prior_constants.phi_b0),
+            str(prior_constants.Bs),
+        ],
+        check=True,
+    )
 
     parameter_draws = pd.read_csv(draws_path)
     series_runtimes = pd.read_csv(runtime_path)
     parameter_draws["series_index"] = (
-        parameter_draws["series_index"].astype(int) + int(chunk_start)
+        parameter_draws["series_index"].astype(int) + chunk_start
     )
     series_runtimes["series_index"] = (
-        series_runtimes["series_index"].astype(int) + int(chunk_start)
+        series_runtimes["series_index"].astype(int) + chunk_start
     )
 
-    return parameter_draws, series_runtimes
-
-
-def run_and_summarize_chunk(
-    y_chunk,
-    chunk_start,
-    chunk_id,
-    tmpdir,
-    rscript,
-    prior_constants,
-    draws,
-    burnin,
-    thinpara,
-    alpha,
-    estimate_ess,
-    transforms,
-    return_draws,
-):
-    parameter_draws, series_runtimes = run_stochvol_chunk(
-        y_chunk=y_chunk,
-        chunk_start=chunk_start,
-        chunk_id=chunk_id,
-        tmpdir=tmpdir,
-        rscript=rscript,
-        prior_constants=prior_constants,
-        draws=draws,
-        burnin=burnin,
-        thinpara=thinpara,
-    )
     summary = summarize_parameter_draws(
         parameter_draws=parameter_draws,
         alpha=alpha,
@@ -455,24 +379,21 @@ def run_and_summarize_chunk(
         ].to_dict(),
     )
 
-    if return_draws:
-        return chunk_id, summary, parameter_draws
-
-    return chunk_id, summary, None
+    return summary, parameter_draws
 
 
 def run_stochvol_mcmc(
-    y,
-    prior="default",
-    draws=2000,
-    burnin=500,
-    thinpara=1,
-    alpha=0.05,
-    estimate_ess=False,
-    transforms=DEFAULT_TRANSFORMS,
-    max_cores=1,
-    return_draws=False,
-):
+    y: ArrayLike,
+    prior: str = "default",
+    draws: int = 2000,
+    burnin: int = 500,
+    thinpara: int = 1,
+    alpha: float = 0.05,
+    estimate_ess: bool = False,
+    transforms: TransformMap | None = DEFAULT_TRANSFORMS,
+    max_cores: int = 1,
+    return_draws: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run stochvol MCMC independently for each row in ``y``.
 
@@ -510,9 +431,10 @@ def run_stochvol_mcmc(
     with tempfile.TemporaryDirectory() as tmpdir_name:
         tmpdir = Path(tmpdir_name)
 
-        if n_workers == 1:
-            for chunk_id, (start, stop) in enumerate(chunks):
-                _, summary, parameter_draws = run_and_summarize_chunk(
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [
+                executor.submit(
+                    run_and_summarize_chunk,
                     y_chunk=y[start:stop],
                     chunk_start=start,
                     chunk_id=chunk_id,
@@ -525,38 +447,15 @@ def run_stochvol_mcmc(
                     alpha=alpha,
                     estimate_ess=estimate_ess,
                     transforms=transforms,
-                    return_draws=return_draws,
                 )
+                for chunk_id, (start, stop) in enumerate(chunks)
+            ]
+
+            for future in as_completed(futures):
+                summary, parameter_draws = future.result()
                 summary_frames.append(summary)
                 if return_draws:
                     draw_frames.append(parameter_draws)
-        else:
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                futures = [
-                    executor.submit(
-                        run_and_summarize_chunk,
-                        y_chunk=y[start:stop],
-                        chunk_start=start,
-                        chunk_id=chunk_id,
-                        tmpdir=tmpdir,
-                        rscript=rscript,
-                        prior_constants=prior_constants,
-                        draws=draws,
-                        burnin=burnin,
-                        thinpara=thinpara,
-                        alpha=alpha,
-                        estimate_ess=estimate_ess,
-                        transforms=transforms,
-                        return_draws=return_draws,
-                    )
-                    for chunk_id, (start, stop) in enumerate(chunks)
-                ]
-
-                for future in as_completed(futures):
-                    _, summary, parameter_draws = future.result()
-                    summary_frames.append(summary)
-                    if return_draws:
-                        draw_frames.append(parameter_draws)
 
     summary = (
         pd.concat(summary_frames, ignore_index=True)
@@ -581,34 +480,26 @@ def run_stochvol_mcmc(
 
 
 def plot_parameter_histograms_with_normal(
-    draws,
-    output_path,
-    true_values=None,
-    parameters=PARAMETER_NAMES,
-    bins=50,
-    transformations=None,
-):
-    """
-    Plot posterior draw histograms with fitted empirical normal overlays.
-    """
-
-    if transformations is None:
-        transformations = {}
-
-    def identity(x):
-        return x
-
+    draws: pd.DataFrame,
+    output_path: str | Path,
+    true_values: Mapping[str, float] | None = None,
+    parameters: Sequence[str] = PARAMETER_NAMES,
+    bins: int = 50,
+    transformations: Mapping[str, Transform] | None = None,
+) -> Path:
+    """Plot posterior histograms with empirical normal overlays."""
+    transformations = {} if transformations is None else transformations
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(1, len(parameters), figsize=(5 * len(parameters), 4))
-
-    if len(parameters) == 1:
-        axes = [axes]
+    axes = np.atleast_1d(axes)
 
     for ax, parameter in zip(axes, parameters):
-        transform_fn = transformations.get(parameter, identity)
-        values = transform_fn(np.asarray(draws[parameter], dtype=float))
+        transform_fn = transformations.get(parameter)
+        values = np.asarray(draws[parameter], dtype=float)
+        if transform_fn is not None:
+            values = np.asarray(transform_fn(values), dtype=float)
         values = values[np.isfinite(values)]
 
         mean_hat = np.mean(values)
@@ -630,17 +521,21 @@ def plot_parameter_histograms_with_normal(
             )
 
         if true_values is not None and parameter in true_values:
-            transformed_true_value = transform_fn(true_values[parameter])
+            true_value = true_values[parameter]
+            if transform_fn is not None:
+                true_value = float(transform_fn(true_value))
             ax.axvline(
-                transformed_true_value,
+                true_value,
                 color="black",
                 linestyle="--",
                 linewidth=2,
-                label=f"true = {transformed_true_value:.3g}",
+                label=f"true = {true_value:.3g}",
             )
 
-        transform_name = getattr(transform_fn, "__name__", "transformed")
-        title = parameter if transform_name == "identity" else f"{transform_name}({parameter})"
+        title = parameter
+        if transform_fn is not None:
+            transform_name = getattr(transform_fn, "__name__", "transformed")
+            title = f"{transform_name}({parameter})"
         ax.set_title(title)
         ax.set_xlabel("Posterior draw")
         ax.set_ylabel("Density")
@@ -654,7 +549,12 @@ def plot_parameter_histograms_with_normal(
     return output_path
 
 
-def plot_parameter_trace(draws, output_path, series_index=1, true_values=None):
+def plot_parameter_trace(
+    draws: pd.DataFrame,
+    output_path: str | Path,
+    series_index: int = 1,
+    true_values: Mapping[str, float] | None = None,
+) -> Path:
     draws = draws[draws["series_index"] == series_index]
 
     fig, axes = plt.subplots(
