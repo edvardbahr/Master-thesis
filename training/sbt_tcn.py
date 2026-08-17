@@ -2,17 +2,18 @@ import os
 import sys
 from pathlib import Path
 import warnings
-import numpy as np
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
 PROJECT_DIR = HERE.parent
 sys.path.insert(0, str(PROJECT_DIR))
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 import simulation.sim_5_param_data as sim
 
