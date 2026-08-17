@@ -4,7 +4,7 @@ if (length(args) != 11) {
   stop(
     paste(
       "Usage:",
-      "Rscript stochvol_MCMC.R input_csv draws_output_csv runtime_output_csv",
+      "Rscript stochvol_mcmc.R input_csv draws_output_csv runtime_output_csv",
       "draws burnin thinpara",
       "mu_mean mu_sd phi_a0 phi_b0 Bs"
     )

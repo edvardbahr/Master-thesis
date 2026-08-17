@@ -17,8 +17,9 @@ from time import perf_counter
 
 
 HERE = Path(__file__).resolve().parent
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
+PROJECT_DIR = HERE.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
@@ -28,10 +29,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-
-
-import sim_5_param_data as sim
-from stochvol_MCMC import (
+from simulation import sim_5_param_data as sim
+from simulation.stochvol_mcmc import (
     centered_square_transform,
     log_positive_sq_transform,
     log_positive_transform,
@@ -39,8 +38,8 @@ from stochvol_MCMC import (
     psi_transform,
     run_stochvol_mcmc,
 )
-from train_live_CNN import SVPosteriorTCN
-from train_live_summary_nn import SVPosteriorNN
+from training.train_live_CNN import SVPosteriorTCN
+from training.train_live_summary_nn import SVPosteriorNN
 
 
 ALPHA = 0.05
