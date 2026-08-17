@@ -1,4 +1,3 @@
-import argparse
 import os
 import sys
 from pathlib import Path
@@ -15,12 +14,30 @@ import torch.nn.functional as F
 import simulation.sim_5_param_data as sim
 
 
+TARGET_NAMES = ("mu", "psi", "rho")
+TARGET_TRANSFORMS = {
+    "mu": "mu",
+    "psi": "2 * atanh(phi)",
+    "rho": "log(sigma)",
+}
+LOSS_REDUCTION = "sum_over_parameters"
+
+CHUNKS_PER_WORKER = 4
+KAPPA = 1e-12
+SUMMARY_EPS = 1e-12
+REMOVE_NANS = True
+EXP_CLIP = 350.0
+
+TRAIN_SEED_STREAM = 101
+VALIDATION_SEED_STREAM = 202
+FINAL_VALIDATION_SEED_STREAM = 303
+
+
 def make_mlp(
     input_dim,
     hidden_dims,
     output_dim=None,
     activation=nn.ReLU,
-    dropout=0.0,
     layer_norm=False,
 ):
     layers = []
@@ -34,12 +51,9 @@ def make_mlp(
 
         layers.append(activation())
 
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-
         d_prev = d_hidden
 
-    # If output_dim is specified we add a final linear layer without activation or dropout.
+    # If output_dim is specified we add a final linear layer.
     if output_dim is not None:
         layers.append(nn.Linear(d_prev, output_dim))
         d_prev = output_dim
@@ -49,7 +63,8 @@ def make_mlp(
     if len(layers) == 0:
         return nn.Identity(), input_dim
 
-    return nn.Sequential(*layers), d_prev
+    return nn.Sequential(*layers)
+
 
 class SVPosteriorNN(nn.Module):
     """
@@ -60,17 +75,17 @@ class SVPosteriorNN(nn.Module):
 
     Output:
         mean: shape (batch_size, 3)
-              columns: [mu_mean, psi_mean, log_sigma_mean]
+              columns: [mu_mean, psi_mean, rho_mean]
 
         var: shape (batch_size, 3)
-             columns: [mu_var, psi_var, log_sigma_var]
+             columns: [mu_var, psi_var, rho_var]
 
     where:
         psi = 2 * atanh(phi)
-        log_sigma = log(sigma)
+        rho = log(sigma)
     """
 
-    param_names = ("mu", "psi", "log_sigma")
+    param_names = ("mu", "psi", "rho")
 
     def __init__(
         self,
@@ -79,24 +94,17 @@ class SVPosteriorNN(nn.Module):
         hidden_dims_head=(64,),
         activation=nn.ReLU,
         min_var=1e-12,
-        dropout=0.0,
         layer_norm=False,
     ):
         super().__init__()
 
-        self.input_dim = input_dim
-        self.hidden_dims_shared_trunk = hidden_dims_shared_trunk
-        self.hidden_dims_head = hidden_dims_head
         self.min_var = min_var
-        self.dropout = dropout
-        self.layer_norm = layer_norm
 
-        self.shared_trunk, trunk_output_dim = make_mlp(
+        self.shared_trunk = make_mlp(
             input_dim=input_dim,
             hidden_dims=hidden_dims_shared_trunk,
             output_dim=None,
             activation=activation,
-            dropout=dropout,
             layer_norm=layer_norm,
         )
         
@@ -104,12 +112,11 @@ class SVPosteriorNN(nn.Module):
         self.heads = nn.ModuleDict()
 
         for name in self.param_names:
-            head, _ = make_mlp(
-                input_dim=trunk_output_dim,
+            head = make_mlp(
+                input_dim=hidden_dims_shared_trunk[-1],
                 hidden_dims=hidden_dims_head,
                 output_dim=2,
                 activation=activation,
-                dropout=dropout,
                 layer_norm=layer_norm,
             )
             self.heads[name] = head
@@ -150,7 +157,7 @@ def theta_to_target_numpy(theta, eps=1e-6):
     Returns target with columns:
         mu
         psi = 2 * atanh(phi)
-        log_sigma = log(sigma)
+        rho = log(sigma)
     """
     mu = theta[:, 0]
     phi = theta[:, 1]
@@ -160,9 +167,9 @@ def theta_to_target_numpy(theta, eps=1e-6):
     sigma = np.clip(sigma, eps, None)
 
     psi = 2 * np.arctanh(phi)
-    log_sigma = np.log(sigma)
+    rho = np.log(sigma)
 
-    target = np.column_stack([mu, psi, log_sigma])
+    target = np.column_stack([mu, psi, rho])
 
     return target.astype(np.float32)
 
@@ -196,25 +203,6 @@ def diagonal_gaussian_nll(mean, var, target):
     losses = elementwise_nll.mean(dim=0)
 
     return losses
-
-TARGET_NAMES = ("mu", "psi", "log_sigma")
-TARGET_TRANSFORMS = {
-    "mu": "mu",
-    "psi": "2 * atanh(phi)",
-    "log_sigma": "log(sigma)",
-}
-LOSS_REDUCTION = "sum_over_parameters"
-
-CHUNKS_PER_WORKER = 4
-KAPPA = 1e-12
-SUMMARY_EPS = 1e-12
-CENTER_Y = True
-REMOVE_NANS = True
-EXP_CLIP = 350.0
-
-TRAIN_SEED_STREAM = 101
-VALIDATION_SEED_STREAM = 202
-FINAL_VALIDATION_SEED_STREAM = 303
 
 
 def count_parameters(model):
@@ -287,7 +275,7 @@ def simulate_live_summary_dataset(
         k=KAPPA,
         eps=SUMMARY_EPS,
         arima_method=None,
-        center_y=CENTER_Y,
+        center_y=True,
         remove_NaNs=REMOVE_NANS,
         out_dtype=out_dtype,
         exp_clip=EXP_CLIP,
@@ -317,7 +305,6 @@ def train_live_summary_nn(
     batch_size=1024,
     n_batches=10,
     val_size=20_000,
-    fixed_validation=True,
     lr=5e-4,
     n_epochs=1000,
     patience=100,
@@ -443,7 +430,6 @@ def train_live_summary_nn(
         print("Train samples per validation:", train_size)
         print("Train batches per validation:", n_batches)
         print("Validation size:", val_size)
-        print("Fixed validation:", fixed_validation)
         print("Resolved simulation workers:", resolved_n_workers)
 
     z_mean = None
@@ -543,13 +529,6 @@ def train_live_summary_nn(
             "standardization_source": "first live training set",
 
             "feature_names": feature_names,
-            "n_acvf_ratios": n_acvf_ratios,
-            "n_quantiles": n_quantiles,
-            "compute_arima_coeff": bool(compute_arima_coeff),
-            "k": KAPPA,
-            "eps": SUMMARY_EPS,
-            "center_y": CENTER_Y,
-            "remove_NaNs": REMOVE_NANS,
             "dataset_config": {
                 "sequence_length": sequence_length,
                 "prior": prior,
@@ -559,7 +538,6 @@ def train_live_summary_nn(
                 "compute_arima_coeff": bool(compute_arima_coeff),
                 "k": KAPPA,
                 "eps": SUMMARY_EPS,
-                "center_y": CENTER_Y,
                 "remove_NaNs": REMOVE_NANS,
             },
 
@@ -587,13 +565,7 @@ def train_live_summary_nn(
             "n_batches": n_batches,
             "train_size_per_validation": train_size,
             "val_size": val_size,
-            "fixed_validation": bool(fixed_validation),
             "effective_val_batch_size": effective_val_batch_size,
-            "requested_n_workers": n_workers,
-            "resolved_n_workers": resolved_n_workers,
-            "chunks_per_worker": CHUNKS_PER_WORKER,
-            "train_chunk_size": train_chunk_size,
-            "val_chunk_size": val_chunk_size,
             "out_dtype": str(np.dtype(out_dtype)),
             "deterministic_torch": bool(deterministic_torch),
             "lr": lr,
@@ -629,7 +601,6 @@ def train_live_summary_nn(
             "n_acvf_ratios": n_acvf_ratios,
             "n_quantiles": n_quantiles,
             "compute_arima_coeff": bool(compute_arima_coeff),
-            "fixed_validation": bool(fixed_validation),
             "seed": seed,
             "loss_reduction": LOSS_REDUCTION,
         }
@@ -696,32 +667,6 @@ def train_live_summary_nn(
             print(f"Resumed training from {resume_from}")
             print(f"Starting at epoch {start_epoch + 1}")
             print(f"Using learning rate: {lr:g}")
-
-    fixed_val_summaries = None
-    fixed_val_targets = None
-    fixed_validation_seed = None
-
-    if fixed_validation:
-        fixed_validation_seed = make_child_seed(seed, VALIDATION_SEED_STREAM, 0)
-        if verbose:
-            print("Generating fixed validation set...")
-
-        fixed_val_summaries, fixed_val_targets, generated_feature_names = (
-            simulate_live_summary_dataset(
-                N=val_size,
-                sequence_length=sequence_length,
-                chunk_size=val_chunk_size,
-                n_workers=resolved_n_workers,
-                seed=fixed_validation_seed,
-                prior=prior,
-                n_acvf_ratios=n_acvf_ratios,
-                n_quantiles=n_quantiles,
-                compute_arima_coeff=compute_arima_coeff,
-                out_dtype=out_dtype,
-            )
-        )
-        if generated_feature_names != feature_names:
-            raise RuntimeError("Simulator returned unexpected summary feature names.")
 
     for epoch in range(start_epoch, n_epochs):
         train_seed = make_child_seed(seed, TRAIN_SEED_STREAM, epoch + 1)
@@ -794,33 +739,29 @@ def train_live_summary_nn(
 
         train_marginal_losses = total_train_losses / total_train_n
 
-        if fixed_validation:
-            val_summaries = fixed_val_summaries
-            val_targets = fixed_val_targets
-            validation_seed = fixed_validation_seed
-        else:
-            validation_seed = make_child_seed(seed, VALIDATION_SEED_STREAM, epoch + 1)
-            val_summaries, val_targets, generated_feature_names = (
-                simulate_live_summary_dataset(
-                    N=val_size,
-                    sequence_length=sequence_length,
-                    chunk_size=val_chunk_size,
-                    n_workers=resolved_n_workers,
-                    seed=validation_seed,
-                    prior=prior,
-                    n_acvf_ratios=n_acvf_ratios,
-                    n_quantiles=n_quantiles,
-                    compute_arima_coeff=compute_arima_coeff,
-                    out_dtype=out_dtype,
-                )
+        
+        validation_seed = make_child_seed(seed, VALIDATION_SEED_STREAM, epoch + 1)
+        val_summaries, val_targets, generated_feature_names = (
+            simulate_live_summary_dataset(
+                N=val_size,
+                sequence_length=sequence_length,
+                chunk_size=val_chunk_size,
+                n_workers=resolved_n_workers,
+                seed=validation_seed,
+                prior=prior,
+                n_acvf_ratios=n_acvf_ratios,
+                n_quantiles=n_quantiles,
+                compute_arima_coeff=compute_arima_coeff,
+                out_dtype=out_dtype,
             )
-            if generated_feature_names != feature_names:
-                raise RuntimeError("Simulator returned unexpected summary feature names.")
+        )
+        if generated_feature_names != feature_names:
+            raise RuntimeError("Simulator returned unexpected summary feature names.")
 
         val_marginal_losses = evaluate_array(val_summaries, val_targets)
-        if not fixed_validation:
-            del val_summaries
-            del val_targets
+        
+        del val_summaries
+        del val_targets
 
         train_marginals_np = train_marginal_losses.cpu().numpy()
         val_marginals_np = val_marginal_losses.cpu().numpy()
@@ -887,33 +828,29 @@ def train_live_summary_nn(
         raise RuntimeError("Training completed without a finite best model state.")
     model.eval()
 
-    if fixed_validation:
-        final_val_summaries = fixed_val_summaries
-        final_val_targets = fixed_val_targets
-        final_validation_seed = fixed_validation_seed
-    else:
-        # Keep the final holdout independent of the early-stopping epoch.
-        final_validation_seed = make_child_seed(
-            seed,
-            FINAL_VALIDATION_SEED_STREAM,
-            0,
+
+    # Keep the final holdout independent of the early-stopping epoch.
+    final_validation_seed = make_child_seed(
+        seed,
+        FINAL_VALIDATION_SEED_STREAM,
+        0,
+    )
+    final_val_summaries, final_val_targets, generated_feature_names = (
+        simulate_live_summary_dataset(
+            N=val_size,
+            sequence_length=sequence_length,
+            chunk_size=val_chunk_size,
+            n_workers=resolved_n_workers,
+            seed=final_validation_seed,
+            prior=prior,
+            n_acvf_ratios=n_acvf_ratios,
+            n_quantiles=n_quantiles,
+            compute_arima_coeff=compute_arima_coeff,
+            out_dtype=out_dtype,
         )
-        final_val_summaries, final_val_targets, generated_feature_names = (
-            simulate_live_summary_dataset(
-                N=val_size,
-                sequence_length=sequence_length,
-                chunk_size=val_chunk_size,
-                n_workers=resolved_n_workers,
-                seed=final_validation_seed,
-                prior=prior,
-                n_acvf_ratios=n_acvf_ratios,
-                n_quantiles=n_quantiles,
-                compute_arima_coeff=compute_arima_coeff,
-                out_dtype=out_dtype,
-            )
-        )
-        if generated_feature_names != feature_names:
-            raise RuntimeError("Simulator returned unexpected summary feature names.")
+    )
+    if generated_feature_names != feature_names:
+        raise RuntimeError("Simulator returned unexpected summary feature names.")
 
     final_val_marginal_losses = evaluate_array(final_val_summaries, final_val_targets)
     final_val_marginals_np = final_val_marginal_losses.cpu().numpy()
@@ -948,27 +885,15 @@ def train_live_summary_nn(
     return model, checkpoint
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Train the live summary NN with the selected SV prior."
-    )
-    parser.add_argument(
-        "prior",
-        choices=("default", "finance"),
-        help="Prior used to simulate the live training and validation data.",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
+def main():
+    prior = "default"
     checkpoint_path = Path(__file__).resolve().parent / (
-        f"sv_posterior_summary_nn_live_{args.prior}_arima.pt"
+        f"sv_posterior_summary_nn_live_{prior}_arima.pt"
     )
 
     train_live_summary_nn(
         sequence_length=253,
-        prior=args.prior,
+        prior=prior,
         hidden_dims_shared_trunk=(128, 64),
         hidden_dims_head=(16, 16),
         checkpoint_path=checkpoint_path,
@@ -977,7 +902,6 @@ def main(argv=None):
         batch_size=1024,
         n_batches=10,
         val_size=20_000,
-        fixed_validation=False,
         n_quantiles=19,
         compute_arima_coeff=True,
         n_epochs=2000,
