@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PROJECT_DIR = HERE.parent
+PROJECT_DIR = HERE.parent.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
@@ -25,9 +25,8 @@ from simulation.stochvol_mcmc import (
 
 
 SEQUENCE_LENGTH = 253
-DRAWS = 20_000
+DRAWS = 1_000
 BURNIN = 500
-SEED = 3
 PRIORS = ("default", "finance")
 PARAMETER_NAMES = ("mu", "psi", "rho")
 PARAMETER_LABELS = (
@@ -68,7 +67,7 @@ def apply_plot_style() -> None:
 
 def main() -> None:
     apply_plot_style()
-    rng = np.random.default_rng(SEED)
+    rng = np.random.default_rng()
     chains: dict[str, pd.DataFrame] = {}
     true_values: dict[str, dict[str, float]] = {}
 

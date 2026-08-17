@@ -23,7 +23,7 @@ def main():
         )
         final_nll[grid_position] = float(checkpoint["final_val_loss"])
 
-    print("Final validation NLL")
+    print("Final validation NLL:")
     print(f"{'shared trunk / head':>20}", end="")
     for head_dims in HEAD_DIMS:
         print(f"{str(head_dims):>14}", end="")
@@ -48,5 +48,5 @@ if __name__ == "__main__":
         weights_only=False,
     )
 
-    print(checkpoint["prior"])
+    print("Prior used: " + checkpoint["prior"])
 
