@@ -38,8 +38,8 @@ from simulation.stochvol_mcmc import (
     psi_transform,
     run_stochvol_mcmc,
 )
-from training.train_live_CNN import SVPosteriorTCN
-from training.train_live_summary_nn import SVPosteriorNN
+from training.sbt_summary_nn import SummaryNN
+from training.sbt_tcn import SVPosteriorTCN
 
 
 ALPHA = 0.05
@@ -127,7 +127,7 @@ def load_models() -> dict[tuple[str, str], LoadedModel]:
             map_location=DEVICE,
             weights_only=False,
         )
-        summary_model = SVPosteriorNN(
+        summary_model = SummaryNN(
             input_dim=summary_checkpoint["input_dim"],
             hidden_dims_shared_trunk=tuple(
                 summary_checkpoint["hidden_dims_shared_trunk"]
@@ -135,7 +135,6 @@ def load_models() -> dict[tuple[str, str], LoadedModel]:
             hidden_dims_head=tuple(summary_checkpoint["hidden_dims_head"]),
             activation=getattr(nn, summary_checkpoint["activation"]),
             min_var=summary_checkpoint["min_var"],
-            dropout=summary_checkpoint.get("dropout", 0.0),
             layer_norm=summary_checkpoint["layer_norm"],
         ).to(DEVICE)
         summary_model.load_state_dict(summary_checkpoint["model_state_dict"])

@@ -20,7 +20,6 @@ TARGET_TRANSFORMS = {
     "psi": "2 * atanh(phi)",
     "rho": "log(sigma)",
 }
-LOSS_REDUCTION = "sum_over_parameters"
 
 CHUNKS_PER_WORKER = 4
 KAPPA = 1e-12
@@ -34,13 +33,13 @@ FINAL_VALIDATION_SEED_STREAM = 303
 
 
 def make_mlp(
-    input_dim,
-    hidden_dims,
-    output_dim=None,
-    activation=nn.ReLU,
-    layer_norm=False,
-):
-    layers = []
+    input_dim: int,
+    hidden_dims: tuple[int, ...],
+    output_dim: int | None = None,
+    activation: type[nn.Module] = nn.ReLU,
+    layer_norm: bool = False,
+) -> nn.Module:
+    layers: list[nn.Module] = []
     d_prev = input_dim
 
     for d_hidden in hidden_dims:
@@ -53,20 +52,13 @@ def make_mlp(
 
         d_prev = d_hidden
 
-    # If output_dim is specified we add a final linear layer.
     if output_dim is not None:
         layers.append(nn.Linear(d_prev, output_dim))
-        d_prev = output_dim
-    
-    # If no hidden layers and no output layer, the function returns the identity function
-    # which is useful for the shared trunk when we want to skip it and directly connect the input to the heads.
-    if len(layers) == 0:
-        return nn.Identity(), input_dim
 
-    return nn.Sequential(*layers)
+    return nn.Sequential(*layers) if layers else nn.Identity()
 
 
-class SVPosteriorNN(nn.Module):
+class SummaryNN(nn.Module):
     """
     Neural network for amortized inference in the standard SV model.
 
@@ -85,35 +77,36 @@ class SVPosteriorNN(nn.Module):
         rho = log(sigma)
     """
 
-    param_names = ("mu", "psi", "rho")
+    param_names: tuple[str, ...] = ("mu", "psi", "rho")
 
     def __init__(
         self,
-        input_dim,
-        hidden_dims_shared_trunk=(128, 128),
-        hidden_dims_head=(64,),
-        activation=nn.ReLU,
-        min_var=1e-12,
-        layer_norm=False,
-    ):
+        input_dim: int,
+        hidden_dims_shared_trunk: tuple[int, ...] = (128, 128),
+        hidden_dims_head: tuple[int, ...] = (64,),
+        activation: type[nn.Module] = nn.ReLU,
+        min_var: float = 1e-12,
+        layer_norm: bool = False,
+    ) -> None:
         super().__init__()
 
         self.min_var = min_var
 
-        self.shared_trunk = make_mlp(
+        self.shared_trunk: nn.Module = make_mlp(
             input_dim=input_dim,
             hidden_dims=hidden_dims_shared_trunk,
             output_dim=None,
             activation=activation,
             layer_norm=layer_norm,
         )
-        
-        # pytorch's ModuleDict is a dictionary that properly registers its contents as submodules.
+        trunk_output_dim = (
+            hidden_dims_shared_trunk[-1] if hidden_dims_shared_trunk else input_dim
+        )
         self.heads = nn.ModuleDict()
 
         for name in self.param_names:
             head = make_mlp(
-                input_dim=hidden_dims_shared_trunk[-1],
+                input_dim=trunk_output_dim,
                 hidden_dims=hidden_dims_head,
                 output_dim=2,
                 activation=activation,
@@ -121,7 +114,7 @@ class SVPosteriorNN(nn.Module):
             )
             self.heads[name] = head
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.shared_trunk(z)
 
         means = []
@@ -130,8 +123,9 @@ class SVPosteriorNN(nn.Module):
         for name in self.param_names:
             out = self.heads[name](h)
 
-            mean = out[:, 0:1]    # Preserves shape (batch_size, 1) which is
-            raw_var = out[:, 1:2] # important for torch.cat later.
+            # Keep a two-dimensional slice for the final concatenation.
+            mean = out[:, 0:1]
+            raw_var = out[:, 1:2]
 
             var = F.softplus(raw_var) + self.min_var
 
@@ -141,11 +135,10 @@ class SVPosteriorNN(nn.Module):
         mean = torch.cat(means, dim=1)
         var = torch.cat(variances, dim=1)
 
-        # The mean and var posterior parameters for each main parameter is returned as we assume a diagonal Gaussian posterior.
-        return mean, var  
-    
+        return mean, var
 
-def theta_to_target_numpy(theta, eps=1e-6):
+
+def theta_to_target_numpy(theta: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
     Converts original SV parameters to transformed training targets.
 
@@ -174,7 +167,11 @@ def theta_to_target_numpy(theta, eps=1e-6):
     return target.astype(np.float32)
 
 
-def diagonal_gaussian_nll(mean, var, target):
+def diagonal_gaussian_nll(
+    mean: torch.Tensor,
+    var: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
     """
     Computes marginal negative log scores under a diagonal Gaussian.
 
@@ -205,38 +202,42 @@ def diagonal_gaussian_nll(mean, var, target):
     return losses
 
 
-def count_parameters(model):
-    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+def count_parameters(model: nn.Module) -> int:
+    return sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
 
 
-def make_child_seed(seed, stream, index):
+def make_child_seed(seed: int, stream: int, index: int) -> int:
     """Derive reproducible, independent seeds for live data streams."""
     seed_sequence = np.random.SeedSequence([int(seed), int(stream), int(index)])
     return int(seed_sequence.generate_state(1, dtype=np.uint32)[0])
 
 
-def default_checkpoint_paths(checkpoint_path):
+def default_checkpoint_paths(
+    checkpoint_path: str | os.PathLike[str],
+) -> tuple[str, str]:
     base, extension = os.path.splitext(checkpoint_path)
     if extension == "":
         extension = ".pt"
     return f"{base}.latest{extension}", f"{base}.best{extension}"
 
 
-def torch_load_checkpoint(path, map_location):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-
-def state_dict_to_cpu(state_dict):
+def state_dict_to_cpu(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     return {
         key: value.detach().cpu().clone()
         for key, value in state_dict.items()
     }
 
 
-def save_checkpoint_atomic(checkpoint, path):
+def save_checkpoint_atomic(
+    checkpoint: dict[str, object],
+    path: str | os.PathLike[str],
+) -> None:
     path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -247,17 +248,17 @@ def save_checkpoint_atomic(checkpoint, path):
 
 
 def simulate_live_summary_dataset(
-    N,
-    sequence_length,
-    chunk_size,
-    n_workers,
-    seed,
-    prior,
-    n_acvf_ratios,
-    n_quantiles,
-    compute_arima_coeff,
-    out_dtype,
-):
+    N: int,
+    sequence_length: int,
+    chunk_size: int,
+    n_workers: int,
+    seed: int,
+    prior: str,
+    n_acvf_ratios: int,
+    n_quantiles: int,
+    compute_arima_coeff: bool,
+    out_dtype: type[np.floating],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Simulate summaries and transformed standard-SV targets."""
     summaries, theta, feature_names = sim.simulate_sv_summaries_parallel(
         N=N,
@@ -285,49 +286,42 @@ def simulate_live_summary_dataset(
     targets = theta_to_target_numpy(theta).astype(np.float32, copy=False)
     summaries = summaries.astype(np.float32, copy=False)
 
-    if not np.all(np.isfinite(summaries)):
-        raise FloatingPointError("Simulated summary statistics contain NaN or Inf values.")
-    if not np.all(np.isfinite(targets)):
-        raise FloatingPointError("Simulated transformed targets contain NaN or Inf values.")
-
     return summaries, targets, feature_names
 
 
-def train_live_summary_nn(
-    sequence_length,
-    prior="default",
-    hidden_dims_shared_trunk=(128, 64),
-    hidden_dims_head=(16, 16),
-    activation=nn.ReLU,
-    checkpoint_path="sv_posterior_summary_nn_live.pt",
-    resume_from=None,
-    seed=1,
-    batch_size=1024,
-    n_batches=10,
-    val_size=20_000,
-    lr=5e-4,
-    n_epochs=1000,
-    patience=100,
-    min_delta=1e-5,
-    min_var=1e-12,
-    layer_norm=True,
-    grad_clip_norm=None,
-    deterministic_torch=True,
-    n_acvf_ratios=4,
-    n_quantiles=5,
-    compute_arima_coeff=True,
-    n_workers=-2,
-    out_dtype=np.float32,
-    verbose=True,
-):
+def train_summary_nn(
+    sequence_length: int,
+    prior: str = "default",
+    hidden_dims_shared_trunk: tuple[int, ...] = (128, 64),
+    hidden_dims_head: tuple[int, ...] = (16, 16),
+    activation: type[nn.Module] = nn.ReLU,
+    checkpoint_path: str | os.PathLike[str] = "sv_posterior_summary_nn_live.pt",
+    resume_from: str | os.PathLike[str] | None = None,
+    seed: int = 1,
+    batch_size: int = 1024,
+    n_batches: int = 10,
+    val_size: int = 20_000,
+    lr: float = 5e-4,
+    n_epochs: int = 1000,
+    patience: int = 100,
+    min_delta: float = 1e-5,
+    min_var: float = 1e-12,
+    layer_norm: bool = True,
+    grad_clip_norm: float | None = None,
+    deterministic_torch: bool = True,
+    n_acvf_ratios: int = 4,
+    n_quantiles: int = 5,
+    compute_arima_coeff: bool = True,
+    n_workers: int = -2,
+    out_dtype: type[np.floating] = np.float32,
+    verbose: bool = True,
+) -> tuple[SummaryNN, dict[str, object]]:
     """
-    Train ``SVPosteriorNN`` on newly simulated summaries every epoch.
+    Train ``SummaryNN`` on newly simulated summaries every epoch.
 
     One epoch generates ``batch_size * n_batches`` training examples, performs
-    exactly ``n_batches`` updates, and then evaluates one validation set. With
-    ``fixed_validation=True`` the same validation sample is reused throughout;
-    otherwise a deterministic fresh sample is generated each epoch. The longer
-    default patience is intended for the noisier changing-validation case.
+    exactly ``n_batches`` updates, and then evaluates a deterministically seeded
+    fresh validation sample. The final holdout uses a separate seed stream.
 
     Summary standardization is estimated once from the first live training set
     and stored in every checkpoint. Resume runs reuse the stored values.
@@ -364,8 +358,10 @@ def train_live_summary_nn(
     sim.get_gh_skew_t_prior_constants(prior)
 
     checkpoint_path = os.fspath(checkpoint_path)
-    resume_from = None if resume_from is None else os.fspath(resume_from)
-    latest_checkpoint_path, best_checkpoint_path = default_checkpoint_paths(checkpoint_path)
+    resume_from = os.fspath(resume_from) if resume_from is not None else None
+    latest_checkpoint_path, best_checkpoint_path = default_checkpoint_paths(
+        checkpoint_path
+    )
 
     if resume_from is not None and not os.path.isfile(resume_from):
         raise FileNotFoundError(
@@ -386,7 +382,6 @@ def train_live_summary_nn(
         resolved_n_workers,
         CHUNKS_PER_WORKER,
     )
-    effective_val_batch_size = min(batch_size, val_size)
 
     feature_names = sim.summary_stats_sv_feature_names(
         n_acvf_ratios=n_acvf_ratios,
@@ -410,7 +405,7 @@ def train_live_summary_nn(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = SVPosteriorNN(
+    model = SummaryNN(
         input_dim=input_dim,
         hidden_dims_shared_trunk=hidden_dims_shared_trunk,
         hidden_dims_head=hidden_dims_head,
@@ -432,12 +427,12 @@ def train_live_summary_nn(
         print("Validation size:", val_size)
         print("Resolved simulation workers:", resolved_n_workers)
 
-    z_mean = None
-    z_std = None
-    z_mean_tensor = None
-    z_std_tensor = None
+    z_mean: np.ndarray | None = None
+    z_std: np.ndarray | None = None
+    z_mean_tensor: torch.Tensor | None = None
+    z_std_tensor: torch.Tensor | None = None
 
-    def set_standardization(mean, std):
+    def set_standardization(mean: np.ndarray, std: np.ndarray) -> None:
         nonlocal z_mean, z_std, z_mean_tensor, z_std_tensor
 
         z_mean = np.asarray(mean, dtype=np.float32).reshape(1, input_dim)
@@ -447,7 +442,10 @@ def train_live_summary_nn(
         z_std_tensor = torch.from_numpy(z_std).to(device)
 
     @torch.no_grad()
-    def evaluate_array(summaries, targets):
+    def evaluate_array(
+        summaries: np.ndarray,
+        targets: np.ndarray,
+    ) -> torch.Tensor:
         if z_mean_tensor is None or z_std_tensor is None:
             raise RuntimeError("Summary standardization has not been initialized.")
 
@@ -455,8 +453,8 @@ def train_live_summary_nn(
         total_losses = None
         total_n = 0
 
-        for start in range(0, len(summaries), effective_val_batch_size):
-            stop = min(start + effective_val_batch_size, len(summaries))
+        for start in range(0, len(summaries), batch_size):
+            stop = min(start + batch_size, len(summaries))
             summary_batch = torch.from_numpy(summaries[start:stop]).to(device)
             target_batch = torch.from_numpy(targets[start:stop]).to(device)
             summary_batch = (summary_batch - z_mean_tensor) / z_std_tensor
@@ -473,7 +471,7 @@ def train_live_summary_nn(
 
         return total_losses / total_n
 
-    def has_nonfinite_gradient():
+    def has_nonfinite_gradient() -> bool:
         return any(
             parameter.grad is not None
             and not torch.isfinite(parameter.grad).all()
@@ -493,15 +491,17 @@ def train_live_summary_nn(
     completed_epoch = 0
 
     def make_checkpoint(
-        epoch_completed,
-        checkpoint_kind,
-        final_val_loss=None,
-        final_val_marginal_losses=None,
-        final_validation_seed=None,
-        include_optimizer=True,
-    ):
+        epoch_completed: int,
+        checkpoint_kind: str,
+        final_val_loss: float | None = None,
+        final_val_marginal_losses: np.ndarray | None = None,
+        final_validation_seed: int | None = None,
+        include_optimizer: bool = True,
+    ) -> dict[str, object]:
         if z_mean is None or z_std is None:
-            raise RuntimeError("Cannot checkpoint before standardization is initialized.")
+            raise RuntimeError(
+                "Cannot checkpoint before standardization is initialized."
+            )
 
         final_marginals = None
         if final_val_marginal_losses is not None:
@@ -510,12 +510,14 @@ def train_live_summary_nn(
         return {
             "checkpoint_kind": checkpoint_kind,
             "epoch": epoch_completed,
-            "model_class": "SVPosteriorNN",
+            "model_class": "SummaryNN",
             "model_state_dict": state_dict_to_cpu(model.state_dict()),
             "best_model_state_dict": (
                 None if best_state is None else state_dict_to_cpu(best_state)
             ),
-            "optimizer_state_dict": optimizer.state_dict() if include_optimizer else None,
+            "optimizer_state_dict": (
+                optimizer.state_dict() if include_optimizer else None
+            ),
 
             "input_dim": input_dim,
             "hidden_dims_shared_trunk": hidden_dims_shared_trunk,
@@ -545,7 +547,6 @@ def train_live_summary_nn(
             "target_transform": TARGET_TRANSFORMS,
             "loss": "mean negative joint Gaussian log score, diagonal covariance",
             "loss_components": "mean marginal Gaussian negative log scores",
-            "loss_reduction": LOSS_REDUCTION,
 
             "best_val_loss": float(best_val_loss),
             "final_val_loss": None if final_val_loss is None else float(final_val_loss),
@@ -561,11 +562,13 @@ def train_live_summary_nn(
 
             "sequence_length": sequence_length,
             "prior": prior,
+            "n_acvf_ratios": n_acvf_ratios,
+            "n_quantiles": n_quantiles,
+            "compute_arima_coeff": bool(compute_arima_coeff),
             "batch_size": batch_size,
             "n_batches": n_batches,
             "train_size_per_validation": train_size,
             "val_size": val_size,
-            "effective_val_batch_size": effective_val_batch_size,
             "out_dtype": str(np.dtype(out_dtype)),
             "deterministic_torch": bool(deterministic_torch),
             "lr": lr,
@@ -587,10 +590,14 @@ def train_live_summary_nn(
         }
 
     if resume_from is not None:
-        resume_checkpoint = torch_load_checkpoint(resume_from, map_location=device)
+        resume_checkpoint = torch.load(
+            resume_from,
+            map_location=device,
+            weights_only=False,
+        )
 
         expected_configuration = {
-            "model_class": "SVPosteriorNN",
+            "model_class": "SummaryNN",
             "input_dim": input_dim,
             "hidden_dims_shared_trunk": hidden_dims_shared_trunk,
             "hidden_dims_head": hidden_dims_head,
@@ -602,7 +609,6 @@ def train_live_summary_nn(
             "n_quantiles": n_quantiles,
             "compute_arima_coeff": bool(compute_arima_coeff),
             "seed": seed,
-            "loss_reduction": LOSS_REDUCTION,
         }
         mismatches = {
             key: (resume_checkpoint.get(key), expected)
@@ -614,7 +620,9 @@ def train_live_summary_nn(
                 f"{key}: checkpoint={actual!r}, requested={expected!r}"
                 for key, (actual, expected) in mismatches.items()
             )
-            raise ValueError(f"Cannot resume with a different configuration ({details}).")
+            raise ValueError(
+                f"Cannot resume with a different configuration ({details})."
+            )
 
         if list(resume_checkpoint.get("feature_names", [])) != feature_names:
             raise ValueError("Cannot resume because the summary feature names differ.")
@@ -658,10 +666,11 @@ def train_live_summary_nn(
             )
 
         checkpoint_best_state = resume_checkpoint.get("best_model_state_dict")
-        if checkpoint_best_state is not None:
-            best_state = state_dict_to_cpu(checkpoint_best_state)
-        elif np.isfinite(best_val_loss):
-            best_state = state_dict_to_cpu(model.state_dict())
+        best_state = (
+            None
+            if checkpoint_best_state is None
+            else state_dict_to_cpu(checkpoint_best_state)
+        )
 
         if verbose:
             print(f"Resumed training from {resume_from}")
@@ -671,9 +680,9 @@ def train_live_summary_nn(
     for epoch in range(start_epoch, n_epochs):
         train_seed = make_child_seed(seed, TRAIN_SEED_STREAM, epoch + 1)
         if verbose and epoch == start_epoch:
-            print("Generating live training data...")
+            print("Beginning simulation-based training...")
 
-        train_summaries, train_targets, generated_feature_names = (
+        train_summaries, train_targets, _ = (
             simulate_live_summary_dataset(
                 N=train_size,
                 sequence_length=sequence_length,
@@ -687,8 +696,6 @@ def train_live_summary_nn(
                 out_dtype=out_dtype,
             )
         )
-        if generated_feature_names != feature_names:
-            raise RuntimeError("Simulator returned unexpected summary feature names.")
 
         if z_mean is None:
             set_standardization(
@@ -696,7 +703,9 @@ def train_live_summary_nn(
                 train_summaries.std(axis=0, keepdims=True),
             )
             if verbose:
-                print("Initialized summary standardization from the first training set.")
+                print(
+                    "Initialized summary standardization from the first training set."
+                )
 
         model.train()
         total_train_losses = None
@@ -739,9 +748,8 @@ def train_live_summary_nn(
 
         train_marginal_losses = total_train_losses / total_train_n
 
-        
         validation_seed = make_child_seed(seed, VALIDATION_SEED_STREAM, epoch + 1)
-        val_summaries, val_targets, generated_feature_names = (
+        val_summaries, val_targets, _ = (
             simulate_live_summary_dataset(
                 N=val_size,
                 sequence_length=sequence_length,
@@ -755,11 +763,9 @@ def train_live_summary_nn(
                 out_dtype=out_dtype,
             )
         )
-        if generated_feature_names != feature_names:
-            raise RuntimeError("Simulator returned unexpected summary feature names.")
 
         val_marginal_losses = evaluate_array(val_summaries, val_targets)
-        
+
         del val_summaries
         del val_targets
 
@@ -885,13 +891,13 @@ def train_live_summary_nn(
     return model, checkpoint
 
 
-def main():
+def main() -> None:
     prior = "default"
     checkpoint_path = Path(__file__).resolve().parent / (
         f"sv_posterior_summary_nn_live_{prior}_arima.pt"
     )
 
-    train_live_summary_nn(
+    train_summary_nn(
         sequence_length=253,
         prior=prior,
         hidden_dims_shared_trunk=(128, 64),
