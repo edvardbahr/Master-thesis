@@ -14,7 +14,7 @@ from training.sbt_tcn import train_tcn
 
 def main() -> None:
     if False:
-        checkpoint_path = HERE / "ghst_tcn_default.pt"
+        checkpoint_path = HERE / "svghst_tcn_default.pt"
         latest_checkpoint_path = checkpoint_path.with_name(
             f"{checkpoint_path.stem}.latest{checkpoint_path.suffix}"
         )

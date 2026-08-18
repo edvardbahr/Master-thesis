@@ -1,6 +1,6 @@
 """Test the three standard-SV posterior estimators.
 
-``main0()`` creates the credible-interval and loss-history figures.
+``main0()`` creates the credible-interval figure.
 ``main1()`` runs and formats the 5,000-sequence benchmark.
 ``main2()`` adds the paired Summary-NN-minus-TCN loss uncertainty.
 """
@@ -436,58 +436,6 @@ def plot_credible_intervals(comparison, output_path) -> None:
         frameon=False,
     )
     fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_loss_histories(models, output_path) -> None:
-    apply_plot_style()
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2), sharey=True)
-    legend_handles = {}
-
-    for column, prior in enumerate(PRIORS):
-        ax = axes[column]
-
-        for architecture in ("TCN", "Summary NN"):
-            checkpoint = models[(architecture, prior)].checkpoint
-            marginal_losses = np.asarray(
-                checkpoint["val_marginal_loss_history"], dtype=np.float64
-            )
-            losses = np.mean(marginal_losses, axis=1)
-            epochs = np.arange(1, len(losses) + 1)
-
-            legend_handles[architecture] = ax.plot(
-                epochs,
-                losses,
-                color=COLORS[architecture],
-                label=architecture,
-            )[0]
-            legend_handles["Final epoch"] = ax.plot(
-                epochs[-1],
-                losses[-1],
-                color="black",
-                marker="x",
-                markersize=8,
-                markeredgewidth=1.8,
-                linestyle="none",
-                label="Final epoch",
-            )[0]
-
-        ax.set_title(f"{prior.capitalize()} prior")
-        ax.set_xlabel("Epoch")
-        ax.set_yscale("log")
-        ax.grid(alpha=0.25)
-
-    axes[0].set_ylabel("Mean marginal Gaussian loss")
-    legend_order = ("TCN", "Summary NN", "Final epoch")
-    fig.legend(
-        [legend_handles[name] for name in legend_order],
-        legend_order,
-        loc="lower center",
-        ncol=3,
-        frameon=False,
-    )
-    fig.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -1254,7 +1202,7 @@ def runtime_table_body(metrics) -> str:
 
 
 def main0() -> None:
-    """Create the credible-interval and Gaussian-loss-history plots."""
+    """Create the credible-interval plot."""
     models = load_models()
     counts = print_parameter_counts(models)
     comparison = calculate_credible_intervals(models)
@@ -1262,20 +1210,17 @@ def main0() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     comparison_path = OUTPUT_DIR / "three_parameter_sigma_credible_intervals.csv"
     plot_path = OUTPUT_DIR / "three_parameter_credible_intervals.pdf"
-    loss_plot_path = OUTPUT_DIR / "gaussian_loss_history.pdf"
     counts_path = OUTPUT_DIR / "neural_network_parameter_counts.csv"
 
     comparison.to_csv(comparison_path, index=False)
     counts.to_csv(counts_path, index=False)
     plot_credible_intervals(comparison, plot_path)
-    plot_loss_histories(models, loss_plot_path)
     (OUTPUT_DIR / "three_parameter_sigma2_credible_intervals.csv").unlink(
         missing_ok=True
     )
 
     print(f"\nSaved credible intervals to {comparison_path}")
     print(f"Saved the 3-by-2 plot to {plot_path}")
-    print(f"Saved the Gaussian loss histories to {loss_plot_path}")
 
 
 def main1() -> None:
