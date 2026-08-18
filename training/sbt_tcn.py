@@ -5,7 +5,6 @@ import warnings
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,11 +17,11 @@ sys.path.insert(0, str(PROJECT_DIR))
 import simulation.sim_5_param_data as sim
 
 
-SVGHST_TARGET_NAMES = ("mu", "psi", "log_s", "logit_r", "log_nu")
+SVGHST_TARGET_NAMES = ("mu", "psi", "rho", "logit_r", "log_nu")
 TARGET_TRANSFORMS = {
     "mu": "mu",
     "psi": "2 * atanh(phi)",
-    "log_s": "log(s)",
+    "rho": "log(sigma)",
     "logit_r": "log(r/(1-r))",
     "log_nu": "log(nu)",
 }
@@ -325,7 +324,7 @@ def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
     theta has shape (n_samples, 5), with columns:
         theta[:, 0] = mu
         theta[:, 1] = phi
-        theta[:, 2] = s
+        theta[:, 2] = sigma
         theta[:, 3] = r
         theta[:, 4] = nu
 
@@ -341,19 +340,19 @@ def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
 
     mu = theta[:, 0]
     phi = theta[:, 1]
-    s = theta[:, 2]
+    sigma = theta[:, 2]
     r = theta[:, 3]
     nu = theta[:, 4]
     nu_min = sim.get_gh_skew_t_prior_constants(prior="default").nu_min
 
 
     phi = np.clip(phi, -1.0 + eps, 1.0 - eps)
-    s= np.clip(s, eps, None)
+    sigma = np.clip(sigma, eps, None)
     r = np.clip(r, eps, 1.0 - eps)
     nu_adjusted = np.clip(nu-nu_min, eps, None)
 
     psi = 2 * np.arctanh(phi)
-    log_s = np.log(s)
+    rho = np.log(sigma)
     logit_r = np.log(r / (1 - r))
     log_nu = np.log(nu_adjusted)
 
@@ -361,7 +360,7 @@ def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
     transformed = {
         "mu": mu,
         "psi": psi,
-        "log_s": log_s,
+        "rho": rho,
         "logit_r": logit_r,
         "log_nu": log_nu,
     }
@@ -523,7 +522,6 @@ def train_live_cnn(
     batch_size=1024,
     n_batches=100,
     val_size=500_000,
-    fixed_validation=False,
     lr=1e-4,
     n_epochs=1000,
     patience=50,
@@ -544,8 +542,7 @@ def train_live_cnn(
         2. fit exactly n_batches mini-batches,
         3. compute one validation loss on val_size generated samples.
 
-    If fixed_validation=True, the validation set is generated once and reused.
-    Otherwise, a new deterministic validation set is generated each epoch.
+    A new deterministic validation set is generated each epoch.
 
     If fixed_nu or fixed_r is not None, simulations condition on that value
     and the corresponding log_nu or logit_r target and model head are omitted.
@@ -634,7 +631,6 @@ def train_live_cnn(
         resolved_n_workers,
         CHUNKS_PER_WORKER,
     )
-    effective_val_batch_size = min(val_size, batch_size)
 
     moments = sim.log_y_squared_moments(prior=prior)
     input_mean = np.float32(moments["mean"])
@@ -711,8 +707,8 @@ def train_live_cnn(
         total_losses = None
         total_n = 0
 
-        for start in range(0, len(x), effective_val_batch_size):
-            stop = min(start + effective_val_batch_size, len(x))
+        for start in range(0, len(x), batch_size):
+            stop = min(start + batch_size, len(x))
 
             x_batch = torch.from_numpy(x[start:stop]).to(device)
             target_batch = torch.from_numpy(target[start:stop]).to(device)
@@ -784,43 +780,11 @@ def train_live_cnn(
         print("Train batch size:", batch_size)
         print("Train batches per validation:", n_batches)
         print("Validation size:", val_size)
-        print("Validation batch size:", effective_val_batch_size)
-        print("Fixed validation:", fixed_validation)
         print("Requested simulation workers:", n_workers)
         print("Resolved simulation workers:", resolved_n_workers)
         print("Train chunk size:", train_chunk_size)
         print("Validation chunk size:", val_chunk_size)
 
-    # ============================================================
-    # Optional fixed validation set
-    # ============================================================
-
-    fixed_val_x = None
-    fixed_val_target = None
-    fixed_validation_seed = None
-
-    if fixed_validation:
-        fixed_validation_seed = make_child_seed(
-            seed,
-            VALIDATION_SEED_STREAM,
-            0,
-        )
-
-        if verbose:
-            print("Generating fixed validation set...")
-
-        fixed_val_x, fixed_val_target = simulate_live_dataset(
-            N=val_size,
-            sequence_length=sequence_length,
-            chunk_size=val_chunk_size,
-            n_workers=resolved_n_workers,
-            seed=fixed_validation_seed,
-            prior=prior,
-            fixed_nu=fixed_nu,
-            fixed_r=fixed_r,
-            target_names=target_names,
-            out_dtype=out_dtype,
-        )
 
     # ============================================================
     # Training loop with early stopping
@@ -922,8 +886,6 @@ def train_live_cnn(
             "n_batches": n_batches,
             "train_size_per_validation": train_size,
             "val_size": val_size,
-            "fixed_validation": fixed_validation,
-            "effective_val_batch_size": effective_val_batch_size,
             "requested_n_workers": n_workers,
             "resolved_n_workers": resolved_n_workers,
             "chunks_per_worker": CHUNKS_PER_WORKER,
@@ -1158,35 +1120,30 @@ def train_live_cnn(
 
         train_marginal_losses_value = total_train_losses / total_train_n
 
-        if fixed_validation:
-            val_x = fixed_val_x
-            val_target = fixed_val_target
-            validation_seed = fixed_validation_seed
-        else:
-            validation_seed = make_child_seed(
-                seed,
-                VALIDATION_SEED_STREAM,
-                epoch + 1,
-            )
+        
+        validation_seed = make_child_seed(
+            seed,
+            VALIDATION_SEED_STREAM,
+            epoch + 1,
+        )
 
-            val_x, val_target = simulate_live_dataset(
-                N=val_size,
-                sequence_length=sequence_length,
-                chunk_size=val_chunk_size,
-                n_workers=resolved_n_workers,
-                seed=validation_seed,
-                prior=prior,
-                fixed_nu=fixed_nu,
-                fixed_r=fixed_r,
-                target_names=target_names,
-                out_dtype=out_dtype,
-            )
+        val_x, val_target = simulate_live_dataset(
+            N=val_size,
+            sequence_length=sequence_length,
+            chunk_size=val_chunk_size,
+            n_workers=resolved_n_workers,
+            seed=validation_seed,
+            prior=prior,
+            fixed_nu=fixed_nu,
+            fixed_r=fixed_r,
+            target_names=target_names,
+            out_dtype=out_dtype,
+        )
 
         val_marginal_losses_value = evaluate_array(model, val_x, val_target)
 
-        if not fixed_validation:
-            del val_x
-            del val_target
+        del val_x
+        del val_target
 
         train_marginal_losses_np = train_marginal_losses_value.cpu().numpy()
         val_marginal_losses_np = val_marginal_losses_value.cpu().numpy()
@@ -1273,39 +1230,32 @@ def train_live_cnn(
 
     model.eval()
 
-    # Use the fixed validation set when available. With changing validation,
-    # report a fresh deterministic final validation score for the restored model.
-    if fixed_validation:
-        final_val_x = fixed_val_x
-        final_val_target = fixed_val_target
-        final_validation_seed = fixed_validation_seed
-    else:
-        final_validation_seed = make_child_seed(
-            seed,
-            FINAL_VALIDATION_SEED_STREAM,
-            completed_epoch + 1,
-        )
+    
+    final_validation_seed = make_child_seed(
+        seed,
+        FINAL_VALIDATION_SEED_STREAM,
+        completed_epoch + 1,
+    )
 
-        final_val_x, final_val_target = simulate_live_dataset(
-            N=val_size,
-            sequence_length=sequence_length,
-            chunk_size=val_chunk_size,
-            n_workers=resolved_n_workers,
-            seed=final_validation_seed,
-            prior=prior,
-            fixed_nu=fixed_nu,
-            fixed_r=fixed_r,
-            target_names=target_names,
-            out_dtype=out_dtype,
-        )
+    final_val_x, final_val_target = simulate_live_dataset(
+        N=val_size,
+        sequence_length=sequence_length,
+        chunk_size=val_chunk_size,
+        n_workers=resolved_n_workers,
+        seed=final_validation_seed,
+        prior=prior,
+        fixed_nu=fixed_nu,
+        fixed_r=fixed_r,
+        target_names=target_names,
+        out_dtype=out_dtype,
+    )
 
     final_val_marginal_losses = evaluate_array(model, final_val_x, final_val_target)
     final_val_marginal_losses_np = final_val_marginal_losses.detach().cpu().numpy()
     final_val_loss = float(final_val_marginal_losses_np.mean())
 
-    if not fixed_validation:
-        del final_val_x
-        del final_val_target
+    del final_val_x
+    del final_val_target
 
     if verbose:
         print()
@@ -1360,7 +1310,6 @@ def main():
         batch_size=1024 * 4,
         n_batches=100,    # Number of batches done before each validation
         val_size=1024 * 2 * 100,
-        fixed_validation=False,
         lr=5e-4,
         n_epochs=2000,
         patience=75, # A bit higher patience since live training is noisier than fixed datasets
