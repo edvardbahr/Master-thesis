@@ -12,8 +12,8 @@ from statistics import NormalDist
 
 HERE = Path(__file__).resolve().parent
 PROJECT_DIR = HERE.parent
-FIVE_PARAM_DIR = PROJECT_DIR / "five_param_estimates"
-sys.path.insert(0, str(FIVE_PARAM_DIR))
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 os.environ["MPLBACKEND"] = "Agg"
@@ -28,16 +28,16 @@ from scipy.integrate import quad
 from scipy.special import digamma, expit, polygamma
 from scipy.stats import kstest, norm
 
-import sim_5_param_data as sim
-from R_to_py_interface import (
+from simulation import sim_5_param_data as sim
+from simulation.stochvol_mcmc import (
     log_positive_transform,
     psi_transform,
     run_stochvol_mcmc,
     validate_series_matrix,
 )
-from train_live_CNN import (
+from training.sbt_tcn import (
     SVGHST_TARGET_NAMES,
-    SVPosteriorTCN,
+    TCN,
     theta_to_target_numpy,
 )
 
@@ -170,7 +170,7 @@ def load_tcn_model(
 
     activation = getattr(nn, checkpoint["activation"])
     kernel_sizes = checkpoint.get("kernel_sizes") or checkpoint["kernel_size"]
-    model = SVPosteriorTCN(
+    model = TCN(
         tcn_channels=tuple(checkpoint["tcn_channels"]),
         kernel_size=kernel_sizes,
         dilations=tuple(checkpoint["dilations"]),
@@ -217,7 +217,7 @@ def predict_transformed_gaussian(
 
 
 def inverse_transform(values: np.ndarray) -> np.ndarray:
-    """Map (mu, psi, log_s, logit_r, log_nu) to model parameters."""
+    """Map (mu, psi, rho, logit_r, log_nu) to model parameters."""
     values = np.asarray(values, dtype=np.float64)
     parameters = np.empty_like(values)
     parameters[:, 0] = values[:, 0]

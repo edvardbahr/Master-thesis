@@ -39,7 +39,7 @@ from simulation.stochvol_mcmc import (
     run_stochvol_mcmc,
 )
 from training.sbt_summary_nn import SummaryNN
-from training.sbt_tcn import SVPosteriorTCN
+from training.sbt_tcn import TCN
 
 
 ALPHA = 0.05
@@ -148,7 +148,7 @@ def load_models() -> dict[tuple[str, str], LoadedModel]:
             map_location=DEVICE,
             weights_only=False,
         )
-        tcn_model = SVPosteriorTCN(
+        tcn_model = TCN(
             tcn_channels=tuple(tcn_checkpoint["tcn_channels"]),
             kernel_size=tcn_checkpoint["kernel_sizes"],
             dilations=tuple(tcn_checkpoint["dilations"]),

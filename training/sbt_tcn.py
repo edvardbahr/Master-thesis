@@ -1,7 +1,7 @@
 import os
 import sys
-from pathlib import Path
 import warnings
+from pathlib import Path
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -12,7 +12,8 @@ import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
 PROJECT_DIR = HERE.parent
-sys.path.insert(0, str(PROJECT_DIR))
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 import simulation.sim_5_param_data as sim
 
@@ -23,7 +24,7 @@ TARGET_TRANSFORMS = {
     "psi": "2 * atanh(phi)",
     "rho": "log(sigma)",
     "logit_r": "log(r/(1-r))",
-    "log_nu": "log(nu)",
+    "log_nu": "log(nu - nu_min)",
 }
 LOSS_REDUCTION = "mean_over_active_parameters"
 CHUNKS_PER_WORKER = 4
@@ -33,12 +34,12 @@ EXP_CLIP = 350.0
 
 
 def make_mlp(
-    input_dim,
-    hidden_dims,
-    output_dim=None,
-    activation=nn.ReLU,
-):
-    layers = []
+    input_dim: int,
+    hidden_dims: tuple[int, ...],
+    output_dim: int | None = None,
+    activation: type[nn.Module] = nn.ReLU,
+) -> tuple[nn.Module, int]:
+    layers: list[nn.Module] = []
     d_prev = input_dim
 
     for d_hidden in hidden_dims:
@@ -51,13 +52,17 @@ def make_mlp(
         layers.append(nn.Linear(d_prev, output_dim))
         d_prev = output_dim
 
-    if len(layers) == 0:
+    if not layers:
         return nn.Identity(), input_dim
 
     return nn.Sequential(*layers), d_prev
 
 
-def resolve_per_block_values(value, n_blocks, name):
+def resolve_per_block_values(
+    value: int | tuple[int, ...],
+    n_blocks: int,
+    name: str,
+) -> tuple[int, ...]:
     if isinstance(value, int):
         values = (int(value),) * n_blocks
     else:
@@ -74,7 +79,6 @@ def resolve_per_block_values(value, n_blocks, name):
     return values
 
 
-
 class TemporalResidualBlock(nn.Module):
     """
     Non-causal TCN-style residual block.
@@ -86,23 +90,25 @@ class TemporalResidualBlock(nn.Module):
 
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        kernel_size=5,
-        dilation=1,
-        activation=nn.ReLU,
-    ):
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 5,
+        dilation: int = 1,
+        activation: type[nn.Module] = nn.ReLU,
+    ) -> None:
         super().__init__()
 
         if kernel_size < 1:
             raise ValueError("kernel_size must be at least 1.")
 
         if kernel_size % 2 == 0:
-            raise ValueError("Use an odd kernel_size so symmetric padding preserves length.")
+            raise ValueError(
+                "Use an odd kernel_size so symmetric padding preserves length."
+            )
 
         padding = dilation * (kernel_size - 1) // 2
 
-        layers = [
+        layers: list[nn.Module] = [
             nn.Conv1d(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -111,11 +117,7 @@ class TemporalResidualBlock(nn.Module):
                 dilation=dilation,
             ),
         ]
-
-
         layers.append(activation())
-
-
         layers.append(
             nn.Conv1d(
                 in_channels=out_channels,
@@ -125,8 +127,6 @@ class TemporalResidualBlock(nn.Module):
                 dilation=dilation,
             )
         )
-
-
         self.net = nn.Sequential(*layers)
 
         if in_channels == out_channels:
@@ -136,11 +136,11 @@ class TemporalResidualBlock(nn.Module):
 
         self.activation = activation()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.activation(self.net(x) + self.residual(x))
 
 
-class SVPosteriorTCN(nn.Module):
+class TCN(nn.Module):
     """
     Temporal convolutional network for amortized inference in the standard SV model.
 
@@ -155,21 +155,21 @@ class SVPosteriorTCN(nn.Module):
     The output columns follow ``param_names``.
     """
 
-    supported_param_names = SVGHST_TARGET_NAMES
+    supported_param_names: tuple[str, ...] = SVGHST_TARGET_NAMES
 
     def __init__(
         self,
-        tcn_channels=(16, 32, 32, 64, 64),
-        kernel_size=5,
-        dilations=None,
-        hidden_dims_head=(32, 32),
-        topk_pool_fraction=None,
-        activation=nn.ReLU,
-        param_names=SVGHST_TARGET_NAMES,
-        min_var=1e-12,
-        input_mean=0.0,
-        input_std=1.0,
-    ):
+        tcn_channels: tuple[int, ...] = (16, 32, 32, 64, 64),
+        kernel_size: int | tuple[int, ...] = 5,
+        dilations: tuple[int, ...] | None = None,
+        hidden_dims_head: tuple[int, ...] = (32, 32),
+        topk_pool_fraction: float | None = None,
+        activation: type[nn.Module] = nn.ReLU,
+        param_names: tuple[str, ...] = SVGHST_TARGET_NAMES,
+        min_var: float = 1e-12,
+        input_mean: float = 0.0,
+        input_std: float = 1.0,
+    ) -> None:
         super().__init__()
 
         if len(tcn_channels) == 0:
@@ -208,7 +208,9 @@ class SVPosteriorTCN(nn.Module):
             if block_kernel_size < 1:
                 raise ValueError("kernel_size values must be at least 1.")
             if block_kernel_size % 2 == 0:
-                raise ValueError("Use odd kernel_size values so padding preserves length.")
+                raise ValueError(
+                    "Use odd kernel_size values so padding preserves length."
+                )
 
         if topk_pool_fraction is not None:
             topk_pool_fraction = float(topk_pool_fraction)
@@ -233,7 +235,7 @@ class SVPosteriorTCN(nn.Module):
             torch.tensor(float(input_std), dtype=torch.float32).view(1, 1, 1),
         )
 
-        blocks = []
+        blocks: list[nn.Module] = []
         in_channels = 1
 
         for out_channels, dilation, block_kernel_size in zip(
@@ -268,11 +270,13 @@ class SVPosteriorTCN(nn.Module):
             )
             self.heads[name] = head
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim == 2:
             x = x.unsqueeze(1)
         elif x.ndim != 3:
-            raise ValueError("x must have shape (batch_size, n) or (batch_size, 1, n).")
+            raise ValueError(
+                "x must have shape (batch_size, n) or (batch_size, 1, n)."
+            )
 
         if x.shape[1] != 1:
             raise ValueError("x must have exactly one input channel.")
@@ -317,7 +321,11 @@ class SVPosteriorTCN(nn.Module):
         return mean, var
 
 
-def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
+def theta_to_target_numpy(
+    theta: np.ndarray,
+    target_names: tuple[str, ...] = SVGHST_TARGET_NAMES,
+    eps: float = 1e-6,
+) -> np.ndarray:
     """
     Converts original SV parameters to transformed training targets.
 
@@ -345,17 +353,15 @@ def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
     nu = theta[:, 4]
     nu_min = sim.get_gh_skew_t_prior_constants(prior="default").nu_min
 
-
     phi = np.clip(phi, -1.0 + eps, 1.0 - eps)
     sigma = np.clip(sigma, eps, None)
     r = np.clip(r, eps, 1.0 - eps)
-    nu_adjusted = np.clip(nu-nu_min, eps, None)
+    nu_adjusted = np.clip(nu - nu_min, eps, None)
 
     psi = 2 * np.arctanh(phi)
     rho = np.log(sigma)
     logit_r = np.log(r / (1 - r))
     log_nu = np.log(nu_adjusted)
-
 
     transformed = {
         "mu": mu,
@@ -369,10 +375,19 @@ def theta_to_target_numpy(theta, target_names=SVGHST_TARGET_NAMES, eps=1e-6):
     return target.astype(np.float32)
 
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_parameters(model: nn.Module) -> int:
+    return sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
 
-def temporal_receptive_field(kernel_size, dilations, convs_per_block=2):
+
+def temporal_receptive_field(
+    kernel_size: int | tuple[int, ...],
+    dilations: tuple[int, ...],
+    convs_per_block: int = 2,
+) -> int:
     dilations = tuple(dilations)
     kernel_sizes = resolve_per_block_values(
         kernel_size,
@@ -385,7 +400,13 @@ def temporal_receptive_field(kernel_size, dilations, convs_per_block=2):
         for block_kernel_size, dilation in zip(kernel_sizes, dilations)
     )
 
-def diagonal_gaussian_nll(mean, var, target, min_var):
+
+def diagonal_gaussian_nll(
+    mean: torch.Tensor,
+    var: torch.Tensor,
+    target: torch.Tensor,
+    min_var: float,
+) -> torch.Tensor:
     """
     Computes marginal negative log scores under a diagonal Gaussian.
 
@@ -421,7 +442,7 @@ VALIDATION_SEED_STREAM = 202
 FINAL_VALIDATION_SEED_STREAM = 303
 
 
-def make_child_seed(seed, stream, index):
+def make_child_seed(seed: int, stream: int, index: int) -> int:
     """
     Derive a deterministic 32-bit seed from a master seed and stream id.
 
@@ -432,23 +453,21 @@ def make_child_seed(seed, stream, index):
     return int(seed_sequence.generate_state(1, dtype=np.uint32)[0])
 
 
-def default_checkpoint_paths(checkpoint_path):
-    base, ext = os.path.splitext(checkpoint_path)
+def default_checkpoint_paths(
+    checkpoint_path: str | os.PathLike[str],
+) -> tuple[str, str]:
+    base, extension = os.path.splitext(checkpoint_path)
 
-    if ext == "":
-        ext = ".pt"
+    if extension == "":
+        extension = ".pt"
 
-    return f"{base}.latest{ext}", f"{base}.best{ext}"
-
-
-def torch_load_checkpoint(path, map_location):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
+    return f"{base}.latest{extension}", f"{base}.best{extension}"
 
 
-def save_checkpoint_atomic(checkpoint, path):
+def save_checkpoint_atomic(
+    checkpoint: dict[str, object],
+    path: str | os.PathLike[str],
+) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
 
@@ -457,7 +476,9 @@ def save_checkpoint_atomic(checkpoint, path):
     os.replace(tmp_path, path)
 
 
-def state_dict_to_cpu(state_dict):
+def state_dict_to_cpu(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     return {
         key: value.detach().cpu().clone()
         for key, value in state_dict.items()
@@ -465,17 +486,17 @@ def state_dict_to_cpu(state_dict):
 
 
 def simulate_live_dataset(
-    N,
-    sequence_length,
-    chunk_size,
-    n_workers,
-    seed,
-    prior,
-    fixed_nu,
-    fixed_r,
-    target_names,
-    out_dtype,
-):
+    N: int,
+    sequence_length: int,
+    chunk_size: int,
+    n_workers: int,
+    seed: int,
+    prior: str,
+    fixed_nu: float | None,
+    fixed_r: float | None,
+    target_names: tuple[str, ...],
+    out_dtype: type[np.floating],
+) -> tuple[np.ndarray, np.ndarray]:
     log_y_squared, theta = sim.simulate_sv_log_y_squared_parallel(
         N=N,
         n=sequence_length,
@@ -501,39 +522,35 @@ def simulate_live_dataset(
     return log_y_squared.astype(np.float32, copy=False), target
 
 
-# ============================================================
-# Training
-# ============================================================
-
-def train_live_cnn(
-    sequence_length,
-    prior="default",
-    fixed_nu=None,
-    fixed_r=None,
-    tcn_channels=(16, 32, 32, 64, 64, 64),
-    kernel_size=5,
-    dilations=None,
-    hidden_dims_head=(64, 64),
-    topk_pool_fraction=None,
-    activation=nn.ReLU,
-    checkpoint_path="sv_posterior_tcn_live.pt",
-    resume_from=None,
-    seed=1,
-    batch_size=1024,
-    n_batches=100,
-    val_size=500_000,
-    lr=1e-4,
-    n_epochs=1000,
-    patience=50,
-    min_delta=1e-4,
-    min_var=1e-12,
-    use_amp=None,
-    grad_clip_norm=None,
-    deterministic_torch=True,
-    n_workers=-2,
-    out_dtype=np.float32,
-    verbose=True,
-):
+def train_tcn(
+    sequence_length: int,
+    prior: str = "default",
+    fixed_nu: float | None = None,
+    fixed_r: float | None = None,
+    tcn_channels: tuple[int, ...] = (16, 32, 32, 64, 64, 64),
+    kernel_size: int | tuple[int, ...] = 5,
+    dilations: tuple[int, ...] | None = None,
+    hidden_dims_head: tuple[int, ...] = (64, 64),
+    topk_pool_fraction: float | None = None,
+    activation: type[nn.Module] = nn.ReLU,
+    checkpoint_path: str | os.PathLike[str] = "sv_posterior_tcn_live.pt",
+    resume_from: str | os.PathLike[str] | None = None,
+    seed: int = 1,
+    batch_size: int = 1024,
+    n_batches: int = 100,
+    val_size: int = 500_000,
+    lr: float = 1e-4,
+    n_epochs: int = 1000,
+    patience: int = 50,
+    min_delta: float = 1e-4,
+    min_var: float = 1e-12,
+    use_amp: bool | None = None,
+    grad_clip_norm: float | None = None,
+    deterministic_torch: bool = True,
+    n_workers: int = -2,
+    out_dtype: type[np.floating] = np.float32,
+    verbose: bool = True,
+) -> tuple[TCN, dict[str, object]]:
     """
     Train a TCN on SV time series generated live during training.
 
@@ -549,10 +566,6 @@ def train_live_cnn(
     Set fixed_nu=np.inf and fix r to obtain the three-parameter standard SV
     model setup.
     """
-
-    # ============================================================
-    # Validate configuration
-    # ============================================================
 
     if sequence_length < 1:
         raise ValueError("sequence_length must be at least 1.")
@@ -606,7 +619,8 @@ def train_live_cnn(
     # Validate the prior name through the 3-parameter simulator API.
     sim.get_gh_skew_t_prior_constants(prior)
 
-
+    checkpoint_path = os.fspath(checkpoint_path)
+    resume_from = os.fspath(resume_from) if resume_from is not None else None
     latest_checkpoint_path, best_checkpoint_path = default_checkpoint_paths(
         checkpoint_path
     )
@@ -636,10 +650,6 @@ def train_live_cnn(
     input_mean = np.float32(moments["mean"])
     input_std = np.float32(moments["std"])
 
-    # ============================================================
-    # Reproducibility
-    # ============================================================
-
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -659,10 +669,6 @@ def train_live_cnn(
             torch.use_deterministic_algorithms(True)
         except TypeError:
             torch.use_deterministic_algorithms(True, warn_only=False)
-
-    # ============================================================
-    # Device
-    # ============================================================
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -686,23 +692,21 @@ def train_live_cnn(
     if verbose and amp_enabled:
         print("Using CUDA automatic mixed precision")
 
-    def has_nonfinite_gradient(model):
-        for parameter in model.parameters():
-            if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
-                return True
-
-        return False
-
-    # ============================================================
-    # Evaluation helper
-    # ============================================================
+    def has_nonfinite_gradient(candidate: nn.Module) -> bool:
+        return any(
+            parameter.grad is not None
+            and not torch.isfinite(parameter.grad).all()
+            for parameter in candidate.parameters()
+        )
 
     @torch.no_grad()
-    def evaluate_array(model, x, target):
-        """
-        Return one mean validation NLL per transformed parameter.
-        """
-        model.eval()
+    def evaluate_array(
+        candidate: nn.Module,
+        x: np.ndarray,
+        target: np.ndarray,
+    ) -> torch.Tensor:
+        """Return one mean validation NLL per transformed parameter."""
+        candidate.eval()
 
         total_losses = None
         total_n = 0
@@ -714,7 +718,7 @@ def train_live_cnn(
             target_batch = torch.from_numpy(target[start:stop]).to(device)
 
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                mean, var = model(x_batch)
+                mean, var = candidate(x_batch)
 
             losses = diagonal_gaussian_nll(
                 mean.float(),
@@ -733,11 +737,7 @@ def train_live_cnn(
 
         return total_losses / total_n
 
-    # ============================================================
-    # Initialize model
-    # ============================================================
-
-    model = SVPosteriorTCN(
+    model = TCN(
         tcn_channels=tcn_channels,
         kernel_size=kernel_size,
         dilations=dilations,
@@ -750,10 +750,7 @@ def train_live_cnn(
         input_std=input_std,
     ).to(device)
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=lr,
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     if verbose:
         print("Prior:", prior)
@@ -786,19 +783,15 @@ def train_live_cnn(
         print("Validation chunk size:", val_chunk_size)
 
 
-    # ============================================================
-    # Training loop with early stopping
-    # ============================================================
-
-    train_marginal_loss_history = []
-    val_marginal_loss_history = []
-    train_loss_history = []
-    val_loss_history = []
+    train_marginal_loss_history: list[list[float]] = []
+    val_marginal_loss_history: list[list[float]] = []
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
 
     best_val_loss = float("inf")
-    best_state = None
-    best_epoch = None
-    best_validation_seed = None
+    best_state: dict[str, torch.Tensor] | None = None
+    best_epoch: int | None = None
+    best_validation_seed: int | None = None
     epochs_without_improvement = 0
     start_epoch = 0
     completed_epoch = 0
@@ -806,17 +799,12 @@ def train_live_cnn(
     activation_name = getattr(activation, "__name__", str(activation))
 
     def make_checkpoint(
-        epoch_completed,
-        checkpoint_kind,
-        final_val_loss=None,
-        final_val_marginal_losses=None,
-        final_validation_seed=None,
-    ):
-        best_model_state_cpu = None
-
-        if best_state is not None:
-            best_model_state_cpu = state_dict_to_cpu(best_state)
-
+        epoch_completed: int,
+        checkpoint_kind: str,
+        final_val_loss: float | None = None,
+        final_val_marginal_losses: np.ndarray | None = None,
+        final_validation_seed: int | None = None,
+    ) -> dict[str, object]:
         if final_val_marginal_losses is not None:
             final_val_marginal_losses = np.asarray(
                 final_val_marginal_losses,
@@ -827,11 +815,13 @@ def train_live_cnn(
             "checkpoint_kind": checkpoint_kind,
             "epoch": epoch_completed,
             "model_state_dict": state_dict_to_cpu(model.state_dict()),
-            "best_model_state_dict": best_model_state_cpu,
+            "best_model_state_dict": (
+                None if best_state is None else state_dict_to_cpu(best_state)
+            ),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
 
-            "model_class": "SVPosteriorTCN",
+            "model_class": "TCN",
             "sequence_length": sequence_length,
             "tcn_channels": tuple(tcn_channels),
             "kernel_size": kernel_size,
@@ -858,8 +848,7 @@ def train_live_cnn(
 
             "target_names": target_names,
             "target_transform": {
-                name: TARGET_TRANSFORMS[name]
-                for name in target_names
+                name: TARGET_TRANSFORMS[name] for name in target_names
             },
             "loss": "mean marginal Gaussian NLL across active parameters",
             "loss_components": "mean marginal Gaussian negative log scores",
@@ -917,7 +906,11 @@ def train_live_cnn(
         }
 
     if resume_from is not None:
-        resume_checkpoint = torch_load_checkpoint(resume_from, map_location=device)
+        resume_checkpoint = torch.load(
+            resume_from,
+            map_location=device,
+            weights_only=False,
+        )
 
         checkpoint_loss_reduction = resume_checkpoint.get("loss_reduction")
         if checkpoint_loss_reduction != LOSS_REDUCTION:
@@ -928,9 +921,7 @@ def train_live_cnn(
                 f"requested={LOSS_REDUCTION}."
             )
 
-        checkpoint_target_names = tuple(
-            resume_checkpoint.get("target_names", ())
-        )
+        checkpoint_target_names = tuple(resume_checkpoint.get("target_names", ()))
         if checkpoint_target_names != target_names:
             raise ValueError(
                 "Cannot resume with different estimated parameters: "
@@ -983,8 +974,12 @@ def train_live_cnn(
         if "scaler_state_dict" in resume_checkpoint:
             scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
 
-        train_marginal_loss_history = resume_checkpoint.get("train_marginal_loss_history", [])
-        val_marginal_loss_history = resume_checkpoint.get("val_marginal_loss_history", [])
+        train_marginal_loss_history = resume_checkpoint.get(
+            "train_marginal_loss_history", []
+        )
+        val_marginal_loss_history = resume_checkpoint.get(
+            "val_marginal_loss_history", []
+        )
         train_loss_history = resume_checkpoint.get("train_loss_history", [])
         val_loss_history = resume_checkpoint.get("val_loss_history", [])
         best_val_loss = float(resume_checkpoint.get("best_val_loss", float("inf")))
@@ -1053,8 +1048,8 @@ def train_live_cnn(
         total_train_losses = None
         total_train_n = 0
 
-        for batch_idx in range(n_batches):
-            start = batch_idx * batch_size
+        for batch_index in range(n_batches):
+            start = batch_index * batch_size
             stop = start + batch_size
 
             x_batch = torch.from_numpy(train_x[start:stop]).to(device)
@@ -1086,13 +1081,13 @@ def train_live_cnn(
                 if amp_enabled:
                     print(
                         "Warning: NaN/Inf gradients detected "
-                        f"at epoch {epoch + 1}, batch {batch_idx + 1}; "
+                        f"at epoch {epoch + 1}, batch {batch_index + 1}; "
                         "GradScaler will skip the optimizer step and lower the scale."
                     )
                 else:
                     print(
                         "Warning: NaN/Inf gradients detected "
-                        f"at epoch {epoch + 1}, batch {batch_idx + 1}; "
+                        f"at epoch {epoch + 1}, batch {batch_index + 1}; "
                         "skipping the optimizer step."
                     )
 
@@ -1120,7 +1115,6 @@ def train_live_cnn(
 
         train_marginal_losses_value = total_train_losses / total_train_n
 
-        
         validation_seed = make_child_seed(
             seed,
             VALIDATION_SEED_STREAM,
@@ -1182,14 +1176,8 @@ def train_live_cnn(
                 f"train NLL = {train_loss_value:.4f}, "
                 f"val NLL = {val_loss_value:.4f}"
             )
-            print(
-                f"             "
-                f"train marginal NLLs: {train_parts}"
-            )
-            print(
-                f"             "
-                f"val marginal NLLs:   {val_parts}"
-            )
+            print(f"             train marginal NLLs: {train_parts}")
+            print(f"             val marginal NLLs:   {val_parts}")
 
         completed_epoch = epoch + 1
 
@@ -1206,22 +1194,24 @@ def train_live_cnn(
             )
             save_checkpoint_atomic(best_checkpoint, best_checkpoint_path)
             if verbose:
-                print(f"New best model found at epoch {epoch + 1} with validation NLL {val_loss_value:.6f}")
-                print(f"val marginal NLLs: {', '.join(f'{name}={loss:.4f}' for name, loss in zip(target_names, val_marginal_losses_np))}")
+                print(
+                    f"New best model found at epoch {epoch + 1} "
+                    f"with validation NLL {val_loss_value:.6f}"
+                )
+                best_parts = ", ".join(
+                    f"{name}={loss:.4f}"
+                    for name, loss in zip(target_names, val_marginal_losses_np)
+                )
+                print(f"val marginal NLLs: {best_parts}")
                 print(f"Best checkpoint saved to {best_checkpoint_path}")
 
         if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
             print(f"Latest checkpoint saved to {latest_checkpoint_path}")
 
-
         if epochs_without_improvement >= patience:
             if verbose:
                 print(f"Early stopping at epoch {epoch + 1}")
             break
-
-    # ============================================================
-    # Restore best model
-    # ============================================================
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -1230,7 +1220,6 @@ def train_live_cnn(
 
     model.eval()
 
-    
     final_validation_seed = make_child_seed(
         seed,
         FINAL_VALIDATION_SEED_STREAM,
@@ -1272,10 +1261,6 @@ def train_live_cnn(
             },
         )
 
-    # ============================================================
-    # Save checkpoint
-    # ============================================================
-
     checkpoint = make_checkpoint(
         epoch_completed=completed_epoch,
         checkpoint_kind="final",
@@ -1292,33 +1277,33 @@ def train_live_cnn(
     return model, checkpoint
 
 
-def main():
-    train_live_cnn(
-        sequence_length=253, # times ten when fitting GHST model with r and nu unfixed
+def main() -> None:
+    train_tcn(
+        sequence_length=253,
         prior="finance",
         fixed_r=0,
-        fixed_nu=np.inf,  # Set to 12 as this was our EM estimate using 2000-2020 5 min RV of S&P500. Set to np.inf for Gaussian innovations
-        tcn_channels=(16, 32, 32, 64, 64), #tcn_channels=(16, 32, 32, 64, 64, 64),
+        fixed_nu=np.inf,
+        tcn_channels=(16, 32, 32, 64, 64),
         kernel_size=(9, 9, 7, 5, 5),
-        dilations = None, #dilations=(1, 2, 4, 16, 64, 256),
+        dilations=None,
         hidden_dims_head=(32, 32),
         topk_pool_fraction=0.05,
         activation=nn.ReLU,
         checkpoint_path="sv_posterior_tcn_live_finance_n253_multiscale_topk.pt",
-        resume_from="sv_posterior_tcn_live_finance_n253_multiscale_topk.latest.pt",  # Set to the n2530_multiscale_topk latest checkpoint to continue.
+        resume_from="sv_posterior_tcn_live_finance_n253_multiscale_topk.latest.pt",
         seed=2,
         batch_size=1024 * 4,
-        n_batches=100,    # Number of batches done before each validation
+        n_batches=100,
         val_size=1024 * 2 * 100,
         lr=5e-4,
         n_epochs=2000,
-        patience=75, # A bit higher patience since live training is noisier than fixed datasets
+        patience=75,
         min_delta=1e-5,
-        min_var=1e-12, # Minimum variance to ensure numerical stability in the loss and gradients
-        use_amp=True,  # Use automatic mixed precision to save on vram
+        min_var=1e-12,
+        use_amp=True,
         grad_clip_norm=5.0,
         deterministic_torch=True,
-        n_workers= -4, # Uses all but 4 cpu cores for data simulation
+        n_workers=-4,
         out_dtype=np.float32,
         verbose=True,
     )
