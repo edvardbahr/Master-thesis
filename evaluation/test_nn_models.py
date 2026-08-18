@@ -5,8 +5,6 @@
 ``main2()`` adds the paired Summary-NN-minus-TCN loss uncertainty.
 """
 
-from __future__ import annotations
-
 import os
 import sys
 import tempfile
@@ -14,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import NormalDist
 from time import perf_counter
-
 
 HERE = Path(__file__).resolve().parent
 PROJECT_DIR = HERE.parent
@@ -67,10 +64,10 @@ TRANSFORMED_PARAMETERS = ("mu", "psi", "rho")
 METHODS = ("stochvol", "TCN", "Summary NN")
 
 CHECKPOINT_NAMES = {
-    ("Summary NN", "default"): "sv_posterior_summary_nn_live_default_arima.pt",
-    ("Summary NN", "finance"): "sv_posterior_summary_nn_live_finance_arima.pt",
-    ("TCN", "default"): "sv_posterior_tcn_live_default_n253_multiscale_topk.pt",
-    ("TCN", "finance"): "sv_posterior_tcn_live_finance_n253_multiscale_topk.pt",
+    ("Summary NN", "default"): "summary_nn_default_arima.pt",
+    ("Summary NN", "finance"): "summary_nn_finance_arima.pt",
+    ("TCN", "default"): "tcn_default.pt",
+    ("TCN", "finance"): "tcn_finance.pt",
 }
 
 BASELINE = {
