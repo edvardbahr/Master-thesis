@@ -889,36 +889,3 @@ def train_summary_nn(
         print(f"Model saved to {checkpoint_path}")
 
     return model, checkpoint
-
-
-def main() -> None:
-    prior = "default"
-    checkpoint_path = Path(__file__).resolve().parent / (
-        f"sv_posterior_summary_nn_live_{prior}_arima.pt"
-    )
-
-    train_summary_nn(
-        sequence_length=253,
-        prior=prior,
-        hidden_dims_shared_trunk=(128, 64),
-        hidden_dims_head=(16, 16),
-        checkpoint_path=checkpoint_path,
-        resume_from=None,
-        seed=2,
-        batch_size=1024,
-        n_batches=10,
-        val_size=20_000,
-        n_quantiles=19,
-        compute_arima_coeff=True,
-        n_epochs=2000,
-        patience=100,
-        min_delta=1e-5,
-        layer_norm=True,
-        n_workers=-2,
-        verbose=True,
-        lr=5e-4,
-    )
-
-
-if __name__ == "__main__":
-    main()

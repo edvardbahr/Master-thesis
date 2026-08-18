@@ -1275,39 +1275,3 @@ def train_tcn(
         print(f"Model saved to {checkpoint_path}")
 
     return model, checkpoint
-
-
-def main() -> None:
-    train_tcn(
-        sequence_length=253,
-        prior="finance",
-        fixed_r=0,
-        fixed_nu=np.inf,
-        tcn_channels=(16, 32, 32, 64, 64),
-        kernel_size=(9, 9, 7, 5, 5),
-        dilations=None,
-        hidden_dims_head=(32, 32),
-        topk_pool_fraction=0.05,
-        activation=nn.ReLU,
-        checkpoint_path="sv_posterior_tcn_live_finance_n253_multiscale_topk.pt",
-        resume_from="sv_posterior_tcn_live_finance_n253_multiscale_topk.latest.pt",
-        seed=2,
-        batch_size=1024 * 4,
-        n_batches=100,
-        val_size=1024 * 2 * 100,
-        lr=5e-4,
-        n_epochs=2000,
-        patience=75,
-        min_delta=1e-5,
-        min_var=1e-12,
-        use_amp=True,
-        grad_clip_norm=5.0,
-        deterministic_torch=True,
-        n_workers=-4,
-        out_dtype=np.float32,
-        verbose=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
