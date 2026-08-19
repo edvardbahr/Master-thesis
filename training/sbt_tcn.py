@@ -1028,7 +1028,7 @@ def train_tcn(
         )
 
         if verbose and epoch == 0:
-            print("Generating live training data...")
+            print("Beginning simulation-based training...")
 
         train_x, train_target = simulate_live_dataset(
             N=train_size,
