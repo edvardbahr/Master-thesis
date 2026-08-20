@@ -1,10 +1,17 @@
 import csv
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-import sim_5_param_data as sim
+HERE = Path(__file__).resolve().parent
+PROJECT_DIR = HERE.parent.parent
+
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+import simulation.sim_5_param_data as sim
 
 
 # Grid configuration. Rows vary phi and columns vary nu.

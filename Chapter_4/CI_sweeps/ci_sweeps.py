@@ -6,17 +6,17 @@ import tempfile
 from pathlib import Path
 from statistics import NormalDist
 
-HERE = Path(__file__).resolve().parent
-PROJECT_DIR = HERE.parent.parent
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.insert(0, str(PROJECT_DIR))
-
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch.nn as nn
+
+HERE = Path(__file__).resolve().parent
+PROJECT_DIR = HERE.parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 from evaluation.test_nn_model import load_model, predict
 from simulation import sim_5_param_data as sim
@@ -80,6 +80,7 @@ def simulate_sweep_series() -> dict[str, np.ndarray]:
     datasets = {}
 
     for swept_parameter, values in SWEEPS.items():
+        # Naive way of doing this, but doesnt matter much when SWEEP_SIZE is small.
         parameters = {
             name: np.full(SWEEP_SIZE, value)
             for name, value in BASELINE.items()
@@ -196,11 +197,11 @@ def calculate_credible_intervals() -> tuple[pd.DataFrame, pd.DataFrame]:
         for prior in PRIORS:
             checkpoint_path = WEIGHTS_DIR / CHECKPOINT_NAMES[(architecture, prior)]
             print(f"Loading {architecture} ({prior}) from {checkpoint_path.name}.")
-            model = load_model(checkpoint_path)
+            model, checkpoint = load_model(checkpoint_path)
             count_rows.append(parameter_count_row(model, architecture, prior))
 
             for parameter in PARAMETERS:
-                mean, variance = predict(model, datasets[parameter])
+                mean, variance = predict(model, checkpoint, datasets[parameter])
                 intervals[(architecture, prior, parameter)] = transformed_gaussian_ci(
                     mean,
                     variance,

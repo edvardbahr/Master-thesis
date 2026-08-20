@@ -236,9 +236,9 @@ def evaluate_neural_model(
     reference_variances: np.ndarray,
 ) -> tuple[dict[str, object], pd.DataFrame, pd.DataFrame]:
     checkpoint_path = WEIGHTS_DIR / CHECKPOINT_NAMES[(architecture, prior)]
-    model = load_model(checkpoint_path)
+    model, checkpoint = load_model(checkpoint_path)
     print(f"Timing {architecture} ({prior}) one sequence at a time.")
-    means, variances, runtimes = predict_with_runtimes(model, y)
+    means, variances, runtimes = predict_with_runtimes(model, checkpoint, y)
 
     return (
         metric_row(

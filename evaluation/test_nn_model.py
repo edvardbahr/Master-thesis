@@ -1,7 +1,5 @@
 """Load standard-SV neural estimators and use them for prediction."""
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 from time import perf_counter
@@ -20,14 +18,11 @@ from training.sbt_summary_nn import SummaryNN
 from training.sbt_tcn import TCN
 
 
-Checkpoint = dict[str, object]
-
-
 def load_model(
     checkpoint_path: str | Path,
     device: str | torch.device | None = None,
-) -> nn.Module:
-    """Load one Summary NN or TCN checkpoint as an inference-ready model."""
+) -> tuple[nn.Module, dict[str, object]]:
+    """Load an inference-ready model and its checkpoint dictionary."""
     resolved_device = torch.device(
         device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -73,23 +68,17 @@ def load_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(resolved_device)
     model.eval()
-    model.checkpoint = checkpoint
-    return model
-
-
-def _checkpoint(model: nn.Module) -> Checkpoint:
-    checkpoint = getattr(model, "checkpoint", None)
-    if not isinstance(checkpoint, dict):
-        raise ValueError("Use load_model() before calling a prediction function.")
-    return checkpoint
+    return model, checkpoint
 
 
 def _model_device(model: nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
-def prepare_summary_input(model: SummaryNN, y: np.ndarray) -> np.ndarray:
-    checkpoint = _checkpoint(model)
+def prepare_summary_input(
+    checkpoint: dict[str, object],
+    y: np.ndarray,
+) -> np.ndarray:
     dataset_config = checkpoint.get("dataset_config", checkpoint)
     if not isinstance(dataset_config, dict):
         raise TypeError("Summary-NN dataset_config must be a dictionary.")
@@ -113,24 +102,34 @@ def prepare_summary_input(model: SummaryNN, y: np.ndarray) -> np.ndarray:
     return ((summaries - z_mean) / z_std).astype(np.float32)
 
 
-def prepare_tcn_input(model: TCN, y: np.ndarray) -> np.ndarray:
-    checkpoint = _checkpoint(model)
+def prepare_tcn_input(
+    checkpoint: dict[str, object],
+    y: np.ndarray,
+) -> np.ndarray:
     centered_y = y - np.mean(y, axis=1, keepdims=True)
     return np.log(centered_y**2 + float(checkpoint["k"])).astype(np.float32)
 
 
-def prepare_model_input(model: nn.Module, y: np.ndarray) -> np.ndarray:
+def prepare_model_input(
+    model: nn.Module,
+    checkpoint: dict[str, object],
+    y: np.ndarray,
+) -> np.ndarray:
     if isinstance(model, SummaryNN):
-        return prepare_summary_input(model, y)
+        return prepare_summary_input(checkpoint, y)
     if isinstance(model, TCN):
-        return prepare_tcn_input(model, y)
+        return prepare_tcn_input(checkpoint, y)
     raise TypeError(f"Unsupported model type: {type(model).__name__}.")
 
 
 @torch.inference_mode()
-def predict(model: nn.Module, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def predict(
+    model: nn.Module,
+    checkpoint: dict[str, object],
+    y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     """Predict transformed posterior means and variances for a batch of series."""
-    model_input = torch.from_numpy(prepare_model_input(model, y)).to(
+    model_input = torch.from_numpy(prepare_model_input(model, checkpoint, y)).to(
         _model_device(model)
     )
     mean, variance = model(model_input)
@@ -148,10 +147,10 @@ def _synchronize(device: torch.device) -> None:
 @torch.inference_mode()
 def predict_with_runtimes(
     model: nn.Module,
+    checkpoint: dict[str, object],
     y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Predict one series at a time and include preprocessing in each runtime."""
-    checkpoint = _checkpoint(model)
     device = _model_device(model)
     if isinstance(model, SummaryNN):
         dummy_shape = (1, int(checkpoint["input_dim"]))
@@ -173,7 +172,7 @@ def predict_with_runtimes(
         _synchronize(device)
         started_at = perf_counter()
 
-        model_input = prepare_model_input(model, series[None, :])
+        model_input = prepare_model_input(model, checkpoint, series[None, :])
         model_input_tensor = torch.from_numpy(model_input).to(device)
         mean, variance = model(model_input_tensor)
         means[index] = mean[0].cpu().numpy()

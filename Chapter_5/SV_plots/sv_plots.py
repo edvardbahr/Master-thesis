@@ -5,12 +5,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-
-HERE = Path(__file__).resolve().parent
-SIMULATION_DIR = HERE.parent / "five_param_estimates"
-if str(SIMULATION_DIR) not in sys.path:
-    sys.path.insert(0, str(SIMULATION_DIR))
-
 os.environ.setdefault(
     "MPLCONFIGDIR",
     str(Path(tempfile.gettempdir()) / "matplotlib"),
@@ -19,7 +13,13 @@ os.environ.setdefault(
 import matplotlib.pyplot as plt
 import numpy as np
 
-from sim_5_param_data import sample_centered_gh_skew_t_innovations
+HERE = Path(__file__).resolve().parent
+PROJECT_DIR = HERE.parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from simulation.sim_5_param_data import sample_centered_gh_skew_t_innovations
+
 
 #1,6
 N_TIME_STEPS = 200
