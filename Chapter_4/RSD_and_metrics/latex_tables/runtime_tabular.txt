@@ -1,0 +1,11 @@
+\toprule
+Method & Mean runtime (s) & Runtime SD (s) \\
+\midrule
+MCMC (default) & \(3.4991\) & \(0.6075\) \\
+TCN (default) & \(0.0028\) & \(0.0000\) \\
+Summary NN (default) & \(0.0814\) & \(0.0532\) \\
+\midrule
+MCMC (finance) & \(3.4673\) & \(0.6442\) \\
+TCN (finance) & \(0.0028\) & \(0.0001\) \\
+Summary NN (finance) & \(0.0778\) & \(0.0496\) \\
+\bottomrule

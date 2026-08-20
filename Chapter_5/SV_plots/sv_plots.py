@@ -21,7 +21,6 @@ if str(PROJECT_DIR) not in sys.path:
 from simulation.sim_5_param_data import sample_centered_gh_skew_t_innovations
 
 
-#1,6
 N_TIME_STEPS = 200
 MU = -9.0
 PHI = 0.975

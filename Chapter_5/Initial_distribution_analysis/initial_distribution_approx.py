@@ -34,7 +34,6 @@ REFERENCE_RESIDUAL_TOLERANCE = 1e-8
 
 SEED = 20260620
 SHOW_PLOTS = False
-OUTPUT_DIR = Path(__file__).resolve().parent / "stationary_law_approx_results"
 
 
 def reference_burn_in_steps(phi, residual_tolerance):
@@ -408,7 +407,6 @@ def write_summary_csv(rows, output_path):
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     reference_quantiles, hybrid_quantiles, reference_steps = generate_qq_quantiles()
     summary_rows = build_summary_rows(
@@ -417,11 +415,11 @@ def main():
         reference_steps,
     )
 
-    summary_path = OUTPUT_DIR / "stationary_law_qq_errors.csv"
+    summary_path = HERE / "stationary_law_qq_errors.csv"
     write_summary_csv(summary_rows, summary_path)
 
     for k in K_VALUES:
-        figure_path = OUTPUT_DIR / f"stationary_law_qq_K_{k:04d}.png"
+        figure_path = HERE / f"stationary_law_qq_K_{k:04d}.png"
         plot_qq_grid(
             k=k,
             reference_quantiles=reference_quantiles,

@@ -1,0 +1,9 @@
+\toprule
+Method & \(\overline{\ell}_{\mu}\) & \(\overline{\ell}_{\psi}\) & \(\overline{\ell}_{\rho}\) & \(L_K\) \\
+\midrule
+MCMC (default, \(\beta=0.85\)) & \(-1.0457\) & \(-0.0535\) & \(-0.6450\) & \(-0.5814\) \\
+TCN (default, full sequence) & \(-1.0705\) & \(-0.0457\) & \(-0.6184\) & \(-0.5782\) \\
+\midrule
+MCMC (finance, \(\beta=0.90\)) & \(-0.4874\) & \(-0.1186\) & \(-0.9604\) & \(-0.5221\) \\
+TCN (finance, full sequence) & \(-0.5132\) & \(-0.1356\) & \(-0.9256\) & \(-0.5248\) \\
+\bottomrule
