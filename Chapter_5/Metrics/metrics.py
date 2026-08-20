@@ -21,7 +21,7 @@ PROJECT_DIR = HERE.parent.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from evaluation.test_svghst_tcn import load_model, predict
+from evaluation.test_ghst_sv_tcn import load_model, predict
 from simulation import sim_5_param_data as sim
 from simulation.stochvol_mcmc import (
     log_positive_transform,
@@ -43,6 +43,9 @@ ALPHA = 0.05
 MCMC_DRAWS = 20_000
 MCMC_BURNIN = 500
 MCMC_THINPARA = 1
+# The bottleneck. Current implementation of stochvol_mcmc.py
+# Is highly memory inefficient, and raising max_cores to a number above
+# 3 causes oom errors (on a 32 gb ram system). 
 MCMC_MAX_CORES = 3
 
 TRANSFORMED_PARAMETERS = tuple(SVGHST_TARGET_NAMES)

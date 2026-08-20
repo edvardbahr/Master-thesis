@@ -11,7 +11,7 @@ if str(PROJECT_DIR) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from evaluation.test_nn_model import load_model, predict_with_runtimes
+from evaluation.test_sv_nn_model import load_model, predict_with_runtimes
 from simulation import sim_5_param_data as sim
 from simulation.stochvol_mcmc import (
     centered_square_transform,

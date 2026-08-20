@@ -21,7 +21,7 @@ PROJECT_DIR = HERE.parent.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from evaluation.test_svghst_tcn import load_model, predict
+from evaluation.test_ghst_sv_tcn import load_model, predict
 from simulation import sim_5_param_data as sim
 from simulation.stochvol_mcmc import run_stochvol_mcmc
 from training.sbt_tcn import SVGHST_TARGET_NAMES, theta_to_target_numpy

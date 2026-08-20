@@ -12,7 +12,7 @@ PROJECT_DIR = HERE.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from evaluation.test_nn_model import (
+from evaluation.test_sv_nn_model import (
     load_model as load_neural_model,
     predict as predict_batch,
 )
