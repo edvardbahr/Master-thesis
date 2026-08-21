@@ -80,7 +80,6 @@ The principal local software versions were:
 | SciPy | 1.16.3 |
 | statsmodels | 0.14.6 |
 | Matplotlib | 3.10.7 |
-| scikit-learn | 1.7.2 |
 | R | 4.6.1 |
 | R package `stochvol` | 3.2.9 |
 
