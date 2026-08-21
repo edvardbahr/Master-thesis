@@ -20,12 +20,10 @@ package `stochvol`.
 | `evaluation/` | Checkpoint loading, preprocessing, and neural prediction utilities |
 | `Chapter_3/` | Prior, MCMC, effective-sample-size, and tuning analyses |
 | `Chapter_4/` | Three-parameter model comparisons and diagnostics |
-| `Chapter_5/` | Five-parameter SV-GHST analyses and diagnostics |
+| `Chapter_5/` | Five-parameter GHST-SV analyses and diagnostics |
 | `weights/` | Final trained model checkpoints used by the evaluation scripts |
 | `requirements.txt` | Exact Python environment recovered from IDUN training |
 
-The files named `test_*.py` in `evaluation/` are evaluation utilities rather
-than an automated test suite.
 
 ## Computational environments
 
@@ -44,7 +42,7 @@ configuration:
 | GPU | NVIDIA Tesla V100 PCIe, 32 GB |
 | CPUs | 16 CPUs allocated to the job |
 | Memory | 64 GB RAM |
-| Maximum job time | 16 hours |
+| Maximum job time | 48 hours |
 | Python | 3.11.3 |
 | PyTorch | 2.12.1+cu126 |
 | CUDA build used by PyTorch | 12.6 |
@@ -127,8 +125,8 @@ export MPLBACKEND=Agg
 
 The training configurations are located at:
 
-- `Chapter_3/Training_configs/init_training.py` for the three-parameter model;
-- `Chapter_5/Training_config/init_training.py` for the five-parameter SV-GHST
+- `Chapter_3/Training_configs/init_training.py` for the three-parameter NN models;
+- `Chapter_5/Training_config/init_training.py` for the five-parameter GHST-SV TCN
   model.
 
 The training calls in these files are intentionally protected by `if False`
@@ -146,15 +144,11 @@ training dataset. They use multiprocessing for simulation and CUDA automatic
 mixed precision for the TCN. The final checkpoints used by the evaluation code
 are stored in `weights/`.
 
-Reproducing training locally is not recommended with the recorded batch sizes,
-validation sizes, and worker counts. Review these values carefully when using
-different hardware.
-
 ## Evaluation and figure generation
 
-The repository includes the final checkpoints and many of the generated CSV,
-PDF, and PNG outputs. Retraining is therefore not necessary to inspect the
-saved results or rerun an evaluation.
+The repository includes the final checkpoints and many of the generated
+PDF outputs. CSV outputs are created when running the metrics python scripts.
+Retraining is therefore not necessary to inspect the saved results or rerun an evaluation.
 
 Each analysis script can be executed directly from the repository root. For
 example:
@@ -220,17 +214,12 @@ make MCMC evaluation considerably slower.
 
 ## Author and citation
 
-Edvard Kjesbu Bahr<br>
-Master's thesis, Norwegian University of Science and Technology (NTNU), 2026.
-
-If you use this repository or its results, please cite the accompanying thesis:
-
 > Edvard Kjesbu Bahr. *Neural Posterior Estimation for Stochastic Volatility
 > Models*. Master's thesis, Norwegian University of Science and Technology,
 > 2026.
 
 ```bibtex
-@mastersthesis{kjesbubahr2026neural,
+@mastersthesis{kjesbubahr2026npesv,
   author = {Edvard Kjesbu Bahr},
   title  = {Neural Posterior Estimation for Stochastic Volatility Models},
   school = {Norwegian University of Science and Technology},
