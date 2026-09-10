@@ -21,6 +21,7 @@ package `stochvol`.
 | `Chapter_3/` | Prior, MCMC, effective-sample-size, and tuning analyses |
 | `Chapter_4/` | Three-parameter model comparisons and diagnostics |
 | `Chapter_5/` | Five-parameter GHST-SV analyses and diagnostics |
+| `Latex/` | Latex code and pdf of the Master's thesis|
 | `weights/` | Final trained model checkpoints used by the evaluation scripts |
 | `requirements.txt` | Exact Python environment recovered from IDUN training |
 
