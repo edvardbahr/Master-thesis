@@ -1,0 +1,68 @@
+\documentclass[tikz,border=3pt]{standalone}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta,positioning}
+
+\newcommand{\plotimage}[1]{%
+    \IfFileExists{#1}{%
+        \includegraphics[width=7.5cm]{#1}%
+    }{%
+        \parbox[c][2.6cm][c]{7.5cm}{\centering
+            Missing plot\\[3pt]\texttt{#1}}%
+    }%
+}
+
+\begin{document}
+\begin{tikzpicture}[
+    >=Latex,
+    font=\huge,
+    box/.style={
+        draw,
+        circle,
+        minimum size=3.4cm,
+        align=center,
+        inner sep=5pt
+    },
+    plotbox/.style={
+        draw=none,
+        rectangle,
+        inner sep=2pt
+    },
+    lab/.style={
+        font=\huge,
+        fill=white,
+        inner sep=1pt
+    }
+]
+\node[plotbox] (yplot) at (0,0)
+    {\plotimage{y.pdf}};
+
+\node[box, right=22mm of yplot] (enc) {Encoder};
+
+\node[box, right=22mm of enc] (headpsi) {$\psi$ head};
+\node[box, above=12mm of headpsi] (headmu) {$\mu$ head};
+\node[box, below=12mm of headpsi] (headrho) {$\rho$ head};
+
+\node[plotbox, right=28mm of headpsi] (pdfpsi)
+    {\plotimage{psi.pdf}};
+\node[plotbox, above=5mm of pdfpsi] (pdfmu)
+    {\plotimage{mu.pdf}};
+\node[plotbox, below=5mm of pdfpsi] (pdfrho)
+    {\plotimage{rho.pdf}};
+
+\draw[->] (yplot.east) -- node[lab, above] {$x(y)$} (enc.west);
+
+\path (enc.east) ++(7mm,0) coordinate (headsplit);
+\draw (enc.east) -- node[lab, above] {$z$} (headsplit);
+\draw[->] (headsplit)
+    to[out=0, in=180] (headmu.west);
+\draw[->] (headsplit)
+    -- (headpsi.west);
+\draw[->] (headsplit)
+    to[out=0, in=180] (headrho.west);
+
+\draw[->] (headmu.east)  -- node[lab, above=5mm] {$(\hat m_\mu,\hat v_\mu)$}   (pdfmu.west);
+\draw[->] (headpsi.east) -- node[lab, above] {$(\hat m_\psi,\hat v_\psi)$} (pdfpsi.west);
+\draw[->] (headrho.east) -- node[lab, above=5mm] {$(\hat m_\rho,\hat v_\rho)$} (pdfrho.west);
+\end{tikzpicture}
+\end{document}
